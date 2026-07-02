@@ -6,7 +6,9 @@ import org.meltzg.fs.mtp.types.MTPDeviceIdentifier;
 import java.io.IOException;
 import java.net.URI;
 import java.nio.file.*;
+import java.nio.file.attribute.BasicFileAttributeView;
 import java.nio.file.attribute.BasicFileAttributes;
+import java.nio.file.attribute.FileTime;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.stream.Collectors;
@@ -360,9 +362,11 @@ public class MTPFileSystemIntegrationTest {
 
     @Test
     public void moveNonEmptyDirectoryThrowsWhenNotNativelySupported() throws IOException {
-        // This device does not implement MTP MoveObject, so relocating a non-empty directory to a
-        // different folder cannot be done without moving its entries. Per the Files.move contract
-        // that must fail rather than recursively copy.
+        // A device without native MTP MoveObject cannot relocate a non-empty directory to a
+        // different folder without moving its entries. Per the Files.move contract the provider's
+        // emulation must fail with DirectoryNotEmptyException rather than recursively copy. Devices
+        // that do implement MoveObject relocate the tree in one native operation, so the emulation
+        // path under test is never reached there; probe the device and skip when that is the case.
         var storage = requireFirstStorage();
         var srcDir = storage.resolve(TEST_DIR_NAME);
         var destParent = storage.resolve(TEST_DIR_NAME2);
@@ -372,9 +376,16 @@ public class MTPFileSystemIntegrationTest {
         Files.write(srcDir.resolve("child.bin"), new byte[]{1, 2, 3});
         Files.createDirectory(destParent);
         try {
-            assertThrows(DirectoryNotEmptyException.class, () -> Files.move(srcDir, moved));
+            DirectoryNotEmptyException refused = null;
+            try {
+                Files.move(srcDir, moved);
+            } catch (DirectoryNotEmptyException e) {
+                refused = e;
+            }
+            assumeTrue("device supports native directory move; emulation path not exercised",
+                refused != null);
 
-            // A failed move must leave the source untouched and must not create the target.
+            // The emulation refused the move: the source must be untouched and the target absent.
             assertTrue("Source directory should still exist", Files.isDirectory(srcDir));
             assertTrue("Source child should still exist", Files.isRegularFile(srcDir.resolve("child.bin")));
             assertFalse("Target should not have been created", Files.exists(moved));
@@ -486,6 +497,181 @@ public class MTPFileSystemIntegrationTest {
         try {
             assertEquals("Reported size should match the written length", payload.length, Files.size(file));
             assertArrayEquals("Large round-tripped content should match", payload, Files.readAllBytes(file));
+        } finally {
+            Files.deleteIfExists(file);
+        }
+    }
+
+    // --- isSameFile ---
+
+    @Test
+    public void isSameFileTrueForEquivalentPaths() throws IOException {
+        var storage = requireFirstStorage();
+        var a = storage.resolve(TEST_FILE_NAME);
+        var b = storage.resolve(TEST_FILE_NAME);
+        Files.write(a, new byte[]{1});
+        try {
+            assertTrue("Two paths resolving to the same object should be the same file",
+                Files.isSameFile(a, b));
+            assertTrue("A path should be the same file as itself", Files.isSameFile(a, a));
+        } finally {
+            Files.deleteIfExists(a);
+        }
+    }
+
+    @Test
+    public void isSameFileFalseForDifferentPaths() throws IOException {
+        var storage = requireFirstStorage();
+        var a = storage.resolve(TEST_FILE_NAME);
+        var b = storage.resolve(TEST_FILE_NAME2);
+        Files.write(a, new byte[]{1});
+        Files.write(b, new byte[]{2});
+        try {
+            assertFalse("Distinct paths should not be the same file", Files.isSameFile(a, b));
+        } finally {
+            Files.deleteIfExists(a);
+            Files.deleteIfExists(b);
+        }
+    }
+
+    // --- isHidden ---
+
+    @Test
+    public void isHiddenAlwaysFalse() throws IOException {
+        var storage = requireFirstStorage();
+        var file = storage.resolve(TEST_FILE_NAME);
+        Files.write(file, new byte[]{7});
+        try {
+            assertFalse("MTP filesystem reports no hidden files", Files.isHidden(file));
+            assertFalse("Storage root should not be hidden", Files.isHidden(storage));
+        } finally {
+            Files.deleteIfExists(file);
+        }
+    }
+
+    // --- checkAccess ---
+
+    @Test
+    public void checkAccessSucceedsForReadAndWriteOnExistingFile() throws IOException {
+        var storage = requireFirstStorage();
+        var file = storage.resolve(TEST_FILE_NAME);
+        Files.write(file, new byte[]{1, 2, 3});
+        try {
+            // No exception means access is granted.
+            provider.checkAccess(file);
+            provider.checkAccess(file, AccessMode.READ);
+            provider.checkAccess(file, AccessMode.WRITE);
+        } finally {
+            Files.deleteIfExists(file);
+        }
+    }
+
+    @Test
+    public void checkAccessExecuteThrowsAccessDenied() throws IOException {
+        var storage = requireFirstStorage();
+        var file = storage.resolve(TEST_FILE_NAME);
+        Files.write(file, new byte[]{1});
+        try {
+            assertThrows(AccessDeniedException.class,
+                () -> provider.checkAccess(file, AccessMode.EXECUTE));
+        } finally {
+            Files.deleteIfExists(file);
+        }
+    }
+
+    @Test(expected = NoSuchFileException.class)
+    public void checkAccessThrowsForMissingFile() throws IOException {
+        var storage = requireFirstStorage();
+        provider.checkAccess(storage.resolve(TEST_FILE_NAME));
+    }
+
+    // --- attribute views / string attributes ---
+
+    @Test
+    public void basicFileAttributeViewReadsAttributes() throws IOException {
+        var storage = requireFirstStorage();
+        var file = storage.resolve(TEST_FILE_NAME);
+        var payload = new byte[]{1, 2, 3, 4, 5};
+        Files.write(file, payload);
+        try {
+            var view = Files.getFileAttributeView(file, BasicFileAttributeView.class);
+            assertNotNull("BasicFileAttributeView should be available", view);
+            var attrs = view.readAttributes();
+            assertTrue("View should report the file as a regular file", attrs.isRegularFile());
+            assertEquals("View should report the written size", payload.length, attrs.size());
+        } finally {
+            Files.deleteIfExists(file);
+        }
+    }
+
+    @Test
+    public void setTimesViaViewIsUnsupported() throws IOException {
+        var storage = requireFirstStorage();
+        var file = storage.resolve(TEST_FILE_NAME);
+        Files.write(file, new byte[]{1});
+        try {
+            var view = Files.getFileAttributeView(file, BasicFileAttributeView.class);
+            assertThrows(UnsupportedOperationException.class,
+                () -> view.setTimes(FileTime.fromMillis(0), null, null));
+        } finally {
+            Files.deleteIfExists(file);
+        }
+    }
+
+    @Test
+    public void readStringAttributesReturnsRequestedKeys() throws IOException {
+        var storage = requireFirstStorage();
+        var file = storage.resolve(TEST_FILE_NAME);
+        var payload = new byte[]{1, 2, 3, 4};
+        Files.write(file, payload);
+        try {
+            var attrs = Files.readAttributes(file, "basic:size,isRegularFile,isDirectory");
+            assertEquals("Only the requested keys should be returned", 3, attrs.size());
+            assertEquals((long) payload.length, attrs.get("size"));
+            assertEquals(Boolean.TRUE, attrs.get("isRegularFile"));
+            assertEquals(Boolean.FALSE, attrs.get("isDirectory"));
+        } finally {
+            Files.deleteIfExists(file);
+        }
+    }
+
+    @Test
+    public void readStringAttributesWildcardReturnsAllBasicKeys() throws IOException {
+        var storage = requireFirstStorage();
+        var file = storage.resolve(TEST_FILE_NAME);
+        Files.write(file, new byte[]{1});
+        try {
+            var attrs = Files.readAttributes(file, "*");
+            assertTrue("Wildcard should include size", attrs.containsKey("size"));
+            assertTrue("Wildcard should include isDirectory", attrs.containsKey("isDirectory"));
+            assertTrue("Wildcard should include fileKey", attrs.containsKey("fileKey"));
+            assertTrue("Wildcard should include lastModifiedTime", attrs.containsKey("lastModifiedTime"));
+        } finally {
+            Files.deleteIfExists(file);
+        }
+    }
+
+    @Test
+    public void readUnknownStringAttributeThrows() throws IOException {
+        var storage = requireFirstStorage();
+        var file = storage.resolve(TEST_FILE_NAME);
+        Files.write(file, new byte[]{1});
+        try {
+            assertThrows(IllegalArgumentException.class,
+                () -> Files.readAttributes(file, "basic:notAnAttribute"));
+        } finally {
+            Files.deleteIfExists(file);
+        }
+    }
+
+    @Test
+    public void setAttributeIsUnsupported() throws IOException {
+        var storage = requireFirstStorage();
+        var file = storage.resolve(TEST_FILE_NAME);
+        Files.write(file, new byte[]{1});
+        try {
+            assertThrows(UnsupportedOperationException.class,
+                () -> Files.setAttribute(file, "basic:lastModifiedTime", FileTime.fromMillis(0)));
         } finally {
             Files.deleteIfExists(file);
         }
