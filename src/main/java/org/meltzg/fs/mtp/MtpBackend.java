@@ -3,6 +3,7 @@ package org.meltzg.fs.mtp;
 import org.meltzg.fs.mtp.types.MTPDeviceIdentifier;
 import org.meltzg.fs.mtp.types.MTPDeviceInfo;
 import org.meltzg.fs.mtp.types.MTPItemInfo;
+import org.meltzg.fs.mtp.types.MTPTrackMetadata;
 
 import java.io.IOException;
 import java.util.List;
@@ -67,6 +68,16 @@ public interface MtpBackend {
     long getFreeSpace(DeviceHandle device, String storageId);
 
     MTPItemInfo[] getChildItems(DeviceHandle device, String storageId, String parentId) throws IOException;
+
+    /**
+     * Reads the audio metadata the device reports for {@code itemId} through MTP object properties —
+     * a metadata-only exchange that never transfers file content. Returns null when the object is
+     * not an audio track or the device reports no metadata for it (e.g. a file its media indexer
+     * has not scanned). The default implementation reports no metadata for anything.
+     */
+    default MTPTrackMetadata getTrackMetadata(DeviceHandle device, String itemId) throws IOException {
+        return null;
+    }
 
     String createFolder(DeviceHandle device, String name, String parentId, String storageId) throws IOException;
 

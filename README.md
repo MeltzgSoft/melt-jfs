@@ -264,6 +264,22 @@ Files.move(deviceFile, fs.getPath("/Internal Storage/NewFolder/photo.jpg"));
 Files.delete(fs.getPath("/Internal Storage/NewFolder/photo.jpg"));
 ```
 
+**Read a track's audio metadata (the `mtp` attribute view)**
+
+MTP devices index their media and expose per-object Artist/Album/Title/Genre properties. The
+`mtp` attribute view reads them as a metadata-only exchange — no file content is transferred,
+so it is orders of magnitude cheaper than pulling the file and parsing its tags:
+
+```java
+Path song = fs.getPath("/Internal Storage/Music/song.mp3");
+Map<String, Object> tags = Files.readAttributes(song, "mtp:*");
+// {title=…, artist=…, album=…, genre=…, trackNumber=…, durationMillis=…}
+// or request a subset: Files.readAttributes(song, "mtp:title,artist,album")
+```
+
+Every value is `null` when the object is not an audio track or the device has not indexed it
+(e.g. a file uploaded moments ago that the device's media scanner has not yet classified).
+
 ### JVM flags
 
 The FFM API requires the following flag, which the Gradle build sets automatically. If you invoke the JVM directly, add:

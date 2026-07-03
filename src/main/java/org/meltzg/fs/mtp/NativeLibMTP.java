@@ -3,6 +3,7 @@ package org.meltzg.fs.mtp;
 import org.meltzg.fs.mtp.types.MTPDeviceIdentifier;
 import org.meltzg.fs.mtp.types.MTPDeviceInfo;
 import org.meltzg.fs.mtp.types.MTPItemInfo;
+import org.meltzg.fs.mtp.types.MTPTrackMetadata;
 
 import java.io.IOException;
 import java.lang.foreign.*;
@@ -107,6 +108,37 @@ class NativeLibMTP implements MtpBackend {
     private static final VarHandle STORAGE_NEXT =
         vh(DEVICE_STORAGE_LAYOUT, groupElement("next"));
 
+    // LIBMTP_track_t layout
+    private static final StructLayout TRACK_LAYOUT = MemoryLayout.structLayout(
+        JAVA_INT.withName("item_id"),
+        JAVA_INT.withName("parent_id"),
+        JAVA_INT.withName("storage_id"),
+        MemoryLayout.paddingLayout(4),
+        ADDRESS.withName("title"),
+        ADDRESS.withName("artist"),
+        ADDRESS.withName("composer"),
+        ADDRESS.withName("genre"),
+        ADDRESS.withName("album"),
+        ADDRESS.withName("date"),
+        ADDRESS.withName("filename"),
+        JAVA_SHORT.withName("tracknumber"),
+        MemoryLayout.paddingLayout(2),
+        JAVA_INT.withName("duration"),
+        JAVA_INT.withName("samplerate"),
+        JAVA_SHORT.withName("nochannels"),
+        MemoryLayout.paddingLayout(2),
+        JAVA_INT.withName("wavecodec"),
+        JAVA_INT.withName("bitrate"),
+        JAVA_SHORT.withName("bitratetype"),
+        JAVA_SHORT.withName("rating"),
+        JAVA_INT.withName("usecount"),
+        JAVA_LONG.withName("filesize"),
+        JAVA_LONG.withName("modificationdate"),
+        JAVA_INT.withName("filetype"),
+        MemoryLayout.paddingLayout(4),
+        ADDRESS.withName("next")
+    ).withName("LIBMTP_track_t");
+
     private static final VarHandle FILE_ITEM_ID =
         vh(FILE_LAYOUT, groupElement("item_id"));
     private static final VarHandle FILE_PARENT_ID =
@@ -124,6 +156,19 @@ class NativeLibMTP implements MtpBackend {
     private static final VarHandle FILE_NEXT =
         vh(FILE_LAYOUT, groupElement("next"));
 
+    private static final VarHandle TRACK_TITLE =
+        vh(TRACK_LAYOUT, groupElement("title"));
+    private static final VarHandle TRACK_ARTIST =
+        vh(TRACK_LAYOUT, groupElement("artist"));
+    private static final VarHandle TRACK_GENRE =
+        vh(TRACK_LAYOUT, groupElement("genre"));
+    private static final VarHandle TRACK_ALBUM =
+        vh(TRACK_LAYOUT, groupElement("album"));
+    private static final VarHandle TRACK_TRACKNUMBER =
+        vh(TRACK_LAYOUT, groupElement("tracknumber"));
+    private static final VarHandle TRACK_DURATION =
+        vh(TRACK_LAYOUT, groupElement("duration"));
+
     private final MethodHandle init;
     private final MethodHandle releaseDevice;
     private final MethodHandle detectRawDevices;
@@ -133,6 +178,8 @@ class NativeLibMTP implements MtpBackend {
     private final MethodHandle getModelName;
     private final MethodHandle getManufacturerName;
     private final MethodHandle getFilesAndFolders;
+    private final MethodHandle getTrackMetadataFn;
+    private final MethodHandle destroyTrack;
     private final MethodHandle getFileToFile;
     private final MethodHandle sendFileFromFile;
     private final MethodHandle destroyFile;
@@ -170,6 +217,10 @@ class NativeLibMTP implements MtpBackend {
             FunctionDescriptor.of(ADDRESS, ADDRESS));
         getFilesAndFolders = bind(linker, libmtp, "LIBMTP_Get_Files_And_Folders",
             FunctionDescriptor.of(ADDRESS, ADDRESS, JAVA_INT, JAVA_INT));
+        getTrackMetadataFn = bind(linker, libmtp, "LIBMTP_Get_Trackmetadata",
+            FunctionDescriptor.of(ADDRESS, ADDRESS, JAVA_INT));
+        destroyTrack = bind(linker, libmtp, "LIBMTP_destroy_track_t",
+            FunctionDescriptor.ofVoid(ADDRESS));
         getFileToFile = bind(linker, libmtp, "LIBMTP_Get_File_To_File",
             FunctionDescriptor.of(JAVA_INT, ADDRESS, JAVA_INT, ADDRESS, ADDRESS, ADDRESS));
         sendFileFromFile = bind(linker, libmtp, "LIBMTP_Send_File_From_File",
@@ -400,6 +451,49 @@ class NativeLibMTP implements MtpBackend {
         } catch (Throwable t) {
             throw new IOException("Failed to list files and folders", t);
         }
+    }
+
+    /**
+     * Backed by {@code LIBMTP_Get_Trackmetadata}. On the uncached device handle this library opens,
+     * that costs one GetObjectInfo for the handle (already cached when a listing walked past it)
+     * plus a single-object GetObjectPropList (or per-property GetObjectPropValue calls on devices
+     * without proplist support) — a few small USB transactions, never a data transfer. libmtp
+     * returns NULL for objects whose format is not a known track type, so files stored as
+     * "unknown" (as {@link #sendFile} sends them) report no metadata until the device's own
+     * indexer reclassifies them.
+     */
+    @Override
+    public MTPTrackMetadata getTrackMetadata(DeviceHandle handle, String itemId) throws IOException {
+        MemorySegment trackPtr;
+        try {
+            trackPtr = (MemorySegment) getTrackMetadataFn.invokeExact(dev(handle), toHandle(itemId));
+        } catch (Throwable t) {
+            throw new IOException("Failed to read track metadata for id: " + itemId, t);
+        }
+        if (MemorySegment.NULL.equals(trackPtr)) {
+            return null; // not an audio-track object (libmtp filters by object format)
+        }
+        try {
+            var track = trackPtr.reinterpret(TRACK_LAYOUT.byteSize());
+            var meta = new MTPTrackMetadata(
+                emptyToNull(readCString((MemorySegment) TRACK_TITLE.get(track))),
+                emptyToNull(readCString((MemorySegment) TRACK_ARTIST.get(track))),
+                emptyToNull(readCString((MemorySegment) TRACK_ALBUM.get(track))),
+                emptyToNull(readCString((MemorySegment) TRACK_GENRE.get(track))),
+                Short.toUnsignedInt((short) TRACK_TRACKNUMBER.get(track)),
+                Integer.toUnsignedLong((int) TRACK_DURATION.get(track)));
+            return meta.isEmpty() ? null : meta;
+        } finally {
+            try {
+                destroyTrack.invokeExact(trackPtr);
+            } catch (Throwable t) {
+                throw new RuntimeException("Failed to free track metadata", t);
+            }
+        }
+    }
+
+    private static String emptyToNull(String s) {
+        return s == null || s.isEmpty() ? null : s;
     }
 
     @Override

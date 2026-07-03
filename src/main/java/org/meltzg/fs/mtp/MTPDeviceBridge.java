@@ -15,6 +15,7 @@ import org.meltzg.fs.mtp.types.MTPDeviceConnection;
 import org.meltzg.fs.mtp.types.MTPDeviceIdentifier;
 import org.meltzg.fs.mtp.types.MTPDeviceInfo;
 import org.meltzg.fs.mtp.types.MTPItemInfo;
+import org.meltzg.fs.mtp.types.MTPTrackMetadata;
 
 public enum MTPDeviceBridge implements Closeable {
     INSTANCE;
@@ -351,6 +352,28 @@ public enum MTPDeviceBridge implements Closeable {
                 } finally {
                     invalidateListings();
                 }
+            }
+        } finally {
+            connectionLock.readLock().unlock();
+        }
+    }
+
+    /**
+     * Reads the audio metadata the device reports for the file at {@code path} through MTP object
+     * properties (see {@link MtpBackend#getTrackMetadata}) — a metadata-only exchange that never
+     * transfers file content. Returns null when the object is not a file, is not an audio track,
+     * or the device reports no metadata for it. Throws {@link NoSuchFileException} when nothing
+     * exists at {@code path}.
+     */
+    public MTPTrackMetadata getTrackMetadata(MTPDeviceIdentifier deviceId, String path) throws IOException {
+        connectionLock.readLock().lock();
+        try {
+            var parts = pathParts(path);
+            var conn = requireConnection(deviceId);
+            synchronized (conn) {
+                var item = resolveItemUnsafe(conn, parts);
+                if (item == null || !item.isFile()) return null;
+                return backend().getTrackMetadata(conn.handle(), item.itemId());
             }
         } finally {
             connectionLock.readLock().unlock();

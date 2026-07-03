@@ -3,9 +3,12 @@ package org.meltzg.fs.mtp;
 import org.meltzg.fs.mtp.types.MTPDeviceIdentifier;
 import org.meltzg.fs.mtp.types.MTPDeviceInfo;
 import org.meltzg.fs.mtp.types.MTPItemInfo;
+import org.meltzg.fs.mtp.types.MTPTrackMetadata;
 
 import java.io.IOException;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 /**
  * In-memory {@link MtpBackend} implementation for unit tests. Returns fixed data matching the
@@ -33,6 +36,12 @@ class FakeLibMTP implements MtpBackend {
 
     // Tests toggle this to simulate the device being unplugged/replugged.
     volatile boolean devicePresent = true;
+
+    // Tests seed these to expose a directory tree (keyed by parentId; ROOT_PARENT for the storage
+    // root) and per-item track metadata (keyed by itemId). Empty by default, preserving the
+    // "empty device" the other fixtures assume.
+    final Map<String, MTPItemInfo[]> childItems = new HashMap<>();
+    final Map<String, MTPTrackMetadata> trackMetadata = new HashMap<>();
 
     @Override
     public Scan scan() {
@@ -76,7 +85,12 @@ class FakeLibMTP implements MtpBackend {
 
     @Override
     public MTPItemInfo[] getChildItems(DeviceHandle device, String storageId, String parentId) throws IOException {
-        return new MTPItemInfo[0];
+        return childItems.getOrDefault(parentId, new MTPItemInfo[0]);
+    }
+
+    @Override
+    public MTPTrackMetadata getTrackMetadata(DeviceHandle device, String itemId) throws IOException {
+        return trackMetadata.get(itemId);
     }
 
     @Override

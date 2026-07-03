@@ -11,6 +11,7 @@ import java.nio.file.attribute.BasicFileAttributes;
 import java.nio.file.attribute.FileTime;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Set;
 import java.util.stream.Collectors;
 
 import static org.junit.Assert.*;
@@ -677,7 +678,66 @@ public class MTPFileSystemIntegrationTest {
         }
     }
 
+    // --- track metadata ("mtp" attribute view) ---
+
+    @Test
+    public void trackMetadataViewHasExpectedShape() throws IOException {
+        var storage = requireFirstStorage();
+        var file = findFirstFile(storage, 2);
+        assumeTrue("No regular files found in first 2 levels of " + storage, file != null);
+
+        var attrs = Files.readAttributes(file, "mtp:*");
+        assertEquals(Set.of("title", "artist", "album", "genre", "trackNumber", "durationMillis"),
+            attrs.keySet());
+    }
+
+    @Test
+    public void trackMetadataReadsForAudioFileWithoutTransferringContent() throws IOException {
+        var storage = requireFirstStorage();
+        var audio = findFirstAudioFile(storage, 4);
+        assumeTrue("No audio files found in first 4 levels of " + storage, audio != null);
+
+        long start = System.nanoTime();
+        var attrs = Files.readAttributes(audio, "mtp:*");
+        long elapsedMillis = (System.nanoTime() - start) / 1_000_000;
+
+        // Diagnostic for the spike: how long a metadata-only read takes vs pulling the file.
+        System.out.println("mtp:* for " + audio + " took " + elapsedMillis + "ms: " + attrs);
+        assertEquals(Set.of("title", "artist", "album", "genre", "trackNumber", "durationMillis"),
+            attrs.keySet());
+        // A metadata read must be far cheaper than transferring the object; even the slowest
+        // supported path (per-property GetObjectPropValue) stays well under this bound.
+        assertTrue("metadata-only read took " + elapsedMillis + "ms", elapsedMillis < 5_000);
+    }
+
+    @Test
+    public void trackMetadataIsNullForDirectories() throws IOException {
+        var storage = requireFirstStorage();
+        var bridge = MTPDeviceBridge.getInstance();
+        var deviceId = fs.getDeviceIdentifier();
+        assertNull(bridge.getTrackMetadata(deviceId, storage.toAbsolutePath().toString()));
+    }
+
     // --- helpers ---
+
+    private static final List<String> AUDIO_EXTENSIONS =
+        List.of(".mp3", ".flac", ".ogg", ".m4a", ".wma", ".wav", ".opus", ".aac");
+
+    private Path findFirstAudioFile(Path dir, int depthRemaining) throws IOException {
+        try (var stream = Files.newDirectoryStream(dir)) {
+            for (var child : stream) {
+                var name = child.getFileName().toString().toLowerCase();
+                if (Files.isRegularFile(child) && AUDIO_EXTENSIONS.stream().anyMatch(name::endsWith)) {
+                    return child;
+                }
+                if (Files.isDirectory(child) && depthRemaining > 0) {
+                    var found = findFirstAudioFile(child, depthRemaining - 1);
+                    if (found != null) return found;
+                }
+            }
+        }
+        return null;
+    }
 
     private Path requireFirstStorage() throws IOException {
         var storage = firstStorageOrNull();

@@ -3,6 +3,7 @@ package org.meltzg.fs.mtp;
 import org.meltzg.fs.mtp.types.MTPDeviceIdentifier;
 import org.meltzg.fs.mtp.types.MTPDeviceInfo;
 import org.meltzg.fs.mtp.types.MTPItemInfo;
+import org.meltzg.fs.mtp.types.MTPTrackMetadata;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -60,6 +61,12 @@ class WpdBackend implements MtpBackend {
     private static final MemorySegment KEY_STORAGE_CAPACITY;
     private static final MemorySegment KEY_STORAGE_FREE_SPACE;
     private static final MemorySegment KEY_RESOURCE_DEFAULT;
+    private static final MemorySegment KEY_MEDIA_TITLE;
+    private static final MemorySegment KEY_MEDIA_DURATION;
+    private static final MemorySegment KEY_MEDIA_ARTIST;
+    private static final MemorySegment KEY_MEDIA_GENRE;
+    private static final MemorySegment KEY_MUSIC_ALBUM;
+    private static final MemorySegment KEY_MUSIC_TRACK;
     private static final MemorySegment KEY_CLIENT_NAME;
     private static final MemorySegment KEY_CLIENT_MAJOR_VERSION;
     private static final MemorySegment KEY_CLIENT_MINOR_VERSION;
@@ -88,7 +95,7 @@ class WpdBackend implements MtpBackend {
     private static final int PROPS_GET_VALUES = 5, PROPS_SET_VALUES = 6;
     private static final int RES_GET_STREAM = 5;
     private static final int VAL_GET_VALUE = 6, VAL_SET_STRING = 7, VAL_GET_STRING = 8, VAL_SET_U4 = 9,
-        VAL_SET_U8 = 13, VAL_GET_U8 = 14, VAL_SET_GUID = 27, VAL_GET_GUID = 28;
+        VAL_GET_U4 = 10, VAL_SET_U8 = 13, VAL_GET_U8 = 14, VAL_SET_GUID = 27, VAL_GET_GUID = 28;
     private static final int KEYCOLL_ADD = 5;
     private static final int PVCOLL_ADD = 5;
     private static final int STREAM_READ = 3, STREAM_WRITE = 4, STREAM_COMMIT = 8;
@@ -126,6 +133,15 @@ class WpdBackend implements MtpBackend {
         KEY_STORAGE_CAPACITY = propertyKey(a, "01a3057a-74d6-4e80-bea7-dc4c212ce50a", 4);
         KEY_STORAGE_FREE_SPACE = propertyKey(a, "01a3057a-74d6-4e80-bea7-dc4c212ce50a", 5);
         KEY_RESOURCE_DEFAULT = propertyKey(a, "e81e79be-34f0-41bf-b53f-f1a06ae87842", 0);
+        // WPD_MEDIA_* / WPD_MUSIC_* property keys (PortableDevice.h), read by getTrackMetadata.
+        String mediaFmt = "2ed8ba05-0ad3-42dc-b0d0-bc95ac396ac8";
+        KEY_MEDIA_TITLE = propertyKey(a, mediaFmt, 18);
+        KEY_MEDIA_DURATION = propertyKey(a, mediaFmt, 19);
+        KEY_MEDIA_ARTIST = propertyKey(a, mediaFmt, 24);
+        KEY_MEDIA_GENRE = propertyKey(a, mediaFmt, 32);
+        String musicFmt = "b324f56a-dc5d-46e5-b6df-d2ea414888c6";
+        KEY_MUSIC_ALBUM = propertyKey(a, musicFmt, 3);
+        KEY_MUSIC_TRACK = propertyKey(a, musicFmt, 4);
         String clientFmt = "204d9f0c-2292-4080-9f42-40664e70f859";
         KEY_CLIENT_NAME = propertyKey(a, clientFmt, 2);
         KEY_CLIENT_MAJOR_VERSION = propertyKey(a, clientFmt, 3);
@@ -395,6 +411,39 @@ class WpdBackend implements MtpBackend {
         return items.toArray(new MTPItemInfo[0]);
     }
 
+    /**
+     * Backed by a single {@code IPortableDeviceProperties::GetValues} call requesting the
+     * WPD_MEDIA_* / WPD_MUSIC_* keys — a metadata-only exchange, never a data transfer. WPD has no
+     * "is a track" gate, so an object where every requested property is absent (a folder, a
+     * non-audio file, or an audio file the device has not indexed) reports null.
+     */
+    @Override
+    public MTPTrackMetadata getTrackMetadata(DeviceHandle handle, String itemId) throws IOException {
+        var d = dev(handle);
+        var values = getValues(d.properties(), itemId,
+            KEY_MEDIA_TITLE, KEY_MEDIA_ARTIST, KEY_MUSIC_ALBUM, KEY_MEDIA_GENRE,
+            KEY_MUSIC_TRACK, KEY_MEDIA_DURATION);
+        if (MemorySegment.NULL.equals(values)) return null;
+        try {
+            long trackNumber = getU4(values, KEY_MUSIC_TRACK);
+            long duration = getU8(values, KEY_MEDIA_DURATION);
+            var meta = new MTPTrackMetadata(
+                emptyToNull(getString(values, KEY_MEDIA_TITLE)),
+                emptyToNull(getString(values, KEY_MEDIA_ARTIST)),
+                emptyToNull(getString(values, KEY_MUSIC_ALBUM)),
+                emptyToNull(getString(values, KEY_MEDIA_GENRE)),
+                (int) Math.max(trackNumber, 0),
+                Math.max(duration, 0));
+            return meta.isEmpty() ? null : meta;
+        } finally {
+            release(values);
+        }
+    }
+
+    private static String emptyToNull(String s) {
+        return s == null || s.isEmpty() ? null : s;
+    }
+
     @Override
     public String createFolder(DeviceHandle handle, String name, String parentId, String storageId) throws IOException {
         var d = dev(handle);
@@ -627,6 +676,15 @@ class WpdBackend implements MtpBackend {
             int hr = call(values, VAL_GET_U8,
                 FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, ADDRESS), key, out);
             return failed(hr) ? -1 : out.get(JAVA_LONG, 0);
+        }
+    }
+
+    private long getU4(MemorySegment values, MemorySegment key) {
+        try (var arena = Arena.ofConfined()) {
+            var out = arena.allocate(JAVA_INT);
+            int hr = call(values, VAL_GET_U4,
+                FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, ADDRESS), key, out);
+            return failed(hr) ? -1 : Integer.toUnsignedLong(out.get(JAVA_INT, 0));
         }
     }
 
