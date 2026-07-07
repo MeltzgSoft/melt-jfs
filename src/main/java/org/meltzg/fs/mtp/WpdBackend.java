@@ -441,18 +441,27 @@ class WpdBackend implements MtpBackend {
         var d = dev(handle);
         var values = getValues(d.properties(), itemId,
             KEY_MEDIA_TITLE, KEY_MEDIA_ARTIST, KEY_MUSIC_ALBUM, KEY_MEDIA_GENRE,
-            KEY_MUSIC_TRACK, KEY_MEDIA_DURATION);
+            KEY_MUSIC_TRACK, KEY_MEDIA_DURATION, KEY_NAME);
         if (MemorySegment.NULL.equals(values)) return null;
         try {
-            long trackNumber = getU4(values, KEY_MUSIC_TRACK);
-            long duration = getU8(values, KEY_MEDIA_DURATION);
-            var meta = new MTPTrackMetadata(
-                emptyToNull(getString(values, KEY_MEDIA_TITLE)),
-                emptyToNull(getString(values, KEY_MEDIA_ARTIST)),
-                emptyToNull(getString(values, KEY_MUSIC_ALBUM)),
-                emptyToNull(getString(values, KEY_MEDIA_GENRE)),
-                (int) Math.max(trackNumber, 0),
-                Math.max(duration, 0));
+            String title = emptyToNull(getString(values, KEY_MEDIA_TITLE));
+            String artist = emptyToNull(getString(values, KEY_MEDIA_ARTIST));
+            String album = emptyToNull(getString(values, KEY_MUSIC_ALBUM));
+            String genre = emptyToNull(getString(values, KEY_MEDIA_GENRE));
+            int trackNumber = (int) Math.max(getU4(values, KEY_MUSIC_TRACK), 0);
+            long duration = Math.max(getU8(values, KEY_MEDIA_DURATION), 0);
+
+            // Devices commonly index a track's ID3 title (TIT2) onto WPD_OBJECT_NAME and leave
+            // WPD_MEDIA_TITLE empty. Fall back to the object name for the title — but only once
+            // another media property confirms the device recognised this object as a track, so a
+            // plain file's name can't masquerade as a title (WPD has no "is a track" gate).
+            boolean recognisedTrack = artist != null || album != null || genre != null
+                || trackNumber > 0 || duration > 0;
+            if (title == null && recognisedTrack) {
+                title = emptyToNull(getString(values, KEY_NAME));
+            }
+
+            var meta = new MTPTrackMetadata(title, artist, album, genre, trackNumber, duration);
             return meta.isEmpty() ? null : meta;
         } finally {
             release(values);

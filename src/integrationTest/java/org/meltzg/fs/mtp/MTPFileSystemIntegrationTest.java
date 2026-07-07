@@ -740,8 +740,8 @@ public class MTPFileSystemIntegrationTest {
 
         Files.write(target, fixture);
         try {
-            // sendFile now stamps an audio filetype from the .mp3 extension, so the device indexes
-            // the object and exposes its tags. Indexing is asynchronous, so poll within a budget.
+            // sendFile stamps an audio filetype from the .mp3 extension, so the device indexes the
+            // object and exposes its tags. Indexing can be asynchronous, so poll within a budget.
             MTPTrackMetadata meta = null;
             long deadlineNanos = System.nanoTime() + java.time.Duration.ofSeconds(30).toNanos();
             while (System.nanoTime() < deadlineNanos) {
