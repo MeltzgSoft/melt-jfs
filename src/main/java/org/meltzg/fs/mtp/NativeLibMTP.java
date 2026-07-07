@@ -12,6 +12,8 @@ import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
+import java.util.Map;
 
 import static java.lang.foreign.MemoryLayout.PathElement.groupElement;
 import static java.lang.foreign.ValueLayout.*;
@@ -29,8 +31,38 @@ class NativeLibMTP implements MtpBackend {
     static final int LIBMTP_ERROR_NO_DEVICE_ATTACHED = 5;
     static final int LIBMTP_FILES_AND_FOLDERS_ROOT = 0xFFFFFFFF;
     static final int LIBMTP_FILETYPE_FOLDER = 0;
+    // Audio filetypes whose enum indices are stable across libmtp 1.1.x (verified against 1.1.21).
+    static final int LIBMTP_FILETYPE_WAV = 1;
+    static final int LIBMTP_FILETYPE_MP3 = 2;
+    static final int LIBMTP_FILETYPE_WMA = 3;
+    static final int LIBMTP_FILETYPE_OGG = 4;
+    static final int LIBMTP_FILETYPE_AAC = 30;
+    static final int LIBMTP_FILETYPE_FLAC = 32;
+    static final int LIBMTP_FILETYPE_MP2 = 33;
+    static final int LIBMTP_FILETYPE_M4A = 34;
     // Neutral "generic file" type; index of LIBMTP_FILETYPE_UNKNOWN in libmtp 1.1.x's enum.
     static final int LIBMTP_FILETYPE_UNKNOWN = 44;
+
+    // Uploads carry only a filename, so the audio object format is inferred from the extension.
+    // Storing a track under a media filetype lets the device index it and expose its tags through
+    // getTrackMetadata; anything unrecognised stays LIBMTP_FILETYPE_UNKNOWN (a plain file).
+    private static final Map<String, Integer> AUDIO_FILETYPES_BY_EXTENSION = Map.of(
+        "mp3",  LIBMTP_FILETYPE_MP3,
+        "flac", LIBMTP_FILETYPE_FLAC,
+        "m4a",  LIBMTP_FILETYPE_M4A,
+        "aac",  LIBMTP_FILETYPE_AAC,
+        "ogg",  LIBMTP_FILETYPE_OGG,
+        "wav",  LIBMTP_FILETYPE_WAV,
+        "wma",  LIBMTP_FILETYPE_WMA,
+        "mp2",  LIBMTP_FILETYPE_MP2);
+
+    /** Maps a filename's extension to a libmtp audio filetype, or UNKNOWN when it is not audio. */
+    static int filetypeForFilename(String filename) {
+        int dot = filename.lastIndexOf('.');
+        if (dot < 0 || dot == filename.length() - 1) return LIBMTP_FILETYPE_UNKNOWN;
+        var ext = filename.substring(dot + 1).toLowerCase(Locale.ROOT);
+        return AUDIO_FILETYPES_BY_EXTENSION.getOrDefault(ext, LIBMTP_FILETYPE_UNKNOWN);
+    }
 
     /** Live libmtp handle: the opened device plus the raw-device slice it was opened from. */
     private record LibMtpDevice(MemorySegment rawDevice, MemorySegment device) implements DeviceHandle {}
@@ -458,9 +490,10 @@ class NativeLibMTP implements MtpBackend {
      * that costs one GetObjectInfo for the handle (already cached when a listing walked past it)
      * plus a single-object GetObjectPropList (or per-property GetObjectPropValue calls on devices
      * without proplist support) — a few small USB transactions, never a data transfer. libmtp
-     * returns NULL for objects whose format is not a known track type, so files stored as
-     * "unknown" (as {@link #sendFile} sends them) report no metadata until the device's own
-     * indexer reclassifies them.
+     * returns NULL for objects whose format is not a known track type. {@link #sendFile} infers an
+     * audio filetype from the filename extension, so tracks uploaded with a recognised extension are
+     * stored in an indexable format; files stored as "unknown" report no metadata until the device's
+     * own indexer reclassifies them.
      */
     @Override
     public MTPTrackMetadata getTrackMetadata(DeviceHandle handle, String itemId) throws IOException {
@@ -550,7 +583,7 @@ class NativeLibMTP implements MtpBackend {
             FILE_STORAGE_ID.set(fileData, toHandle(storageId));
             FILE_FILENAME.set(fileData, arena.allocateFrom(filename));
             FILE_FILESIZE.set(fileData, filesize);
-            FILE_FILETYPE.set(fileData, LIBMTP_FILETYPE_UNKNOWN);
+            FILE_FILETYPE.set(fileData, filetypeForFilename(filename));
 
             var pathSeg = arena.allocateFrom(localPath);
             int ret;

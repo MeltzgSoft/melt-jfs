@@ -2,6 +2,7 @@ package org.meltzg.fs.mtp;
 
 import org.junit.*;
 import org.meltzg.fs.mtp.types.MTPDeviceIdentifier;
+import org.meltzg.fs.mtp.types.MTPTrackMetadata;
 
 import java.io.IOException;
 import java.net.URI;
@@ -29,6 +30,8 @@ public class MTPFileSystemIntegrationTest {
     private static final String TEST_FILE_NAME = "__melt_jfs_test__.bin";
     private static final String TEST_FILE_NAME2 = "__melt_jfs_test__moved.bin";
     private static final String TEST_DIR_NAME2 = "__melt_jfs_test_moved__";
+    private static final String META_FILE_NAME = "__melt_jfs_test__.mp3";
+    private static final String META_FIXTURE = "/fixtures/tagged-track.mp3";
 
     private MTPFileSystemProvider provider;
     private MTPFileSystem fs;
@@ -63,6 +66,7 @@ public class MTPFileSystemIntegrationTest {
             if (storage != null) {
                 Files.deleteIfExists(storage.resolve(TEST_FILE_NAME));
                 Files.deleteIfExists(storage.resolve(TEST_FILE_NAME2));
+                Files.deleteIfExists(storage.resolve(META_FILE_NAME));
                 deleteTreeQuietly(storage.resolve(TEST_DIR_NAME));
                 deleteTreeQuietly(storage.resolve(TEST_DIR_NAME2));
             }
@@ -716,6 +720,47 @@ public class MTPFileSystemIntegrationTest {
         var bridge = MTPDeviceBridge.getInstance();
         var deviceId = fs.getDeviceIdentifier();
         assertNull(bridge.getTrackMetadata(deviceId, storage.toAbsolutePath().toString()));
+    }
+
+    @Test
+    public void uploadedTrackTagsAreReadBackCorrectly() throws IOException, InterruptedException {
+        var storage = requireFirstStorage();
+
+        // A ~1s silent MP3 carrying these exact ID3 tags, checked in under integrationTest resources.
+        byte[] fixture;
+        try (var in = getClass().getResourceAsStream(META_FIXTURE)) {
+            assumeTrue("tagged audio fixture " + META_FIXTURE + " not on classpath", in != null);
+            fixture = in.readAllBytes();
+        }
+
+        var target = storage.resolve(META_FILE_NAME);
+        var bridge = MTPDeviceBridge.getInstance();
+        var deviceId = fs.getDeviceIdentifier();
+        var absPath = target.toAbsolutePath().toString();
+
+        Files.write(target, fixture);
+        try {
+            // sendFile now stamps an audio filetype from the .mp3 extension, so the device indexes
+            // the object and exposes its tags. Indexing is asynchronous, so poll within a budget.
+            MTPTrackMetadata meta = null;
+            long deadlineNanos = System.nanoTime() + java.time.Duration.ofSeconds(30).toNanos();
+            while (System.nanoTime() < deadlineNanos) {
+                meta = bridge.getTrackMetadata(deviceId, absPath);
+                if (meta != null && meta.title() != null) break;
+                Thread.sleep(1_000);
+            }
+            assumeTrue("device did not index the uploaded track within 30s", meta != null && meta.title() != null);
+
+            assertEquals("melt-jfs Test Title",  meta.title());
+            assertEquals("melt-jfs Test Artist", meta.artist());
+            assertEquals("melt-jfs Test Album",  meta.album());
+            assertEquals("Jazz",                 meta.genre());
+            assertEquals(7,                      meta.trackNumber());
+            assertTrue("duration should be positive, was " + meta.durationMillis(),
+                meta.durationMillis() > 0);
+        } finally {
+            Files.deleteIfExists(target);
+        }
     }
 
     // --- helpers ---

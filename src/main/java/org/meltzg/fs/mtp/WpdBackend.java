@@ -15,6 +15,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -76,8 +77,16 @@ class WpdBackend implements MtpBackend {
     private static final MemorySegment CONTENT_TYPE_FOLDER;
     private static final MemorySegment CONTENT_TYPE_FUNCTIONAL_OBJECT;
     private static final MemorySegment CONTENT_TYPE_GENERIC_FILE;
+    private static final MemorySegment CONTENT_TYPE_AUDIO;
     private static final MemorySegment FORMAT_UNSPECIFIED;
     private static final MemorySegment FORMAT_PROPERTIES_ONLY;
+    // Audio object formats, keyed by upload extension in audioFormatForFilename.
+    private static final MemorySegment FORMAT_MP3;
+    private static final MemorySegment FORMAT_WAV;
+    private static final MemorySegment FORMAT_WMA;
+    private static final MemorySegment FORMAT_OGG;
+    private static final MemorySegment FORMAT_AAC;
+    private static final MemorySegment FORMAT_FLAC;
     private static final MemorySegment FUNCTIONAL_CATEGORY_STORAGE;
 
     // The well-known root from which a device's functional objects (storages) are enumerated.
@@ -151,8 +160,18 @@ class WpdBackend implements MtpBackend {
         CONTENT_TYPE_FOLDER = guid(a, "27e2e392-a111-48e0-ab0c-e17705a05f85");
         CONTENT_TYPE_FUNCTIONAL_OBJECT = guid(a, "99ed0160-17ff-4c44-9d98-1d7a6f941921");
         CONTENT_TYPE_GENERIC_FILE = guid(a, "0085e0a6-8d34-45d7-bc5c-447e59c73d48");
+        CONTENT_TYPE_AUDIO = guid(a, "4ad2c85e-5e2d-45e5-8864-4f229e3c6cf0");
         FORMAT_UNSPECIFIED = guid(a, "30000000-ae6c-4804-98ba-c57b46965fe7");
         FORMAT_PROPERTIES_ONLY = guid(a, "30010000-ae6c-4804-98ba-c57b46965fe7");
+        // WPD object-format GUIDs are {0000<mtp-format-code>-ae6c-4804-98ba-c57b46965fe7}
+        // (PortableDevice.h). Codes: WAV 0x3008, MP3 0x3009, WMA 0xB901, OGG 0xB902,
+        // AAC 0xB903, FLAC 0xB906.
+        FORMAT_MP3  = guid(a, "00003009-ae6c-4804-98ba-c57b46965fe7");
+        FORMAT_WAV  = guid(a, "00003008-ae6c-4804-98ba-c57b46965fe7");
+        FORMAT_WMA  = guid(a, "0000b901-ae6c-4804-98ba-c57b46965fe7");
+        FORMAT_OGG  = guid(a, "0000b902-ae6c-4804-98ba-c57b46965fe7");
+        FORMAT_AAC  = guid(a, "0000b903-ae6c-4804-98ba-c57b46965fe7");
+        FORMAT_FLAC = guid(a, "0000b906-ae6c-4804-98ba-c57b46965fe7");
         FUNCTIONAL_CATEGORY_STORAGE = guid(a, "23f05bbc-15de-4c2a-a55b-a9af5ce412ef");
     }
 
@@ -514,6 +533,25 @@ class WpdBackend implements MtpBackend {
         }
     }
 
+    /**
+     * Returns the WPD audio object-format GUID for a filename's extension, or {@code null} when it
+     * is not a recognised audio extension. Extensions without a standard WPD object format (e.g.
+     * .m4a, .mp2) return null and are stored as generic files, unlike the libmtp backend.
+     */
+    private static MemorySegment audioFormatForFilename(String filename) {
+        int dot = filename.lastIndexOf('.');
+        if (dot < 0 || dot == filename.length() - 1) return null;
+        return switch (filename.substring(dot + 1).toLowerCase(Locale.ROOT)) {
+            case "mp3"  -> FORMAT_MP3;
+            case "wav"  -> FORMAT_WAV;
+            case "wma"  -> FORMAT_WMA;
+            case "ogg"  -> FORMAT_OGG;
+            case "aac"  -> FORMAT_AAC;
+            case "flac" -> FORMAT_FLAC;
+            default     -> null;
+        };
+    }
+
     @Override
     public String sendFile(DeviceHandle handle, String localPath, String filename,
                            String parentId, String storageId, long filesize) throws IOException {
@@ -527,10 +565,17 @@ class WpdBackend implements MtpBackend {
                 setString(values, KEY_NAME, wstr(arena, filename));
                 setString(values, KEY_ORIGINAL_FILE_NAME, wstr(arena, filename));
                 setU8(values, KEY_OBJECT_SIZE, filesize);
-                setGuid(values, KEY_CONTENT_TYPE, CONTENT_TYPE_GENERIC_FILE);
-                // WPD requires an object format alongside the content type; the generic
-                // "unspecified" format lets the device store an arbitrary byte stream.
-                setGuid(values, KEY_OBJECT_FORMAT, FORMAT_UNSPECIFIED);
+                // Storing a track as audio with its codec's object format lets the device index it
+                // and expose tags via getTrackMetadata (parity with the libmtp backend's sendFile).
+                // Anything else is stored as a generic, format-unspecified byte stream.
+                var audioFormat = audioFormatForFilename(filename);
+                if (audioFormat != null) {
+                    setGuid(values, KEY_CONTENT_TYPE, CONTENT_TYPE_AUDIO);
+                    setGuid(values, KEY_OBJECT_FORMAT, audioFormat);
+                } else {
+                    setGuid(values, KEY_CONTENT_TYPE, CONTENT_TYPE_GENERIC_FILE);
+                    setGuid(values, KEY_OBJECT_FORMAT, FORMAT_UNSPECIFIED);
+                }
 
                 var streamOut = arena.allocate(ADDRESS);
                 var optBuf = arena.allocate(JAVA_INT);
