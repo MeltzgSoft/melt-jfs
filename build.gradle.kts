@@ -29,7 +29,7 @@ dependencies {
 }
 
 // Source set for developer tools — compiled separately, never included in the published JAR.
-val dev by sourceSets.creating {
+val dev = sourceSets.create("dev") {
     java.srcDir("src/dev/java")
     compileClasspath += sourceSets.main.get().output
     compileClasspath += configurations["runtimeClasspath"]
@@ -39,7 +39,7 @@ val dev by sourceSets.creating {
 
 // Real-device integration tests live in their own source set so they run in a separate JVM from the
 // fake-backed unit tests — no shared MTPDeviceBridge singleton or libmtp state across the two.
-val integrationTest by sourceSets.creating {
+val integrationTest = sourceSets.create("integrationTest") {
     java.srcDir("src/integrationTest/java")
     compileClasspath += sourceSets.main.get().output + configurations["testCompileClasspath"]
     runtimeClasspath += sourceSets.main.get().output + configurations["testRuntimeClasspath"]
