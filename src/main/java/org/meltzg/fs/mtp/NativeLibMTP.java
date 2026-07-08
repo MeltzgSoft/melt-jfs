@@ -290,12 +290,15 @@ class NativeLibMTP implements MtpBackend {
 
     // Locates the installed libmtp shared library. The SONAME differs per OS (Linux keeps the
     // versioned `.so.9`; macOS uses `libmtp.9.dylib`), so each candidate is tried in turn and the
-    // first that loads wins. Struct layouts in this class are still authored for libmtp 1.1.x on an
-    // LP64 target — see the class header before trusting this on a new platform.
+    // first that loads wins. On macOS the bare name only resolves if Homebrew's lib dir is on the
+    // dlopen path, so the Homebrew prefixes (`/opt/homebrew` on Apple Silicon, `/usr/local` on
+    // Intel) are also tried by absolute path. Struct layouts in this class are still authored for
+    // libmtp 1.1.x on an LP64 target — see the class header before trusting this on a new platform.
     private static SymbolLookup lookupLibmtp() {
         var os = System.getProperty("os.name", "").toLowerCase(Locale.ROOT);
         String[] candidates = os.contains("mac") || os.contains("darwin")
-            ? new String[] {"libmtp.9.dylib", "libmtp.dylib"}
+            ? new String[] {"libmtp.9.dylib", "libmtp.dylib",
+                            "/opt/homebrew/lib/libmtp.9.dylib", "/usr/local/lib/libmtp.9.dylib"}
             : new String[] {"libmtp.so.9", "libmtp.so"};
         for (var name : candidates) {
             try {

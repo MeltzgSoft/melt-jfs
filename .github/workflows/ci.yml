@@ -26,9 +26,20 @@ jobs:
 
       - uses: gradle/actions/setup-gradle@v3
 
-      # The unit tests inject a FakeLibMTP and never load native libmtp, so no system libraries are
-      # needed. Integration tests require a physically connected device, so they are not run here;
-      # we compile them (integrationTestClasses) only to ensure they don't bit-rot.
+      # libmtp is the native backend on Linux and macOS and is required to build the binding, so it
+      # is installed unconditionally on those jobs; NativeLibMTPLoadTest fails if it cannot load.
+      # Windows uses the WPD backend and needs no libmtp.
+      - name: Install libmtp (Linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: sudo apt-get update && sudo apt-get install -y libmtp9
+      - name: Install libmtp (macOS)
+        if: matrix.os == 'macos-latest'
+        run: brew install libmtp
+
+      # The fake-backed unit tests inject a FakeLibMTP and never load native libmtp; the libmtp load
+      # smoke test (NativeLibMTPLoadTest) additionally verifies the real library resolves and binds.
+      # Integration tests require a physically connected device, so they are not run here; we compile
+      # them (integrationTestClasses) only to ensure they don't bit-rot.
       - name: Run unit tests and compile integration tests
         run: ./gradlew test integrationTestClasses
 
