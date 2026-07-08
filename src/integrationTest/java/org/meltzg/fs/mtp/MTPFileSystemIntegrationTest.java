@@ -756,8 +756,11 @@ public class MTPFileSystemIntegrationTest {
             assertEquals("melt-jfs Test Album",  meta.album());
             assertEquals("Jazz",                 meta.genre());
             assertEquals(7,                      meta.trackNumber());
-            assertTrue("duration should be positive, was " + meta.durationMillis(),
-                meta.durationMillis() > 0);
+            // The fixture is ~1045ms of audio; the device reports its own duration in milliseconds.
+            // A band (not an exact match) allows for rounding/derivation differences across devices
+            // while still proving the value is milliseconds — not seconds (~1) or 100ns units (~10.4M).
+            assertTrue("duration should be ~1s in millis, was " + meta.durationMillis(),
+                meta.durationMillis() > 500 && meta.durationMillis() < 2_000);
         } finally {
             Files.deleteIfExists(target);
         }

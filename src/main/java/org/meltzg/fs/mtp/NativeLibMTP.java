@@ -17,6 +17,7 @@ import java.util.Map;
 
 import static java.lang.foreign.MemoryLayout.PathElement.groupElement;
 import static java.lang.foreign.ValueLayout.*;
+import static org.meltzg.fs.mtp.MtpBackend.emptyToNull;
 
 /**
  * FFM bindings for libmtp. Struct layouts are defined for libmtp 1.1.x on x86-64 Linux.
@@ -523,10 +524,6 @@ class NativeLibMTP implements MtpBackend {
                 throw new RuntimeException("Failed to free track metadata", t);
             }
         }
-    }
-
-    private static String emptyToNull(String s) {
-        return s == null || s.isEmpty() ? null : s;
     }
 
     @Override

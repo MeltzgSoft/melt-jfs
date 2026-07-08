@@ -20,6 +20,7 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 import static java.lang.foreign.ValueLayout.*;
+import static org.meltzg.fs.mtp.MtpBackend.emptyToNull;
 import static org.meltzg.fs.mtp.WpdCom.*;
 
 /**
@@ -466,10 +467,6 @@ class WpdBackend implements MtpBackend {
         } finally {
             release(values);
         }
-    }
-
-    private static String emptyToNull(String s) {
-        return s == null || s.isEmpty() ? null : s;
     }
 
     @Override

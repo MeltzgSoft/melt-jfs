@@ -101,6 +101,11 @@ public interface MtpBackend {
 
     void releaseDevice(DeviceHandle device);
 
+    /** Normalizes a device-reported string: a null or empty value becomes null. */
+    static String emptyToNull(String s) {
+        return s == null || s.isEmpty() ? null : s;
+    }
+
     /** Selects the native backend for the current platform. */
     static MtpBackend defaultBackend() {
         String os = System.getProperty("os.name", "").toLowerCase();
