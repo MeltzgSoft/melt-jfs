@@ -20,8 +20,12 @@ import static java.lang.foreign.ValueLayout.*;
 import static org.meltzg.fs.mtp.MtpBackend.emptyToNull;
 
 /**
- * FFM bindings for libmtp. Struct layouts are defined for libmtp 1.1.x on x86-64 Linux.
- * For other platforms, use jextract against the installed libmtp.h to regenerate layouts.
+ * FFM bindings for libmtp. The shared library is resolved per-OS by {@link #lookupLibmtp()}
+ * (Linux {@code libmtp.so.9}, macOS {@code libmtp.9.dylib}). Struct layouts, however, are authored
+ * for libmtp 1.1.x on an LP64 target and verified only on x86-64 Linux; the natural alignments hold
+ * on other LP64 ABIs (e.g. arm64 macOS) but the field offsets and filetype enum indices are not
+ * verified there. For a different libmtp version or a non-LP64 target, regenerate the layouts with
+ * jextract against the installed libmtp.h.
  *
  * <p>libmtp's 32-bit object handles are exposed through the {@link MtpBackend} contract as
  * unsigned-decimal strings; {@link MtpBackend#ROOT_PARENT} maps to libmtp's {@code 0xFFFFFFFF}.
@@ -230,7 +234,7 @@ class NativeLibMTP implements MtpBackend {
 
     private NativeLibMTP() {
         var linker = Linker.nativeLinker();
-        var libmtp = SymbolLookup.libraryLookup("libmtp.so.9", Arena.global());
+        var libmtp = lookupLibmtp();
 
         init = bind(linker, libmtp, "LIBMTP_Init",
             FunctionDescriptor.ofVoid());
@@ -277,6 +281,27 @@ class NativeLibMTP implements MtpBackend {
         } catch (Throwable t) {
             throw new RuntimeException("Failed to initialize libmtp", t);
         }
+    }
+
+    // Locates the installed libmtp shared library. The SONAME differs per OS (Linux keeps the
+    // versioned `.so.9`; macOS uses `libmtp.9.dylib`), so each candidate is tried in turn and the
+    // first that loads wins. Struct layouts in this class are still authored for libmtp 1.1.x on an
+    // LP64 target — see the class header before trusting this on a new platform.
+    private static SymbolLookup lookupLibmtp() {
+        var os = System.getProperty("os.name", "").toLowerCase(Locale.ROOT);
+        String[] candidates = os.contains("mac") || os.contains("darwin")
+            ? new String[] {"libmtp.9.dylib", "libmtp.dylib"}
+            : new String[] {"libmtp.so.9", "libmtp.so"};
+        for (var name : candidates) {
+            try {
+                return SymbolLookup.libraryLookup(name, Arena.global());
+            } catch (IllegalArgumentException ignored) {
+                // Not present under this name; fall through to the next candidate.
+            }
+        }
+        throw new UnsatisfiedLinkError(
+            "libmtp not found; tried " + String.join(", ", candidates)
+                + ". Install libmtp (e.g. `brew install libmtp` or `apt install libmtp9`).");
     }
 
     // As of the finalized FFM API (JDK 22), layout-derived VarHandles carry a leading `long`
