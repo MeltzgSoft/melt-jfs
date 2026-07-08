@@ -729,7 +729,9 @@ public class MTPFileSystemIntegrationTest {
         // A ~1s silent MP3 carrying these exact ID3 tags, checked in under integrationTest resources.
         byte[] fixture;
         try (var in = getClass().getResourceAsStream(META_FIXTURE)) {
-            assumeTrue("tagged audio fixture " + META_FIXTURE + " not on classpath", in != null);
+            // The fixture is checked into integrationTest resources, so a missing one is a build
+            // packaging bug, not an environmental condition — fail rather than skip.
+            assertNotNull("tagged audio fixture " + META_FIXTURE + " not on classpath", in);
             fixture = in.readAllBytes();
         }
 
@@ -749,7 +751,10 @@ public class MTPFileSystemIntegrationTest {
                 if (meta != null && meta.title() != null) break;
                 Thread.sleep(1_000);
             }
-            assumeTrue("device did not index the uploaded track within 30s", meta != null && meta.title() != null);
+            // Reaching here without indexed metadata is a real regression (upload stamped the wrong
+            // filetype, or the tags never became readable), not an environmental skip — fail on it.
+            assertTrue("device did not index the uploaded track within 30s",
+                meta != null && meta.title() != null);
 
             assertEquals("melt-jfs Test Title",  meta.title());
             assertEquals("melt-jfs Test Artist", meta.artist());
