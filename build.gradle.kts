@@ -1,3 +1,8 @@
+import org.gradle.api.tasks.testing.TestDescriptor
+import org.gradle.api.tasks.testing.TestListener
+import org.gradle.api.tasks.testing.TestResult
+import org.gradle.api.tasks.testing.logging.TestLogEvent
+
 plugins {
     `java-library`
     id("com.vanniktech.maven.publish") version "0.36.0"
@@ -24,7 +29,7 @@ dependencies {
 }
 
 // Source set for developer tools — compiled separately, never included in the published JAR.
-val dev by sourceSets.creating {
+val dev = sourceSets.create("dev") {
     java.srcDir("src/dev/java")
     compileClasspath += sourceSets.main.get().output
     compileClasspath += configurations["runtimeClasspath"]
@@ -34,7 +39,7 @@ val dev by sourceSets.creating {
 
 // Real-device integration tests live in their own source set so they run in a separate JVM from the
 // fake-backed unit tests — no shared MTPDeviceBridge singleton or libmtp state across the two.
-val integrationTest by sourceSets.creating {
+val integrationTest = sourceSets.create("integrationTest") {
     java.srcDir("src/integrationTest/java")
     compileClasspath += sourceSets.main.get().output + configurations["testCompileClasspath"]
     runtimeClasspath += sourceSets.main.get().output + configurations["testRuntimeClasspath"]
@@ -63,6 +68,32 @@ tasks.register<Test>("integrationTest") {
     maxParallelForks = 1
     jvmArgs("--enable-native-access=ALL-UNNAMED")
     shouldRunAfter(tasks.test)
+
+    // These tests self-skip (via JUnit assumptions) when no device is attached, so make skips
+    // visible on the console — otherwise an all-skipped run is indistinguishable from a passing one.
+    testLogging {
+        events(TestLogEvent.PASSED, TestLogEvent.SKIPPED, TestLogEvent.FAILED)
+    }
+
+    // Opt-in guard: `-PrequireDevice` turns an all-skipped run into a build failure, so a run meant
+    // to exercise a real device can't quietly pass without executing anything. Off by default and
+    // deliberately NOT used in CI, which never has a device connected.
+    val requireDevice = providers.gradleProperty("requireDevice").isPresent
+    addTestListener(object : TestListener {
+        override fun beforeSuite(suite: TestDescriptor) {}
+        override fun beforeTest(test: TestDescriptor) {}
+        override fun afterTest(test: TestDescriptor, result: TestResult) {}
+        override fun afterSuite(suite: TestDescriptor, result: TestResult) {
+            if (suite.parent == null) { // the root aggregate suite: totals across all forked JVMs
+                println("Integration: ${result.testCount} tests, ${result.successfulTestCount} passed, " +
+                    "${result.skippedTestCount} skipped, ${result.failedTestCount} failed")
+                if (requireDevice && result.successfulTestCount == 0L) {
+                    throw GradleException("requireDevice: no integration tests executed (all skipped) " +
+                        "— is a device connected?")
+                }
+            }
+        }
+    })
 }
 
 mavenPublishing {

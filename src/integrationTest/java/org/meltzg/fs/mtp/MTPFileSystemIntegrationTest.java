@@ -2,6 +2,7 @@ package org.meltzg.fs.mtp;
 
 import org.junit.*;
 import org.meltzg.fs.mtp.types.MTPDeviceIdentifier;
+import org.meltzg.fs.mtp.types.MTPTrackMetadata;
 
 import java.io.IOException;
 import java.net.URI;
@@ -11,6 +12,7 @@ import java.nio.file.attribute.BasicFileAttributes;
 import java.nio.file.attribute.FileTime;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Set;
 import java.util.stream.Collectors;
 
 import static org.junit.Assert.*;
@@ -28,6 +30,8 @@ public class MTPFileSystemIntegrationTest {
     private static final String TEST_FILE_NAME = "__melt_jfs_test__.bin";
     private static final String TEST_FILE_NAME2 = "__melt_jfs_test__moved.bin";
     private static final String TEST_DIR_NAME2 = "__melt_jfs_test_moved__";
+    private static final String META_FILE_NAME = "__melt_jfs_test__.mp3";
+    private static final String META_FIXTURE = "/fixtures/tagged-track.mp3";
 
     private MTPFileSystemProvider provider;
     private MTPFileSystem fs;
@@ -62,6 +66,7 @@ public class MTPFileSystemIntegrationTest {
             if (storage != null) {
                 Files.deleteIfExists(storage.resolve(TEST_FILE_NAME));
                 Files.deleteIfExists(storage.resolve(TEST_FILE_NAME2));
+                Files.deleteIfExists(storage.resolve(META_FILE_NAME));
                 deleteTreeQuietly(storage.resolve(TEST_DIR_NAME));
                 deleteTreeQuietly(storage.resolve(TEST_DIR_NAME2));
             }
@@ -677,7 +682,115 @@ public class MTPFileSystemIntegrationTest {
         }
     }
 
+    // --- track metadata ("mtp" attribute view) ---
+
+    @Test
+    public void trackMetadataViewHasExpectedShape() throws IOException {
+        var storage = requireFirstStorage();
+        var file = findFirstFile(storage, 2);
+        assumeTrue("No regular files found in first 2 levels of " + storage, file != null);
+
+        var attrs = Files.readAttributes(file, "mtp:*");
+        assertEquals(Set.of("title", "artist", "album", "genre", "trackNumber", "durationMillis"),
+            attrs.keySet());
+    }
+
+    @Test
+    public void trackMetadataReadsForAudioFileWithoutTransferringContent() throws IOException {
+        var storage = requireFirstStorage();
+        var audio = findFirstAudioFile(storage, 4);
+        assumeTrue("No audio files found in first 4 levels of " + storage, audio != null);
+
+        long start = System.nanoTime();
+        var attrs = Files.readAttributes(audio, "mtp:*");
+        long elapsedMillis = (System.nanoTime() - start) / 1_000_000;
+
+        // Diagnostic for the spike: how long a metadata-only read takes vs pulling the file.
+        System.out.println("mtp:* for " + audio + " took " + elapsedMillis + "ms: " + attrs);
+        assertEquals(Set.of("title", "artist", "album", "genre", "trackNumber", "durationMillis"),
+            attrs.keySet());
+        // A metadata read must be far cheaper than transferring the object; even the slowest
+        // supported path (per-property GetObjectPropValue) stays well under this bound.
+        assertTrue("metadata-only read took " + elapsedMillis + "ms", elapsedMillis < 5_000);
+    }
+
+    @Test
+    public void trackMetadataIsNullForDirectories() throws IOException {
+        var storage = requireFirstStorage();
+        var bridge = MTPDeviceBridge.getInstance();
+        var deviceId = fs.getDeviceIdentifier();
+        assertNull(bridge.getTrackMetadata(deviceId, storage.toAbsolutePath().toString()));
+    }
+
+    @Test
+    public void uploadedTrackTagsAreReadBackCorrectly() throws IOException, InterruptedException {
+        var storage = requireFirstStorage();
+
+        // A ~1s silent MP3 carrying these exact ID3 tags, checked in under integrationTest resources.
+        byte[] fixture;
+        try (var in = getClass().getResourceAsStream(META_FIXTURE)) {
+            // The fixture is checked into integrationTest resources, so a missing one is a build
+            // packaging bug, not an environmental condition — fail rather than skip.
+            assertNotNull("tagged audio fixture " + META_FIXTURE + " not on classpath", in);
+            fixture = in.readAllBytes();
+        }
+
+        var target = storage.resolve(META_FILE_NAME);
+        var bridge = MTPDeviceBridge.getInstance();
+        var deviceId = fs.getDeviceIdentifier();
+        var absPath = target.toAbsolutePath().toString();
+
+        Files.write(target, fixture);
+        try {
+            // sendFile stamps an audio filetype from the .mp3 extension, so the device indexes the
+            // object and exposes its tags. Indexing can be asynchronous, so poll within a budget.
+            MTPTrackMetadata meta = null;
+            long deadlineNanos = System.nanoTime() + java.time.Duration.ofSeconds(30).toNanos();
+            while (System.nanoTime() < deadlineNanos) {
+                meta = bridge.getTrackMetadata(deviceId, absPath);
+                if (meta != null && meta.title() != null) break;
+                Thread.sleep(1_000);
+            }
+            // Reaching here without indexed metadata is a real regression (upload stamped the wrong
+            // filetype, or the tags never became readable), not an environmental skip — fail on it.
+            assertTrue("device did not index the uploaded track within 30s",
+                meta != null && meta.title() != null);
+
+            assertEquals("melt-jfs Test Title",  meta.title());
+            assertEquals("melt-jfs Test Artist", meta.artist());
+            assertEquals("melt-jfs Test Album",  meta.album());
+            assertEquals("Jazz",                 meta.genre());
+            assertEquals(7,                      meta.trackNumber());
+            // The fixture is ~1045ms of audio; the device reports its own duration in milliseconds.
+            // A band (not an exact match) allows for rounding/derivation differences across devices
+            // while still proving the value is milliseconds — not seconds (~1) or 100ns units (~10.4M).
+            assertTrue("duration should be ~1s in millis, was " + meta.durationMillis(),
+                meta.durationMillis() > 500 && meta.durationMillis() < 2_000);
+        } finally {
+            Files.deleteIfExists(target);
+        }
+    }
+
     // --- helpers ---
+
+    private static final List<String> AUDIO_EXTENSIONS =
+        List.of(".mp3", ".flac", ".ogg", ".m4a", ".wma", ".wav", ".opus", ".aac");
+
+    private Path findFirstAudioFile(Path dir, int depthRemaining) throws IOException {
+        try (var stream = Files.newDirectoryStream(dir)) {
+            for (var child : stream) {
+                var name = child.getFileName().toString().toLowerCase();
+                if (Files.isRegularFile(child) && AUDIO_EXTENSIONS.stream().anyMatch(name::endsWith)) {
+                    return child;
+                }
+                if (Files.isDirectory(child) && depthRemaining > 0) {
+                    var found = findFirstAudioFile(child, depthRemaining - 1);
+                    if (found != null) return found;
+                }
+            }
+        }
+        return null;
+    }
 
     private Path requireFirstStorage() throws IOException {
         var storage = firstStorageOrNull();

@@ -3,6 +3,7 @@ package org.meltzg.fs.mtp;
 import org.meltzg.fs.mtp.types.MTPDeviceIdentifier;
 import org.meltzg.fs.mtp.types.MTPDeviceInfo;
 import org.meltzg.fs.mtp.types.MTPItemInfo;
+import org.meltzg.fs.mtp.types.MTPTrackMetadata;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -14,10 +15,12 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 import static java.lang.foreign.ValueLayout.*;
+import static org.meltzg.fs.mtp.MtpBackend.emptyToNull;
 import static org.meltzg.fs.mtp.WpdCom.*;
 
 /**
@@ -60,6 +63,12 @@ class WpdBackend implements MtpBackend {
     private static final MemorySegment KEY_STORAGE_CAPACITY;
     private static final MemorySegment KEY_STORAGE_FREE_SPACE;
     private static final MemorySegment KEY_RESOURCE_DEFAULT;
+    private static final MemorySegment KEY_MEDIA_TITLE;
+    private static final MemorySegment KEY_MEDIA_DURATION;
+    private static final MemorySegment KEY_MEDIA_ARTIST;
+    private static final MemorySegment KEY_MEDIA_GENRE;
+    private static final MemorySegment KEY_MUSIC_ALBUM;
+    private static final MemorySegment KEY_MUSIC_TRACK;
     private static final MemorySegment KEY_CLIENT_NAME;
     private static final MemorySegment KEY_CLIENT_MAJOR_VERSION;
     private static final MemorySegment KEY_CLIENT_MINOR_VERSION;
@@ -69,8 +78,16 @@ class WpdBackend implements MtpBackend {
     private static final MemorySegment CONTENT_TYPE_FOLDER;
     private static final MemorySegment CONTENT_TYPE_FUNCTIONAL_OBJECT;
     private static final MemorySegment CONTENT_TYPE_GENERIC_FILE;
+    private static final MemorySegment CONTENT_TYPE_AUDIO;
     private static final MemorySegment FORMAT_UNSPECIFIED;
     private static final MemorySegment FORMAT_PROPERTIES_ONLY;
+    // Audio object formats, keyed by upload extension in audioFormatForFilename.
+    private static final MemorySegment FORMAT_MP3;
+    private static final MemorySegment FORMAT_WAV;
+    private static final MemorySegment FORMAT_WMA;
+    private static final MemorySegment FORMAT_OGG;
+    private static final MemorySegment FORMAT_AAC;
+    private static final MemorySegment FORMAT_FLAC;
     private static final MemorySegment FUNCTIONAL_CATEGORY_STORAGE;
 
     // The well-known root from which a device's functional objects (storages) are enumerated.
@@ -88,7 +105,7 @@ class WpdBackend implements MtpBackend {
     private static final int PROPS_GET_VALUES = 5, PROPS_SET_VALUES = 6;
     private static final int RES_GET_STREAM = 5;
     private static final int VAL_GET_VALUE = 6, VAL_SET_STRING = 7, VAL_GET_STRING = 8, VAL_SET_U4 = 9,
-        VAL_SET_U8 = 13, VAL_GET_U8 = 14, VAL_SET_GUID = 27, VAL_GET_GUID = 28;
+        VAL_GET_U4 = 10, VAL_SET_U8 = 13, VAL_GET_U8 = 14, VAL_SET_GUID = 27, VAL_GET_GUID = 28;
     private static final int KEYCOLL_ADD = 5;
     private static final int PVCOLL_ADD = 5;
     private static final int STREAM_READ = 3, STREAM_WRITE = 4, STREAM_COMMIT = 8;
@@ -126,6 +143,15 @@ class WpdBackend implements MtpBackend {
         KEY_STORAGE_CAPACITY = propertyKey(a, "01a3057a-74d6-4e80-bea7-dc4c212ce50a", 4);
         KEY_STORAGE_FREE_SPACE = propertyKey(a, "01a3057a-74d6-4e80-bea7-dc4c212ce50a", 5);
         KEY_RESOURCE_DEFAULT = propertyKey(a, "e81e79be-34f0-41bf-b53f-f1a06ae87842", 0);
+        // WPD_MEDIA_* / WPD_MUSIC_* property keys (PortableDevice.h), read by getTrackMetadata.
+        String mediaFmt = "2ed8ba05-0ad3-42dc-b0d0-bc95ac396ac8";
+        KEY_MEDIA_TITLE = propertyKey(a, mediaFmt, 18);
+        KEY_MEDIA_DURATION = propertyKey(a, mediaFmt, 19);
+        KEY_MEDIA_ARTIST = propertyKey(a, mediaFmt, 24);
+        KEY_MEDIA_GENRE = propertyKey(a, mediaFmt, 32);
+        String musicFmt = "b324f56a-dc5d-46e5-b6df-d2ea414888c6";
+        KEY_MUSIC_ALBUM = propertyKey(a, musicFmt, 3);
+        KEY_MUSIC_TRACK = propertyKey(a, musicFmt, 4);
         String clientFmt = "204d9f0c-2292-4080-9f42-40664e70f859";
         KEY_CLIENT_NAME = propertyKey(a, clientFmt, 2);
         KEY_CLIENT_MAJOR_VERSION = propertyKey(a, clientFmt, 3);
@@ -135,8 +161,18 @@ class WpdBackend implements MtpBackend {
         CONTENT_TYPE_FOLDER = guid(a, "27e2e392-a111-48e0-ab0c-e17705a05f85");
         CONTENT_TYPE_FUNCTIONAL_OBJECT = guid(a, "99ed0160-17ff-4c44-9d98-1d7a6f941921");
         CONTENT_TYPE_GENERIC_FILE = guid(a, "0085e0a6-8d34-45d7-bc5c-447e59c73d48");
+        CONTENT_TYPE_AUDIO = guid(a, "4ad2c85e-5e2d-45e5-8864-4f229e3c6cf0");
         FORMAT_UNSPECIFIED = guid(a, "30000000-ae6c-4804-98ba-c57b46965fe7");
         FORMAT_PROPERTIES_ONLY = guid(a, "30010000-ae6c-4804-98ba-c57b46965fe7");
+        // WPD object-format GUIDs are {0000<mtp-format-code>-ae6c-4804-98ba-c57b46965fe7}
+        // (PortableDevice.h). Codes: WAV 0x3008, MP3 0x3009, WMA 0xB901, OGG 0xB902,
+        // AAC 0xB903, FLAC 0xB906.
+        FORMAT_MP3  = guid(a, "00003009-ae6c-4804-98ba-c57b46965fe7");
+        FORMAT_WAV  = guid(a, "00003008-ae6c-4804-98ba-c57b46965fe7");
+        FORMAT_WMA  = guid(a, "0000b901-ae6c-4804-98ba-c57b46965fe7");
+        FORMAT_OGG  = guid(a, "0000b902-ae6c-4804-98ba-c57b46965fe7");
+        FORMAT_AAC  = guid(a, "0000b903-ae6c-4804-98ba-c57b46965fe7");
+        FORMAT_FLAC = guid(a, "0000b906-ae6c-4804-98ba-c57b46965fe7");
         FUNCTIONAL_CATEGORY_STORAGE = guid(a, "23f05bbc-15de-4c2a-a55b-a9af5ce412ef");
     }
 
@@ -395,6 +431,44 @@ class WpdBackend implements MtpBackend {
         return items.toArray(new MTPItemInfo[0]);
     }
 
+    /**
+     * Backed by a single {@code IPortableDeviceProperties::GetValues} call requesting the
+     * WPD_MEDIA_* / WPD_MUSIC_* keys — a metadata-only exchange, never a data transfer. WPD has no
+     * "is a track" gate, so an object where every requested property is absent (a folder, a
+     * non-audio file, or an audio file the device has not indexed) reports null.
+     */
+    @Override
+    public MTPTrackMetadata getTrackMetadata(DeviceHandle handle, String itemId) throws IOException {
+        var d = dev(handle);
+        var values = getValues(d.properties(), itemId,
+            KEY_MEDIA_TITLE, KEY_MEDIA_ARTIST, KEY_MUSIC_ALBUM, KEY_MEDIA_GENRE,
+            KEY_MUSIC_TRACK, KEY_MEDIA_DURATION, KEY_NAME);
+        if (MemorySegment.NULL.equals(values)) return null;
+        try {
+            String title = emptyToNull(getString(values, KEY_MEDIA_TITLE));
+            String artist = emptyToNull(getString(values, KEY_MEDIA_ARTIST));
+            String album = emptyToNull(getString(values, KEY_MUSIC_ALBUM));
+            String genre = emptyToNull(getString(values, KEY_MEDIA_GENRE));
+            int trackNumber = (int) Math.max(getU4(values, KEY_MUSIC_TRACK), 0);
+            long duration = Math.max(getU8(values, KEY_MEDIA_DURATION), 0);
+
+            // Devices commonly index a track's ID3 title (TIT2) onto WPD_OBJECT_NAME and leave
+            // WPD_MEDIA_TITLE empty. Fall back to the object name for the title — but only once
+            // another media property confirms the device recognised this object as a track, so a
+            // plain file's name can't masquerade as a title (WPD has no "is a track" gate).
+            boolean recognisedTrack = artist != null || album != null || genre != null
+                || trackNumber > 0 || duration > 0;
+            if (title == null && recognisedTrack) {
+                title = emptyToNull(getString(values, KEY_NAME));
+            }
+
+            var meta = new MTPTrackMetadata(title, artist, album, genre, trackNumber, duration);
+            return meta.isEmpty() ? null : meta;
+        } finally {
+            release(values);
+        }
+    }
+
     @Override
     public String createFolder(DeviceHandle handle, String name, String parentId, String storageId) throws IOException {
         var d = dev(handle);
@@ -465,6 +539,25 @@ class WpdBackend implements MtpBackend {
         }
     }
 
+    /**
+     * Returns the WPD audio object-format GUID for a filename's extension, or {@code null} when it
+     * is not a recognised audio extension. Extensions without a standard WPD object format (e.g.
+     * .m4a, .mp2) return null and are stored as generic files, unlike the libmtp backend.
+     */
+    private static MemorySegment audioFormatForFilename(String filename) {
+        int dot = filename.lastIndexOf('.');
+        if (dot < 0 || dot == filename.length() - 1) return null;
+        return switch (filename.substring(dot + 1).toLowerCase(Locale.ROOT)) {
+            case "mp3"  -> FORMAT_MP3;
+            case "wav"  -> FORMAT_WAV;
+            case "wma"  -> FORMAT_WMA;
+            case "ogg"  -> FORMAT_OGG;
+            case "aac"  -> FORMAT_AAC;
+            case "flac" -> FORMAT_FLAC;
+            default     -> null;
+        };
+    }
+
     @Override
     public String sendFile(DeviceHandle handle, String localPath, String filename,
                            String parentId, String storageId, long filesize) throws IOException {
@@ -478,10 +571,17 @@ class WpdBackend implements MtpBackend {
                 setString(values, KEY_NAME, wstr(arena, filename));
                 setString(values, KEY_ORIGINAL_FILE_NAME, wstr(arena, filename));
                 setU8(values, KEY_OBJECT_SIZE, filesize);
-                setGuid(values, KEY_CONTENT_TYPE, CONTENT_TYPE_GENERIC_FILE);
-                // WPD requires an object format alongside the content type; the generic
-                // "unspecified" format lets the device store an arbitrary byte stream.
-                setGuid(values, KEY_OBJECT_FORMAT, FORMAT_UNSPECIFIED);
+                // Storing a track as audio with its codec's object format lets the device index it
+                // and expose tags via getTrackMetadata (parity with the libmtp backend's sendFile).
+                // Anything else is stored as a generic, format-unspecified byte stream.
+                var audioFormat = audioFormatForFilename(filename);
+                if (audioFormat != null) {
+                    setGuid(values, KEY_CONTENT_TYPE, CONTENT_TYPE_AUDIO);
+                    setGuid(values, KEY_OBJECT_FORMAT, audioFormat);
+                } else {
+                    setGuid(values, KEY_CONTENT_TYPE, CONTENT_TYPE_GENERIC_FILE);
+                    setGuid(values, KEY_OBJECT_FORMAT, FORMAT_UNSPECIFIED);
+                }
 
                 var streamOut = arena.allocate(ADDRESS);
                 var optBuf = arena.allocate(JAVA_INT);
@@ -627,6 +727,15 @@ class WpdBackend implements MtpBackend {
             int hr = call(values, VAL_GET_U8,
                 FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, ADDRESS), key, out);
             return failed(hr) ? -1 : out.get(JAVA_LONG, 0);
+        }
+    }
+
+    private long getU4(MemorySegment values, MemorySegment key) {
+        try (var arena = Arena.ofConfined()) {
+            var out = arena.allocate(JAVA_INT);
+            int hr = call(values, VAL_GET_U4,
+                FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, ADDRESS), key, out);
+            return failed(hr) ? -1 : Integer.toUnsignedLong(out.get(JAVA_INT, 0));
         }
     }
 

@@ -73,7 +73,9 @@ public class MTPFileSystem extends FileSystem {
 
     @Override
     public Set<String> supportedFileAttributeViews() {
-        return Set.of("basic");
+        // "mtp" is the track-metadata view (title/artist/album/genre/trackNumber/durationMillis)
+        // read from the device's MTP object properties; see MTPFileSystemProvider.
+        return Set.of("basic", "mtp");
     }
 
     @Override

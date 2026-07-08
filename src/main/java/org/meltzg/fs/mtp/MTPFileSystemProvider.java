@@ -405,6 +405,9 @@ public class MTPFileSystemProvider extends FileSystemProvider {
         "lastModifiedTime", "lastAccessTime", "creationTime", "isRegularFile",
         "isDirectory", "isSymbolicLink", "isOther", "size", "fileKey");
 
+    private static final Set<String> MTP_ATTRIBUTE_NAMES = Set.of(
+        "title", "artist", "album", "genre", "trackNumber", "durationMillis");
+
     @Override
     public Map<String, Object> readAttributes(Path path, String attributes, LinkOption... options) throws IOException {
         if (attributes == null) throw new NullPointerException();
@@ -415,21 +418,16 @@ public class MTPFileSystemProvider extends FileSystemProvider {
             view = attributes.substring(0, colon);
             keys = attributes.substring(colon + 1);
         }
-        if (!view.equals("basic")) throw new UnsupportedOperationException("View not supported: " + view);
         if (keys.isEmpty()) throw new IllegalArgumentException("No attributes specified");
+        return switch (view) {
+            case "basic" -> readBasicAttributeMap(path, keys, options);
+            case "mtp" -> readTrackMetadataMap(path, keys);
+            default -> throw new UnsupportedOperationException("View not supported: " + view);
+        };
+    }
 
-        List<String> requested;
-        if (keys.equals("*")) {
-            requested = new ArrayList<>(BASIC_ATTRIBUTE_NAMES);
-        } else {
-            requested = Arrays.asList(keys.split(","));
-            for (var name : requested) {
-                if (!BASIC_ATTRIBUTE_NAMES.contains(name)) {
-                    throw new IllegalArgumentException("'" + name + "' not recognized");
-                }
-            }
-        }
-
+    private Map<String, Object> readBasicAttributeMap(Path path, String keys, LinkOption... options) throws IOException {
+        var requested = requestedNames(keys, BASIC_ATTRIBUTE_NAMES);
         var attrs = readAttributes(path, BasicFileAttributes.class, options);
         Map<String, Object> all = new HashMap<>();
         all.put("lastModifiedTime", attrs.lastModifiedTime());
@@ -441,7 +439,45 @@ public class MTPFileSystemProvider extends FileSystemProvider {
         all.put("isOther",          attrs.isOther());
         all.put("size",             attrs.size());
         all.put("fileKey",          attrs.fileKey());
+        return selectAttributes(all, requested);
+    }
 
+    /**
+     * The "mtp" attribute view: audio metadata the device itself reports for a track object (see
+     * {@link MTPDeviceBridge#getTrackMetadata}), e.g. {@code Files.readAttributes(path,
+     * "mtp:title,artist,album")}. Reading it is a metadata-only exchange — no file content is
+     * transferred. Every requested attribute maps to null when the object is not an audio track
+     * or the device reports no metadata for it.
+     */
+    private Map<String, Object> readTrackMetadataMap(Path path, String keys) throws IOException {
+        validatePathProvider(path);
+        var requested = requestedNames(keys, MTP_ATTRIBUTE_NAMES);
+        var deviceId = ((MTPPath) path).getFileSystem().getDeviceIdentifier();
+        var meta = MTPDeviceBridge.getInstance().getTrackMetadata(deviceId, path.toAbsolutePath().toString());
+        Map<String, Object> all = new HashMap<>();
+        all.put("title",          meta == null ? null : meta.title());
+        all.put("artist",         meta == null ? null : meta.artist());
+        all.put("album",          meta == null ? null : meta.album());
+        all.put("genre",          meta == null ? null : meta.genre());
+        all.put("trackNumber",    meta == null ? null : meta.trackNumber());
+        all.put("durationMillis", meta == null ? null : meta.durationMillis());
+        return selectAttributes(all, requested);
+    }
+
+    private static List<String> requestedNames(String keys, Set<String> valid) {
+        if (keys.equals("*")) {
+            return new ArrayList<>(valid);
+        }
+        var requested = Arrays.asList(keys.split(","));
+        for (var name : requested) {
+            if (!valid.contains(name)) {
+                throw new IllegalArgumentException("'" + name + "' not recognized");
+            }
+        }
+        return requested;
+    }
+
+    private static Map<String, Object> selectAttributes(Map<String, Object> all, List<String> requested) {
         Map<String, Object> result = new HashMap<>();
         for (var name : requested) result.put(name, all.get(name));
         return result;

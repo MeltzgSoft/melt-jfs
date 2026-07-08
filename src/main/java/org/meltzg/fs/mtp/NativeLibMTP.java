@@ -3,6 +3,7 @@ package org.meltzg.fs.mtp;
 import org.meltzg.fs.mtp.types.MTPDeviceIdentifier;
 import org.meltzg.fs.mtp.types.MTPDeviceInfo;
 import org.meltzg.fs.mtp.types.MTPItemInfo;
+import org.meltzg.fs.mtp.types.MTPTrackMetadata;
 
 import java.io.IOException;
 import java.lang.foreign.*;
@@ -11,13 +12,20 @@ import java.lang.invoke.MethodHandles;
 import java.lang.invoke.VarHandle;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
+import java.util.Map;
 
 import static java.lang.foreign.MemoryLayout.PathElement.groupElement;
 import static java.lang.foreign.ValueLayout.*;
+import static org.meltzg.fs.mtp.MtpBackend.emptyToNull;
 
 /**
- * FFM bindings for libmtp. Struct layouts are defined for libmtp 1.1.x on x86-64 Linux.
- * For other platforms, use jextract against the installed libmtp.h to regenerate layouts.
+ * FFM bindings for libmtp. The shared library is resolved per-OS by {@link #lookupLibmtp()}
+ * (Linux {@code libmtp.so.9}, macOS {@code libmtp.9.dylib}). Struct layouts, however, are authored
+ * for libmtp 1.1.x on an LP64 target and verified only on x86-64 Linux; the natural alignments hold
+ * on other LP64 ABIs (e.g. arm64 macOS) but the field offsets and filetype enum indices are not
+ * verified there. For a different libmtp version or a non-LP64 target, regenerate the layouts with
+ * jextract against the installed libmtp.h.
  *
  * <p>libmtp's 32-bit object handles are exposed through the {@link MtpBackend} contract as
  * unsigned-decimal strings; {@link MtpBackend#ROOT_PARENT} maps to libmtp's {@code 0xFFFFFFFF}.
@@ -28,8 +36,38 @@ class NativeLibMTP implements MtpBackend {
     static final int LIBMTP_ERROR_NO_DEVICE_ATTACHED = 5;
     static final int LIBMTP_FILES_AND_FOLDERS_ROOT = 0xFFFFFFFF;
     static final int LIBMTP_FILETYPE_FOLDER = 0;
+    // Audio filetypes whose enum indices are stable across libmtp 1.1.x (verified against 1.1.21).
+    static final int LIBMTP_FILETYPE_WAV = 1;
+    static final int LIBMTP_FILETYPE_MP3 = 2;
+    static final int LIBMTP_FILETYPE_WMA = 3;
+    static final int LIBMTP_FILETYPE_OGG = 4;
+    static final int LIBMTP_FILETYPE_AAC = 30;
+    static final int LIBMTP_FILETYPE_FLAC = 32;
+    static final int LIBMTP_FILETYPE_MP2 = 33;
+    static final int LIBMTP_FILETYPE_M4A = 34;
     // Neutral "generic file" type; index of LIBMTP_FILETYPE_UNKNOWN in libmtp 1.1.x's enum.
     static final int LIBMTP_FILETYPE_UNKNOWN = 44;
+
+    // Uploads carry only a filename, so the audio object format is inferred from the extension.
+    // Storing a track under a media filetype lets the device index it and expose its tags through
+    // getTrackMetadata; anything unrecognised stays LIBMTP_FILETYPE_UNKNOWN (a plain file).
+    private static final Map<String, Integer> AUDIO_FILETYPES_BY_EXTENSION = Map.of(
+        "mp3",  LIBMTP_FILETYPE_MP3,
+        "flac", LIBMTP_FILETYPE_FLAC,
+        "m4a",  LIBMTP_FILETYPE_M4A,
+        "aac",  LIBMTP_FILETYPE_AAC,
+        "ogg",  LIBMTP_FILETYPE_OGG,
+        "wav",  LIBMTP_FILETYPE_WAV,
+        "wma",  LIBMTP_FILETYPE_WMA,
+        "mp2",  LIBMTP_FILETYPE_MP2);
+
+    /** Maps a filename's extension to a libmtp audio filetype, or UNKNOWN when it is not audio. */
+    static int filetypeForFilename(String filename) {
+        int dot = filename.lastIndexOf('.');
+        if (dot < 0 || dot == filename.length() - 1) return LIBMTP_FILETYPE_UNKNOWN;
+        var ext = filename.substring(dot + 1).toLowerCase(Locale.ROOT);
+        return AUDIO_FILETYPES_BY_EXTENSION.getOrDefault(ext, LIBMTP_FILETYPE_UNKNOWN);
+    }
 
     /** Live libmtp handle: the opened device plus the raw-device slice it was opened from. */
     private record LibMtpDevice(MemorySegment rawDevice, MemorySegment device) implements DeviceHandle {}
@@ -107,6 +145,37 @@ class NativeLibMTP implements MtpBackend {
     private static final VarHandle STORAGE_NEXT =
         vh(DEVICE_STORAGE_LAYOUT, groupElement("next"));
 
+    // LIBMTP_track_t layout
+    private static final StructLayout TRACK_LAYOUT = MemoryLayout.structLayout(
+        JAVA_INT.withName("item_id"),
+        JAVA_INT.withName("parent_id"),
+        JAVA_INT.withName("storage_id"),
+        MemoryLayout.paddingLayout(4),
+        ADDRESS.withName("title"),
+        ADDRESS.withName("artist"),
+        ADDRESS.withName("composer"),
+        ADDRESS.withName("genre"),
+        ADDRESS.withName("album"),
+        ADDRESS.withName("date"),
+        ADDRESS.withName("filename"),
+        JAVA_SHORT.withName("tracknumber"),
+        MemoryLayout.paddingLayout(2),
+        JAVA_INT.withName("duration"),
+        JAVA_INT.withName("samplerate"),
+        JAVA_SHORT.withName("nochannels"),
+        MemoryLayout.paddingLayout(2),
+        JAVA_INT.withName("wavecodec"),
+        JAVA_INT.withName("bitrate"),
+        JAVA_SHORT.withName("bitratetype"),
+        JAVA_SHORT.withName("rating"),
+        JAVA_INT.withName("usecount"),
+        JAVA_LONG.withName("filesize"),
+        JAVA_LONG.withName("modificationdate"),
+        JAVA_INT.withName("filetype"),
+        MemoryLayout.paddingLayout(4),
+        ADDRESS.withName("next")
+    ).withName("LIBMTP_track_t");
+
     private static final VarHandle FILE_ITEM_ID =
         vh(FILE_LAYOUT, groupElement("item_id"));
     private static final VarHandle FILE_PARENT_ID =
@@ -124,6 +193,19 @@ class NativeLibMTP implements MtpBackend {
     private static final VarHandle FILE_NEXT =
         vh(FILE_LAYOUT, groupElement("next"));
 
+    private static final VarHandle TRACK_TITLE =
+        vh(TRACK_LAYOUT, groupElement("title"));
+    private static final VarHandle TRACK_ARTIST =
+        vh(TRACK_LAYOUT, groupElement("artist"));
+    private static final VarHandle TRACK_GENRE =
+        vh(TRACK_LAYOUT, groupElement("genre"));
+    private static final VarHandle TRACK_ALBUM =
+        vh(TRACK_LAYOUT, groupElement("album"));
+    private static final VarHandle TRACK_TRACKNUMBER =
+        vh(TRACK_LAYOUT, groupElement("tracknumber"));
+    private static final VarHandle TRACK_DURATION =
+        vh(TRACK_LAYOUT, groupElement("duration"));
+
     private final MethodHandle init;
     private final MethodHandle releaseDevice;
     private final MethodHandle detectRawDevices;
@@ -133,6 +215,8 @@ class NativeLibMTP implements MtpBackend {
     private final MethodHandle getModelName;
     private final MethodHandle getManufacturerName;
     private final MethodHandle getFilesAndFolders;
+    private final MethodHandle getTrackMetadataFn;
+    private final MethodHandle destroyTrack;
     private final MethodHandle getFileToFile;
     private final MethodHandle sendFileFromFile;
     private final MethodHandle destroyFile;
@@ -142,15 +226,20 @@ class NativeLibMTP implements MtpBackend {
     private final MethodHandle deleteObjectFn;
     private final MethodHandle freeFn;
 
-    private static final NativeLibMTP INSTANCE = new NativeLibMTP();
+    // Lazy-holder idiom: the native libmtp load happens only when getInstance() is first called,
+    // not when the class is initialized. This keeps the pure static helpers (e.g.
+    // filetypeForFilename) usable — and unit-testable — on machines without libmtp installed.
+    private static final class Holder {
+        static final NativeLibMTP INSTANCE = new NativeLibMTP();
+    }
 
     static NativeLibMTP getInstance() {
-        return INSTANCE;
+        return Holder.INSTANCE;
     }
 
     private NativeLibMTP() {
         var linker = Linker.nativeLinker();
-        var libmtp = SymbolLookup.libraryLookup("libmtp.so.9", Arena.global());
+        var libmtp = lookupLibmtp();
 
         init = bind(linker, libmtp, "LIBMTP_Init",
             FunctionDescriptor.ofVoid());
@@ -170,6 +259,10 @@ class NativeLibMTP implements MtpBackend {
             FunctionDescriptor.of(ADDRESS, ADDRESS));
         getFilesAndFolders = bind(linker, libmtp, "LIBMTP_Get_Files_And_Folders",
             FunctionDescriptor.of(ADDRESS, ADDRESS, JAVA_INT, JAVA_INT));
+        getTrackMetadataFn = bind(linker, libmtp, "LIBMTP_Get_Trackmetadata",
+            FunctionDescriptor.of(ADDRESS, ADDRESS, JAVA_INT));
+        destroyTrack = bind(linker, libmtp, "LIBMTP_destroy_track_t",
+            FunctionDescriptor.ofVoid(ADDRESS));
         getFileToFile = bind(linker, libmtp, "LIBMTP_Get_File_To_File",
             FunctionDescriptor.of(JAVA_INT, ADDRESS, JAVA_INT, ADDRESS, ADDRESS, ADDRESS));
         sendFileFromFile = bind(linker, libmtp, "LIBMTP_Send_File_From_File",
@@ -193,6 +286,30 @@ class NativeLibMTP implements MtpBackend {
         } catch (Throwable t) {
             throw new RuntimeException("Failed to initialize libmtp", t);
         }
+    }
+
+    // Locates the installed libmtp shared library. The SONAME differs per OS (Linux keeps the
+    // versioned `.so.9`; macOS uses `libmtp.9.dylib`), so each candidate is tried in turn and the
+    // first that loads wins. On macOS the bare name only resolves if Homebrew's lib dir is on the
+    // dlopen path, so the Homebrew prefixes (`/opt/homebrew` on Apple Silicon, `/usr/local` on
+    // Intel) are also tried by absolute path. Struct layouts in this class are still authored for
+    // libmtp 1.1.x on an LP64 target — see the class header before trusting this on a new platform.
+    private static SymbolLookup lookupLibmtp() {
+        var os = System.getProperty("os.name", "").toLowerCase(Locale.ROOT);
+        String[] candidates = os.contains("mac") || os.contains("darwin")
+            ? new String[] {"libmtp.9.dylib", "libmtp.dylib",
+                            "/opt/homebrew/lib/libmtp.9.dylib", "/usr/local/lib/libmtp.9.dylib"}
+            : new String[] {"libmtp.so.9", "libmtp.so"};
+        for (var name : candidates) {
+            try {
+                return SymbolLookup.libraryLookup(name, Arena.global());
+            } catch (IllegalArgumentException ignored) {
+                // Not present under this name; fall through to the next candidate.
+            }
+        }
+        throw new UnsatisfiedLinkError(
+            "libmtp not found; tried " + String.join(", ", candidates)
+                + ". Install libmtp (e.g. `brew install libmtp` or `apt install libmtp9`).");
     }
 
     // As of the finalized FFM API (JDK 22), layout-derived VarHandles carry a leading `long`
@@ -402,6 +519,46 @@ class NativeLibMTP implements MtpBackend {
         }
     }
 
+    /**
+     * Backed by {@code LIBMTP_Get_Trackmetadata}. On the uncached device handle this library opens,
+     * that costs one GetObjectInfo for the handle (already cached when a listing walked past it)
+     * plus a single-object GetObjectPropList (or per-property GetObjectPropValue calls on devices
+     * without proplist support) — a few small USB transactions, never a data transfer. libmtp
+     * returns NULL for objects whose format is not a known track type. {@link #sendFile} infers an
+     * audio filetype from the filename extension, so tracks uploaded with a recognised extension are
+     * stored in an indexable format; files stored as "unknown" report no metadata until the device's
+     * own indexer reclassifies them.
+     */
+    @Override
+    public MTPTrackMetadata getTrackMetadata(DeviceHandle handle, String itemId) throws IOException {
+        MemorySegment trackPtr;
+        try {
+            trackPtr = (MemorySegment) getTrackMetadataFn.invokeExact(dev(handle), toHandle(itemId));
+        } catch (Throwable t) {
+            throw new IOException("Failed to read track metadata for id: " + itemId, t);
+        }
+        if (MemorySegment.NULL.equals(trackPtr)) {
+            return null; // not an audio-track object (libmtp filters by object format)
+        }
+        try {
+            var track = trackPtr.reinterpret(TRACK_LAYOUT.byteSize());
+            var meta = new MTPTrackMetadata(
+                emptyToNull(readCString((MemorySegment) TRACK_TITLE.get(track))),
+                emptyToNull(readCString((MemorySegment) TRACK_ARTIST.get(track))),
+                emptyToNull(readCString((MemorySegment) TRACK_ALBUM.get(track))),
+                emptyToNull(readCString((MemorySegment) TRACK_GENRE.get(track))),
+                Short.toUnsignedInt((short) TRACK_TRACKNUMBER.get(track)),
+                Integer.toUnsignedLong((int) TRACK_DURATION.get(track)));
+            return meta.isEmpty() ? null : meta;
+        } finally {
+            try {
+                destroyTrack.invokeExact(trackPtr);
+            } catch (Throwable t) {
+                throw new RuntimeException("Failed to free track metadata", t);
+            }
+        }
+    }
+
     @Override
     public String createFolder(DeviceHandle handle, String name, String parentId, String storageId) throws IOException {
         try (var arena = Arena.ofConfined()) {
@@ -456,7 +613,7 @@ class NativeLibMTP implements MtpBackend {
             FILE_STORAGE_ID.set(fileData, toHandle(storageId));
             FILE_FILENAME.set(fileData, arena.allocateFrom(filename));
             FILE_FILESIZE.set(fileData, filesize);
-            FILE_FILETYPE.set(fileData, LIBMTP_FILETYPE_UNKNOWN);
+            FILE_FILETYPE.set(fileData, filetypeForFilename(filename));
 
             var pathSeg = arena.allocateFrom(localPath);
             int ret;
