@@ -226,10 +226,15 @@ class NativeLibMTP implements MtpBackend {
     private final MethodHandle deleteObjectFn;
     private final MethodHandle freeFn;
 
-    private static final NativeLibMTP INSTANCE = new NativeLibMTP();
+    // Lazy-holder idiom: the native libmtp load happens only when getInstance() is first called,
+    // not when the class is initialized. This keeps the pure static helpers (e.g.
+    // filetypeForFilename) usable — and unit-testable — on machines without libmtp installed.
+    private static final class Holder {
+        static final NativeLibMTP INSTANCE = new NativeLibMTP();
+    }
 
     static NativeLibMTP getInstance() {
-        return INSTANCE;
+        return Holder.INSTANCE;
     }
 
     private NativeLibMTP() {

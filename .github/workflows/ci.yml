@@ -10,9 +10,10 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Linux exercises the libmtp backend; Windows builds the WPD backend and confirms the
-        # fake-backed unit tests pass cross-platform. Neither runner has a physical MTP device.
-        os: [ubuntu-latest, windows-latest]
+        # Linux and macOS exercise the libmtp backend's per-OS library resolution; Windows builds
+        # the WPD backend. All three confirm the fake-backed unit tests pass cross-platform. None of
+        # the runners has a physical MTP device.
+        os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
 
     steps:
