@@ -14,6 +14,7 @@ public class AudioTagReadersTest {
         assertTrue(AudioTagReaders.isSupported("song.flac"));
         assertTrue(AudioTagReaders.isSupported("SONG.FLAC"));
         assertTrue(AudioTagReaders.isSupported("song.mp3"));
+        assertTrue(AudioTagReaders.isSupported("song.m4a"));
     }
 
     @Test
@@ -30,6 +31,15 @@ public class AudioTagReadersTest {
         assertNotNull(tags);
         assertEquals(SyntheticFlac.TITLE, tags.title());
         assertEquals(SyntheticFlac.ALBUM, tags.album());
+    }
+
+    @Test
+    public void readsMp4TagsThroughDispatcher() throws IOException {
+        var mp4 = SyntheticMp4.moovLast();
+        var tags = AudioTagReaders.read("song.m4a", RangedByteSource.ofArray(mp4), mp4.length);
+        assertNotNull(tags);
+        assertEquals(SyntheticMp4.TITLE, tags.title());
+        assertEquals(SyntheticMp4.DISC, tags.discNumber());
     }
 
     @Test
