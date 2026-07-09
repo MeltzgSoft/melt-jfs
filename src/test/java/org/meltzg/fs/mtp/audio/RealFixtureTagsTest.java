@@ -40,6 +40,11 @@ public class RealFixtureTagsTest {
         assertFixture("fixture.flac", true, DISC);
     }
 
+    @Test
+    public void mp3Fixture() throws Exception {
+        assertFixture("fixture.mp3", true, DISC);
+    }
+
     /** Reads {@code /fixtures/<name>} with our reader, asserting the known tags; optionally cross-checks jaudiotagger. */
     private void assertFixture(String name, boolean crossCheckReference, int expectedDisc) throws Exception {
         byte[] bytes = load(name);
