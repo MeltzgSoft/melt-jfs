@@ -38,3 +38,9 @@ test.
 
 Same CC0 source and known tags as `fixture.flac`, transcoded with ffmpeg's `aac` encoder to an MP4/M4A
 container (with `moov` after `mdat`, so it exercises the mdat-skip path). Used by `RealFixtureTagsTest`.
+
+## `fixture.ogg`, `fixture.opus`
+
+Same CC0 source and known tags as `fixture.flac`, transcoded with ffmpeg's `libvorbis` (Ogg Vorbis) and
+`libopus` (Opus) encoders. Used by `RealFixtureTagsTest`. jaudiotagger 3.0.1 has no `.opus` reader, so
+the Opus fixture is validated against the known tags only (no reference cross-check).

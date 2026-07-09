@@ -10,13 +10,14 @@ import java.util.Set;
  * whole-object transfer.
  *
  * <p>Implemented: FLAC ({@link FlacMetadataReader}), MP3 ({@link Mp3MetadataReader}), MP4/M4A
- * ({@link Mp4MetadataReader}). Further formats (Ogg/Opus, WAV) plug in as additional {@code switch}
- * arms as they land.
+ * ({@link Mp4MetadataReader}), Ogg Vorbis/Opus ({@link OggMetadataReader}). Further formats (WAV) plug
+ * in as additional {@code switch} arms as they land.
  */
 public final class AudioTagReaders {
 
     /** Extensions this dispatcher can currently parse tags from. */
-    private static final Set<String> SUPPORTED = Set.of("flac", "mp3", "m4a", "m4b", "m4p", "mp4");
+    private static final Set<String> SUPPORTED =
+        Set.of("flac", "mp3", "m4a", "m4b", "m4p", "mp4", "ogg", "oga", "opus");
 
     private AudioTagReaders() {}
 
@@ -36,6 +37,7 @@ public final class AudioTagReaders {
             case "flac" -> FlacMetadataReader.readTags(source);
             case "mp3" -> Mp3MetadataReader.readTags(source, fileSize);
             case "m4a", "m4b", "m4p", "mp4" -> Mp4MetadataReader.readTags(source, fileSize);
+            case "ogg", "oga", "opus" -> OggMetadataReader.readTags(source, fileSize);
             default -> null; // unsupported format
         };
     }
