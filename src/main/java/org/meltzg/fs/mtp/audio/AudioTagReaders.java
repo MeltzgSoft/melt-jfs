@@ -9,13 +9,14 @@ import java.util.Set;
  * works over a {@link RangedByteSource}, so tags come from a small header read rather than a
  * whole-object transfer.
  *
- * <p>Implemented: FLAC ({@link FlacMetadataReader}), MP3 ({@link Mp3MetadataReader}). Further formats
- * (MP4/M4A, Ogg/Opus, WAV) plug in as additional {@code switch} arms as they land.
+ * <p>Implemented: FLAC ({@link FlacMetadataReader}), MP3 ({@link Mp3MetadataReader}), MP4/M4A
+ * ({@link Mp4MetadataReader}). Further formats (Ogg/Opus, WAV) plug in as additional {@code switch}
+ * arms as they land.
  */
 public final class AudioTagReaders {
 
     /** Extensions this dispatcher can currently parse tags from. */
-    private static final Set<String> SUPPORTED = Set.of("flac", "mp3");
+    private static final Set<String> SUPPORTED = Set.of("flac", "mp3", "m4a", "m4b", "m4p", "mp4");
 
     private AudioTagReaders() {}
 
@@ -34,6 +35,7 @@ public final class AudioTagReaders {
         return switch (extension(filename)) {
             case "flac" -> FlacMetadataReader.readTags(source);
             case "mp3" -> Mp3MetadataReader.readTags(source, fileSize);
+            case "m4a", "m4b", "m4p", "mp4" -> Mp4MetadataReader.readTags(source, fileSize);
             default -> null; // unsupported format
         };
     }

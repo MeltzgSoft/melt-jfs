@@ -33,3 +33,8 @@ Same CC0 source and known tags as `fixture.flac`, transcoded with ffmpeg's `libm
 A separate ~1 s **ID3v2.3** MP3 (title `melt-jfs Test Title`, artist `melt-jfs Test Artist`, album
 `melt-jfs Test Album`, genre `Jazz`, track 7) used by `Mp3MetadataReaderTest` and the device integration
 test.
+
+## `fixture.m4a`
+
+Same CC0 source and known tags as `fixture.flac`, transcoded with ffmpeg's `aac` encoder to an MP4/M4A
+container (with `moov` after `mdat`, so it exercises the mdat-skip path). Used by `RealFixtureTagsTest`.

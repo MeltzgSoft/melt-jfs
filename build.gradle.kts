@@ -19,6 +19,12 @@ java {
     targetCompatibility = JavaVersion.VERSION_22
 }
 
+// Compile sources as UTF-8 regardless of the platform default, so non-ASCII literals (e.g. the MP4
+// "©"-prefixed atom names in the audio readers) are interpreted correctly.
+tasks.withType<JavaCompile>().configureEach {
+    options.encoding = "UTF-8"
+}
+
 repositories {
     mavenCentral()
 }
