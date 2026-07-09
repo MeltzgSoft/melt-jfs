@@ -22,3 +22,14 @@ against jaudiotagger (the reference parser).
   - track = `7/12`  (trackNumber 7)
   - disc = `2/3`  (discNumber 2)
   - duration ≈ 4 s
+
+## `fixture.mp3`
+
+Same CC0 source and known tags as `fixture.flac`, transcoded with ffmpeg's `libmp3lame` to MP3 with an
+**ID3v2.4** tag. Used by `RealFixtureTagsTest`.
+
+## `tagged-track.mp3`
+
+A separate ~1 s **ID3v2.3** MP3 (title `melt-jfs Test Title`, artist `melt-jfs Test Artist`, album
+`melt-jfs Test Album`, genre `Jazz`, track 7) used by `Mp3MetadataReaderTest` and the device integration
+test.

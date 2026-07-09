@@ -13,6 +13,7 @@ public class AudioTagReadersTest {
     public void implementedFormatsAreSupportedCaseInsensitively() {
         assertTrue(AudioTagReaders.isSupported("song.flac"));
         assertTrue(AudioTagReaders.isSupported("SONG.FLAC"));
+        assertTrue(AudioTagReaders.isSupported("song.mp3"));
     }
 
     @Test
