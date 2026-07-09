@@ -15,6 +15,8 @@ public class AudioTagReadersTest {
         assertTrue(AudioTagReaders.isSupported("SONG.FLAC"));
         assertTrue(AudioTagReaders.isSupported("song.mp3"));
         assertTrue(AudioTagReaders.isSupported("song.m4a"));
+        assertTrue(AudioTagReaders.isSupported("song.ogg"));
+        assertTrue(AudioTagReaders.isSupported("song.opus"));
     }
 
     @Test
