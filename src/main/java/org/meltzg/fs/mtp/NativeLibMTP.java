@@ -218,6 +218,7 @@ class NativeLibMTP implements MtpBackend {
     private final MethodHandle getTrackMetadataFn;
     private final MethodHandle destroyTrack;
     private final MethodHandle getFileToFile;
+    private final MethodHandle getPartialObjectFn;
     private final MethodHandle sendFileFromFile;
     private final MethodHandle destroyFile;
     private final MethodHandle createFolderFn;
@@ -265,6 +266,10 @@ class NativeLibMTP implements MtpBackend {
             FunctionDescriptor.ofVoid(ADDRESS));
         getFileToFile = bind(linker, libmtp, "LIBMTP_Get_File_To_File",
             FunctionDescriptor.of(JAVA_INT, ADDRESS, JAVA_INT, ADDRESS, ADDRESS, ADDRESS));
+        // int LIBMTP_GetPartialObject(device, uint32 id, uint64 offset, uint32 maxbytes,
+        //                             unsigned char **data, unsigned int *size)
+        getPartialObjectFn = bind(linker, libmtp, "LIBMTP_GetPartialObject",
+            FunctionDescriptor.of(JAVA_INT, ADDRESS, JAVA_INT, JAVA_LONG, JAVA_INT, ADDRESS, ADDRESS));
         sendFileFromFile = bind(linker, libmtp, "LIBMTP_Send_File_From_File",
             FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, ADDRESS, ADDRESS, ADDRESS));
         destroyFile = bind(linker, libmtp, "LIBMTP_destroy_file_t",
@@ -599,6 +604,45 @@ class NativeLibMTP implements MtpBackend {
             }
             if (ret != 0) {
                 throw new IOException("LIBMTP_Get_File_To_File failed with code " + ret);
+            }
+        }
+    }
+
+    /**
+     * Backed by {@code LIBMTP_GetPartialObject} (MTP GetPartialObject / the Android 64-bit-offset
+     * variant). libmtp mallocs the returned buffer; we copy it into a Java array and free it. Returns
+     * an empty array when the device reports zero bytes (offset at or past end-of-object).
+     */
+    @Override
+    public boolean supportsPartialReads() {
+        return true; // LIBMTP_GetPartialObject is bound; device op support is checked at call time
+    }
+
+    @Override
+    public byte[] readPartial(DeviceHandle handle, String itemId, long offset, int maxBytes) throws IOException {
+        if (offset < 0) throw new IllegalArgumentException("offset must be non-negative: " + offset);
+        if (maxBytes < 0) throw new IllegalArgumentException("maxBytes must be non-negative: " + maxBytes);
+        if (maxBytes == 0) return new byte[0];
+        try (var arena = Arena.ofConfined()) {
+            var dataOut = arena.allocate(ADDRESS);  // receives libmtp's malloc'd unsigned char*
+            var sizeOut = arena.allocate(JAVA_INT); // receives the count of bytes actually read
+            int ret;
+            try {
+                ret = (int) getPartialObjectFn.invokeExact(
+                    dev(handle), toHandle(itemId), offset, maxBytes, dataOut, sizeOut);
+            } catch (Throwable t) {
+                throw new IOException("Failed partial read for id: " + itemId, t);
+            }
+            if (ret != 0) {
+                throw new IOException("LIBMTP_GetPartialObject failed with code " + ret + " for id: " + itemId);
+            }
+            int size = sizeOut.get(JAVA_INT, 0);
+            var dataPtr = dataOut.get(ADDRESS, 0);
+            if (size <= 0 || MemorySegment.NULL.equals(dataPtr)) return new byte[0];
+            try {
+                return dataPtr.reinterpret(size).toArray(JAVA_BYTE);
+            } finally {
+                free(dataPtr);
             }
         }
     }

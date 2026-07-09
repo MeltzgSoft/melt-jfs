@@ -42,6 +42,8 @@ class FakeLibMTP implements MtpBackend {
     // "empty device" the other fixtures assume.
     final Map<String, MTPItemInfo[]> childItems = new HashMap<>();
     final Map<String, MTPTrackMetadata> trackMetadata = new HashMap<>();
+    // Per-item raw bytes, keyed by itemId, used to exercise the ranged-read (readPartial) path.
+    final Map<String, byte[]> content = new HashMap<>();
 
     @Override
     public Scan scan() {
@@ -104,6 +106,27 @@ class FakeLibMTP implements MtpBackend {
     @Override
     public void getFile(DeviceHandle device, String itemId, String destPath) throws IOException {
         // No content in the in-memory fake; leave destPath as the (empty) temp file.
+    }
+
+    // Total bytes served through readPartial, so tests can assert a ranged read stayed bounded.
+    volatile long partialBytesServed = 0;
+
+    @Override
+    public boolean supportsPartialReads() {
+        return true;
+    }
+
+    @Override
+    public byte[] readPartial(DeviceHandle device, String itemId, long offset, int maxBytes) throws IOException {
+        var bytes = content.get(itemId);
+        if (bytes == null) throw new IOException("no content for id: " + itemId);
+        if (offset >= bytes.length) return new byte[0];
+        int from = (int) offset;
+        int len = Math.min(maxBytes, bytes.length - from);
+        var out = new byte[len];
+        System.arraycopy(bytes, from, out, 0, len);
+        partialBytesServed += len;
+        return out;
     }
 
     @Override

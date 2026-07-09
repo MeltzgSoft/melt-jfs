@@ -87,6 +87,29 @@ public interface MtpBackend {
     void getFile(DeviceHandle device, String itemId, String destPath) throws IOException;
 
     /**
+     * Reads up to {@code maxBytes} bytes of object {@code itemId} starting at {@code offset}, without
+     * transferring the whole object. Backed by MTP's GetPartialObject operation, so a caller can pull
+     * just a file header (e.g. an audio file's tag block) for a few KB instead of a whole-object read.
+     * The returned array holds the bytes actually read, which may be shorter than {@code maxBytes}
+     * near end-of-object (and empty at or past it). The default implementation reports the operation
+     * as unavailable.
+     *
+     * @throws UnsupportedOperationException if the backend, or the device, does not support ranged reads
+     */
+    default byte[] readPartial(DeviceHandle device, String itemId, long offset, int maxBytes) throws IOException {
+        throw new UnsupportedOperationException("Partial reads are not supported by this backend");
+    }
+
+    /**
+     * Whether {@link #readPartial} is usable on this backend. When false, callers must fall back to a
+     * whole-object {@link #getFile} transfer. Backend-level capability only — it does not probe whether
+     * a specific device advertises the underlying GetPartialObject operation.
+     */
+    default boolean supportsPartialReads() {
+        return false;
+    }
+
+    /**
      * Uploads {@code localPath} to the device as a new file named {@code filename} under
      * {@code parentId} on {@code storageId}. Returns the new item's id.
      */
