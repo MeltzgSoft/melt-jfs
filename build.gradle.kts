@@ -26,6 +26,9 @@ repositories {
 dependencies {
     testImplementation("junit:junit:4.13.2")
     testImplementation("commons-io:commons-io:2.15.1")
+    // Test-only (never published): the same tag parser the consuming app uses, so prototype tests can
+    // prove a stitched minimal-metadata stream parses where a truncated whole-header read crashes.
+    testImplementation("net.jthink:jaudiotagger:3.0.1")
 }
 
 // Source set for developer tools — compiled separately, never included in the published JAR.

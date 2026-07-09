@@ -1,5 +1,8 @@
 package org.meltzg.fs.mtp;
 
+import org.meltzg.fs.mtp.audio.AudioTagReaders;
+import org.meltzg.fs.mtp.audio.AudioTags;
+import org.meltzg.fs.mtp.audio.RangedByteSource;
 import org.meltzg.fs.mtp.types.MTPDeviceIdentifier;
 import org.meltzg.fs.mtp.types.MTPItemInfo;
 
@@ -456,6 +459,11 @@ public class MTPFileSystemProvider extends FileSystemProvider {
     private static final Set<String> MTP_ATTRIBUTE_NAMES = Set.of(
         "title", "artist", "album", "genre", "trackNumber", "durationMillis");
 
+    // The "audio" view reads tags from the file's own bytes. It carries the "mtp" fields plus
+    // discNumber, which embedded tags expose but the device's MTP track index does not.
+    private static final Set<String> AUDIO_ATTRIBUTE_NAMES = Set.of(
+        "title", "artist", "album", "genre", "trackNumber", "discNumber", "durationMillis");
+
     @Override
     public Map<String, Object> readAttributes(Path path, String attributes, LinkOption... options) throws IOException {
         if (attributes == null) throw new NullPointerException();
@@ -470,6 +478,7 @@ public class MTPFileSystemProvider extends FileSystemProvider {
         return switch (view) {
             case "basic" -> readBasicAttributeMap(path, keys, options);
             case "mtp" -> readTrackMetadataMap(path, keys);
+            case "audio" -> readFileTagsMap(path, keys);
             default -> throw new UnsupportedOperationException("View not supported: " + view);
         };
     }
@@ -509,6 +518,44 @@ public class MTPFileSystemProvider extends FileSystemProvider {
         all.put("genre",          meta == null ? null : meta.genre());
         all.put("trackNumber",    meta == null ? null : meta.trackNumber());
         all.put("durationMillis", meta == null ? null : meta.durationMillis());
+        return selectAttributes(all, requested);
+    }
+
+    /**
+     * The "audio" attribute view: tags parsed from the file's own embedded metadata (e.g. a FLAC
+     * VORBIS_COMMENT block) via {@link org.meltzg.fs.mtp.audio.AudioTagReaders}, e.g.
+     * {@code Files.readAttributes(path, "audio:title,artist,album")}. Unlike the "mtp" view — which
+     * queries the device's index — this reads a small slice of the file's header over ranged reads,
+     * so it recovers the real embedded title even on devices that report the filename as the title.
+     * Every requested attribute maps to null when the object is not a file, its format is unsupported
+     * (see {@code AudioTagReaders}), the backend cannot do ranged reads, or the header is unreadable.
+     */
+    private Map<String, Object> readFileTagsMap(Path path, String keys) throws IOException {
+        validatePathProvider(path);
+        var requested = requestedNames(keys, AUDIO_ATTRIBUTE_NAMES);
+        var deviceId = ((MTPPath) path).getFileSystem().getDeviceIdentifier();
+        var absPath = path.toAbsolutePath().toString();
+        var bridge = MTPDeviceBridge.getInstance();
+
+        var item = bridge.resolveItem(deviceId, absPath); // throws NoSuchFileException when absent
+        var filename = path.getFileName() == null ? "" : path.getFileName().toString();
+        AudioTags tags = null;
+        if (item.isFile() && bridge.supportsPartialReads() && AudioTagReaders.isSupported(filename)) {
+            RangedByteSource source = (off, n) -> bridge.readPartial(deviceId, absPath, off, n);
+            try {
+                tags = AudioTagReaders.read(filename, source, item.filesize());
+            } catch (IOException unreadable) {
+                tags = null; // a corrupt/truncated header yields no tags, not an error
+            }
+        }
+        Map<String, Object> all = new HashMap<>();
+        all.put("title",          tags == null ? null : tags.title());
+        all.put("artist",         tags == null ? null : tags.artist());
+        all.put("album",          tags == null ? null : tags.album());
+        all.put("genre",          tags == null ? null : tags.genre());
+        all.put("trackNumber",    tags == null ? null : tags.trackNumber());
+        all.put("discNumber",     tags == null ? null : tags.discNumber());
+        all.put("durationMillis", tags == null ? null : tags.durationMillis());
         return selectAttributes(all, requested);
     }
 

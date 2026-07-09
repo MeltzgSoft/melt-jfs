@@ -1,6 +1,10 @@
 package org.meltzg.fs.mtp;
 
+import org.jaudiotagger.audio.AudioFileIO;
+import org.jaudiotagger.tag.FieldKey;
 import org.junit.*;
+import org.meltzg.fs.mtp.audio.FlacMetadataReader;
+import org.meltzg.fs.mtp.audio.RangedByteSource;
 import org.meltzg.fs.mtp.types.MTPDeviceIdentifier;
 import org.meltzg.fs.mtp.types.MTPTrackMetadata;
 
@@ -747,6 +751,78 @@ public class MTPFileSystemIntegrationTest {
     }
 
     @Test
+    public void flacTagsReadFromHeaderRecoverRealTitle() throws Exception {
+        var storage = requireFirstStorage();
+        var flac = findFirstFlac(storage, 4);
+        assumeTrue("No .flac files found in first 4 levels of " + storage, flac != null);
+
+        var bridge = MTPDeviceBridge.getInstance();
+        var deviceId = fs.getDeviceIdentifier();
+        var absPath = flac.toAbsolutePath().toString();
+
+        // A ranged-read view of the device file via *pure java.nio* — Files.newByteChannel with
+        // position()/read(), no melt-jfs types. This is exactly the seam a decoupled consumer uses;
+        // the lazy channel fetches only the bytes read, so seeking past the album art costs nothing.
+        RangedByteSource source = (off, n) -> {
+            try (var ch = Files.newByteChannel(flac, StandardOpenOption.READ)) {
+                ch.position(off);
+                var buf = java.nio.ByteBuffer.allocate(n);
+                while (buf.hasRemaining() && ch.read(buf) >= 0) { /* fill up to n or EOF */ }
+                return java.util.Arrays.copyOf(buf.array(), buf.position());
+            }
+        };
+
+        var blocks = FlacMetadataReader.describeBlocks(source);
+        System.out.println("FLAC metadata blocks for " + flac + ":");
+        long metadataSpan = 4;
+        for (var b : blocks) {
+            System.out.printf("  %-16s offset=%d length=%d last=%b%n",
+                b.typeName(), b.offset(), b.length(), b.last());
+            metadataSpan = b.offset() + 4 + b.length();
+        }
+
+        long start = System.nanoTime();
+        byte[] minimal = FlacMetadataReader.minimalMetadataStream(source);
+        long elapsedMillis = (System.nanoTime() - start) / 1_000_000;
+        assertNotNull("expected a FLAC stream", minimal);
+
+        // The whole point: what the device's MTP index reports (often the filename) vs. the embedded
+        // tag we recover by parsing the header we pulled over ranged reads.
+        var deviceMeta = bridge.getTrackMetadata(deviceId, absPath);
+        var tag = readFlacTag(minimal);
+        String embeddedTitle = tag.getFirst(FieldKey.TITLE);
+
+        System.out.printf(
+            "stitched %d bytes (file is %d bytes, metadata spans ~%d) in %dms | device-title=%s | embedded-title=%s%n",
+            minimal.length, Files.size(flac), metadataSpan, elapsedMillis,
+            deviceMeta == null ? null : deviceMeta.title(), embeddedTitle);
+
+        assertTrue("stitched stream must be far smaller than the whole file",
+            minimal.length < Files.size(flac));
+        assertNotNull("embedded FLAC tag should expose a title", embeddedTitle);
+        assertFalse("recovered title should not be blank", embeddedTitle.isBlank());
+    }
+
+    @Test
+    public void audioViewRecoversEmbeddedTagsFromFlac() throws IOException {
+        var storage = requireFirstStorage();
+        var flac = findFirstFlac(storage, 4);
+        assumeTrue("No .flac files found in first 4 levels of " + storage, flac != null);
+
+        // The pure-NIO seam: read embedded tags straight off the file via the "audio" attribute view.
+        var audio = Files.readAttributes(flac, "audio:title,artist,album,durationMillis");
+        // Contrast with the device's own index, which typically reports the filename as the title.
+        var mtp = Files.readAttributes(flac, "mtp:title");
+
+        System.out.printf("audio-view title=%s (artist=%s, album=%s, %sms) vs mtp title=%s%n",
+            audio.get("title"), audio.get("artist"), audio.get("album"),
+            audio.get("durationMillis"), mtp.get("title"));
+
+        assertNotNull("audio view should recover an embedded title", audio.get("title"));
+        assertFalse("recovered title should not be blank", ((String) audio.get("title")).isBlank());
+    }
+
+    @Test
     public void trackMetadataIsNullForDirectories() throws IOException {
         var storage = requireFirstStorage();
         var bridge = MTPDeviceBridge.getInstance();
@@ -822,6 +898,32 @@ public class MTPFileSystemIntegrationTest {
             }
         }
         return null;
+    }
+
+    private Path findFirstFlac(Path dir, int depthRemaining) throws IOException {
+        try (var stream = Files.newDirectoryStream(dir)) {
+            for (var child : stream) {
+                if (Files.isRegularFile(child)
+                        && child.getFileName().toString().toLowerCase().endsWith(".flac")) {
+                    return child;
+                }
+                if (Files.isDirectory(child) && depthRemaining > 0) {
+                    var found = findFirstFlac(child, depthRemaining - 1);
+                    if (found != null) return found;
+                }
+            }
+        }
+        return null;
+    }
+
+    private static org.jaudiotagger.tag.Tag readFlacTag(byte[] flac) throws Exception {
+        Path tmp = Files.createTempFile("melt-jfs-flac", ".flac");
+        try {
+            Files.write(tmp, flac);
+            return AudioFileIO.read(tmp.toFile()).getTag();
+        } finally {
+            Files.deleteIfExists(tmp);
+        }
     }
 
     private Path requireFirstStorage() throws IOException {
