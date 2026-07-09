@@ -6,27 +6,42 @@ Two backends are selected automatically by platform:
 
 | Platform | Backend | Native dependency |
 |----------|---------|-------------------|
-| Linux / macOS | libmtp (`NativeLibMTP`) | `libmtp.so.9` |
+| Linux / macOS | libmtp (`NativeLibMTP`) | `libmtp.so.9` (Linux) / `libmtp.9.dylib` (macOS) |
 | Windows | Windows Portable Devices COM (`WpdBackend`) | `ole32` + WPD (built into Windows) |
 
 The Windows backend drives the WPD COM API entirely through FFM, so it works with the in-box MTP driver — no driver replacement (e.g. WinUSB/Zadig) and no libmtp install required.
 
 ## Requirements
 
-- **Java 21** (FFM is finalized in 21; `--enable-native-access=ALL-UNNAMED` is set automatically by the build)
+- **Java 22+** (the FFM API is finalized in Java 22; `--enable-native-access=ALL-UNNAMED` is set automatically by the build)
 - **Gradle** — use the included wrapper (`./gradlew`); no separate Gradle installation needed
+- **libmtp** on Linux/macOS (see below); nothing extra on Windows
 
-## System libraries (Linux)
+## System libraries (Linux / macOS)
 
-The native library is loaded at runtime via FFM — no compile-time linking needed. For production use, install:
+The `NativeLibMTP` backend loads libmtp at runtime via FFM — no compile-time linking needed. Install it
+for your platform:
+
+**Linux (Debian/Ubuntu):**
 
 ```bash
 sudo apt install libmtp9
 ```
 
-| Library | Package | Purpose |
-|---------|---------|---------|
-| `libmtp.so.9` | `libmtp9` | MTP device communication |
+**macOS (Homebrew):**
+
+```bash
+brew install libmtp
+```
+
+| Platform | Install | Library resolved |
+|----------|---------|------------------|
+| Linux | `apt install libmtp9` (or your distro's equivalent) | `libmtp.so.9` |
+| macOS | `brew install libmtp` | `libmtp.9.dylib`, found in the Homebrew prefix (`/opt/homebrew` on Apple Silicon, `/usr/local` on Intel) |
+
+The shared library is located automatically — on macOS, both the bare `libmtp.9.dylib`/`libmtp.dylib`
+names and the absolute Homebrew paths are tried, so no extra environment setup is needed. See
+`NativeLibMTP.lookupLibmtp()` for the exact search order.
 
 ## System libraries (Windows)
 
@@ -78,11 +93,13 @@ The unit tests use a `FakeLibMTP` test double — no physical device and no nati
 
 Integration tests live in a separate `integrationTest` source set and run via their own task, in a
 fresh JVM per test class (`forkEvery = 1`) so they never share `libmtp`/device state with the
-fake-backed unit tests. They require `libmtp9` installed and the device connected, and skip
+fake-backed unit tests. They require libmtp installed (see above) and the device connected, and skip
 automatically when no device is accessible. They are not part of `test`/`check`.
 
 ```bash
-# Connect the device, eject it from the file manager (so GVFS releases the USB interface), then:
+# Connect the device, then release the USB interface from any OS-level MTP mount so libmtp can claim it:
+#   Linux — eject the device in your file manager (so GVFS lets go)
+#   macOS — quit Android File Transfer (or any app holding the device)
 ./gradlew integrationTest
 ```
 
@@ -104,10 +121,15 @@ src/
     MTPFileStore.java            # FileStore (per storage volume)
     MTPBasicFileAttributes.java  # BasicFileAttributes wrapper
     MTPDeviceBridge.java         # Thread-safe device access singleton
+    MTPLazyReadChannel.java      # Lazy, ranged-read SeekableByteChannel (fetches only the bytes read)
     MtpBackend.java              # Platform-neutral backend SPI (opaque String ids + device handles)
     NativeLibMTP.java            # FFM bindings for libmtp (implements MtpBackend; Linux/macOS)
     WpdBackend.java              # WPD COM backend via FFM (implements MtpBackend; Windows)
     WpdCom.java                  # Low-level COM/FFM plumbing used by WpdBackend
+    audio/                       # Embedded audio-tag readers behind the "audio" attribute view
+      AudioTagReaders.java       #   dispatcher (by extension) over a RangedByteSource
+      {Flac,Mp3,Mp4,Ogg,Wav}MetadataReader.java  #   per-format tag + duration readers
+      VorbisComment.java         #   shared Vorbis-comment parser (FLAC + Ogg/Opus)
     types/                       # Value records
   dev/java/org/meltzg/fs/mtp/
     MTPBrowser.java              # CLI tree walker (not included in the published JAR)
@@ -157,7 +179,7 @@ Gradle (Kotlin DSL):
 
 ```kotlin
 dependencies {
-    implementation("io.github.meltzg:melt-jfs:0.1.0")
+    implementation("io.github.meltzg:melt-jfs:0.1.2")
 }
 ```
 
@@ -167,7 +189,7 @@ Maven:
 <dependency>
     <groupId>io.github.meltzg</groupId>
     <artifactId>melt-jfs</artifactId>
-    <version>0.1.0</version>
+    <version>0.1.2</version>
 </dependency>
 ```
 
@@ -279,6 +301,27 @@ Map<String, Object> tags = Files.readAttributes(song, "mtp:*");
 
 Every value is `null` when the object is not an audio track or the device has not indexed it
 (e.g. a file uploaded moments ago that the device's media scanner has not yet classified).
+
+**Read a file's embedded tags (the `audio` attribute view)**
+
+Where the `mtp` view returns the device's *index* — which some devices populate with the filename, and
+only after their media scanner runs — the `audio` view parses the file's **own embedded tags**, reading
+just a small slice of the header over ranged reads rather than transferring the whole file:
+
+```java
+Path song = fs.getPath("/Internal Storage/Music/song.flac");
+Map<String, Object> tags = Files.readAttributes(song, "audio:*");
+// {title=…, artist=…, album=…, genre=…, trackNumber=…, discNumber=…, durationMillis=…}
+// or request a subset: Files.readAttributes(song, "audio:title,artist,album")
+```
+
+Supported formats: **FLAC, MP3 (ID3v2), MP4/M4A, Ogg Vorbis, Opus, and WAV**. Large blocks such as
+embedded album art are skipped, so the read stays small (typically a few KB) regardless of file size,
+and it recovers the real embedded title even on devices whose `mtp` index only reports the filename —
+immediately after upload, with no wait for the device's media scanner. Values are `null` when the object
+is not a file, its format is unsupported, or the header is unreadable; `discNumber` is `0` for containers
+that don't carry it (e.g. WAV/RIFF `INFO`). Requires a backend with ranged-read support (libmtp; the WPD
+backend is a pending follow-up).
 
 ### JVM flags
 

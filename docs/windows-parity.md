@@ -11,8 +11,9 @@ match **`NativeLibMTP`** (libmtp, Linux/macOS). **Keep this file updated wheneve
 - Everything **above** the SPI is platform-neutral and needs no per-backend work:
   - the provider's attribute views (`basic`, `mtp`, `audio`),
   - the lazy read channel (`MTPLazyReadChannel`) and eager `newInputStream`,
-  - the audio tag readers (`org.meltzg.fs.mtp.audio.*` — `FlacMetadataReader`, `Mp3MetadataReader`, …),
-    which are pure Java over `RangedByteSource`.
+  - the audio tag readers (`org.meltzg.fs.mtp.audio.*` — `FlacMetadataReader`, `Mp3MetadataReader`,
+    `Mp4MetadataReader`, `OggMetadataReader`, `WavMetadataReader`), which are pure Java over
+    `RangedByteSource`.
 - These light up on Windows automatically **as soon as the backend implements the primitive they call.**
 - Capability gating keeps unimplemented primitives graceful: `MtpBackend.supportsPartialReads()` lets the
   higher layers degrade instead of failing (the `audio` view returns null tags; the read channel falls
@@ -29,8 +30,8 @@ match **`NativeLibMTP`** (libmtp, Linux/macOS). **Keep this file updated wheneve
 | **Ranged read (`readPartial`)** | ✅ | ❌ | **implement via IStream Seek+Read** |
 | `supportsPartialReads()` | ✅ `true` | ❌ `false` (default) | flip to `true` once `readPartial` lands |
 | Lazy read channel (`newByteChannel`) | ✅ lazy | ⚠️ eager fallback | correct, but not lazy until `readPartial` lands |
-| `audio` view (embedded FLAC/MP3 tags) | ✅ | ❌ (gated off) | needs `readPartial`; then automatic |
-| FLAC / MP3 tag readers | ✅ (neutral) | ✅ (neutral) | none — pure Java, backend-agnostic |
+| `audio` view (embedded tags) | ✅ | ❌ (gated off) | needs `readPartial`; then automatic |
+| Audio tag readers (FLAC/MP3/MP4/Ogg/Opus/WAV) | ✅ (neutral) | ✅ (neutral) | none — pure Java, backend-agnostic |
 
 Legend: ✅ done · ⚠️ works via fallback · ❌ missing.
 
@@ -56,12 +57,14 @@ With `readPartial` implemented, confirm on a real Windows host that:
 - `supportsPartialReads()` → `true` routes `newReadableByteChannel` to `MTPLazyReadChannel`, and
 - `Files.readAttributes(path, "audio:*")` returns embedded tags (currently null on Windows).
 
-Mirror the libmtp device tests: `flacTagsReadFromHeaderRecoverRealTitle`, `audioViewRecoversEmbeddedTagsFromFlac`,
-`partialReadPullsAudioHeaderWithoutTransferringWholeObject`.
+Mirror the libmtp device tests in `MTPFileSystemIntegrationTest`: the `audioViewReadsUploaded*Tags`
+suite (uploads a known-tagged fixture per format and reads `audio:*` back — the same assertions should
+pass on WPD once `readPartial` lands), plus `partialReadPullsAudioHeaderWithoutTransferringWholeObject`.
 
 ## Notes
 
 - The audio tag readers require **no** per-platform work — they operate on `RangedByteSource`, which any
-  backend satisfies through `readPartial`. New format readers (M4A, OGG/Opus, WAV — see
-  `AudioTagReaders`) inherit Windows support for free once task 1 is done.
+  backend satisfies through `readPartial`. All formats currently wired into `AudioTagReaders` (FLAC, MP3,
+  MP4/M4A, Ogg Vorbis, Opus, WAV) — and any added later — inherit Windows support for free once task 1 is
+  done.
 - Keep the status table current as new formats and features land.
