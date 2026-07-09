@@ -3,7 +3,9 @@ package org.meltzg.fs.mtp;
 import org.meltzg.fs.mtp.types.MTPDeviceIdentifier;
 import org.meltzg.fs.mtp.types.MTPItemInfo;
 
+import java.io.FilterInputStream;
 import java.io.IOException;
+import java.io.InputStream;
 import java.net.URI;
 import java.nio.ByteBuffer;
 import java.nio.channels.Channels;
@@ -78,6 +80,40 @@ public class MTPFileSystemProvider extends FileSystemProvider {
     }
 
     @Override
+    public InputStream newInputStream(Path path, OpenOption... options) throws IOException {
+        validatePathProvider(path);
+        for (var opt : options) {
+            // A stream is read-only; reject the write-ish options the JDK default also refuses.
+            if (opt == StandardOpenOption.WRITE || opt == StandardOpenOption.APPEND) {
+                throw new UnsupportedOperationException(opt + " not allowed");
+            }
+        }
+        var deviceId = ((MTPPath) path).getFileSystem().getDeviceIdentifier();
+        var absPath = path.toAbsolutePath().toString();
+
+        // A stream is sequential, whole-object consumption (Files.copy/export, transferTo), so pull the
+        // object in a single bulk transfer rather than many ranged reads. Random-access callers that
+        // want to read only part of a file (e.g. audio tags) use newByteChannel, which is lazy.
+        var tempFile = Files.createTempFile("mtp-in-", ".tmp");
+        try {
+            MTPDeviceBridge.getInstance().getFile(deviceId, absPath, tempFile);
+        } catch (IOException e) {
+            Files.deleteIfExists(tempFile);
+            throw e;
+        }
+        return new FilterInputStream(Files.newInputStream(tempFile, StandardOpenOption.READ)) {
+            @Override
+            public void close() throws IOException {
+                try {
+                    super.close();
+                } finally {
+                    Files.deleteIfExists(tempFile);
+                }
+            }
+        };
+    }
+
+    @Override
     public SeekableByteChannel newByteChannel(Path path, Set<? extends OpenOption> options, FileAttribute<?>... attrs) throws IOException {
         validatePathProvider(path);
         var deviceId = ((MTPPath) path).getFileSystem().getDeviceIdentifier();
@@ -89,10 +125,22 @@ public class MTPFileSystemProvider extends FileSystemProvider {
     }
 
     private SeekableByteChannel newReadableByteChannel(MTPDeviceIdentifier deviceId, String absPath) throws IOException {
-        // Stream the device object straight into a local temp file (no whole-file heap buffering).
+        var bridge = MTPDeviceBridge.getInstance();
+
+        // Preferred path: a lazy, ranged-read channel that fetches only the bytes actually read, so a
+        // consumer can pull a file header (e.g. audio tags) without transferring the whole object.
+        if (bridge.supportsPartialReads()) {
+            var item = bridge.resolveItem(deviceId, absPath); // throws NoSuchFileException when absent
+            if (!item.isFile()) throw new IOException(absPath + " is not a file");
+            return new MTPLazyReadChannel(bridge, deviceId, absPath, item.filesize(),
+                MTPLazyReadChannel.DEFAULT_READ_AHEAD);
+        }
+
+        // Fallback for backends without ranged reads (e.g. WPD today): stream the whole device object
+        // into a local temp file (no whole-file heap buffering) and serve reads from that.
         var tempFile = Files.createTempFile("mtp-read-", ".tmp");
         try {
-            MTPDeviceBridge.getInstance().getFile(deviceId, absPath, tempFile);
+            bridge.getFile(deviceId, absPath, tempFile);
         } catch (IOException e) {
             Files.deleteIfExists(tempFile);
             throw e;
