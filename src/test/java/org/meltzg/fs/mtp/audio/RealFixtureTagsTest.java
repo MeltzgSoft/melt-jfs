@@ -61,6 +61,12 @@ public class RealFixtureTagsTest {
         assertFixture("fixture.opus", false, DISC);
     }
 
+    @Test
+    public void wavFixture() throws Exception {
+        // RIFF INFO has no disc-number field, so a WAV recovers discNumber 0.
+        assertFixture("fixture.wav", true, 0);
+    }
+
     /** Reads {@code /fixtures/<name>} with our reader, asserting the known tags; optionally cross-checks jaudiotagger. */
     private void assertFixture(String name, boolean crossCheckReference, int expectedDisc) throws Exception {
         byte[] bytes = load(name);

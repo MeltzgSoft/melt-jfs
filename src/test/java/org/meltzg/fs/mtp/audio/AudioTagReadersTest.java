@@ -17,6 +17,7 @@ public class AudioTagReadersTest {
         assertTrue(AudioTagReaders.isSupported("song.m4a"));
         assertTrue(AudioTagReaders.isSupported("song.ogg"));
         assertTrue(AudioTagReaders.isSupported("song.opus"));
+        assertTrue(AudioTagReaders.isSupported("song.wav"));
     }
 
     @Test
@@ -47,6 +48,6 @@ public class AudioTagReadersTest {
     @Test
     public void returnsNullForUnsupportedExtension() throws IOException {
         var flac = SyntheticFlac.tagsOnly();
-        assertNull(AudioTagReaders.read("song.wav", RangedByteSource.ofArray(flac), flac.length));
+        assertNull(AudioTagReaders.read("song.wma", RangedByteSource.ofArray(flac), flac.length));
     }
 }

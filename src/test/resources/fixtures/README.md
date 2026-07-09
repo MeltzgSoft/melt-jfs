@@ -44,3 +44,10 @@ container (with `moov` after `mdat`, so it exercises the mdat-skip path). Used b
 Same CC0 source and known tags as `fixture.flac`, transcoded with ffmpeg's `libvorbis` (Ogg Vorbis) and
 `libopus` (Opus) encoders. Used by `RealFixtureTagsTest`. jaudiotagger 3.0.1 has no `.opus` reader, so
 the Opus fixture is validated against the known tags only (no reference cross-check).
+
+## `fixture.wav`
+
+Same CC0 source and known tags as `fixture.flac`, transcoded with ffmpeg to `pcm_s16le` (mono, 8 kHz)
+with RIFF `LIST`/`INFO` tags. Used by `RealFixtureTagsTest`. RIFF `INFO` has no disc field (so the WAV
+`discNumber` is 0), and jaudiotagger keeps a trailing NUL on `INFO` values and does not read the `IPRT`
+track field, so those are normalized/skipped in the cross-check.
