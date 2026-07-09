@@ -380,6 +380,33 @@ public enum MTPDeviceBridge implements Closeable {
         }
     }
 
+    /**
+     * Reads up to {@code maxBytes} bytes of the file at {@code path} starting at {@code offset} via
+     * the backend's ranged-read path (see {@link MtpBackend#readPartial}) — no whole-object transfer.
+     * Returns the bytes actually read (shorter than {@code maxBytes} near end-of-object, empty at or
+     * past it). Throws {@link NoSuchFileException} when nothing exists at {@code path}.
+     */
+    public byte[] readPartial(MTPDeviceIdentifier deviceId, String path, long offset, int maxBytes) throws IOException {
+        connectionLock.readLock().lock();
+        try {
+            var parts = pathParts(path);
+            var conn = requireConnection(deviceId);
+            synchronized (conn) {
+                var item = resolveItemUnsafe(conn, parts);
+                if (item == null) throw new NoSuchFileException(path);
+                if (!item.isFile()) throw new IOException(path + " is not a file");
+                return backend().readPartial(conn.handle(), item.itemId(), offset, maxBytes);
+            }
+        } finally {
+            connectionLock.readLock().unlock();
+        }
+    }
+
+    /** Whether the active backend supports ranged reads (see {@link MtpBackend#supportsPartialReads}). */
+    public boolean supportsPartialReads() {
+        return backend().supportsPartialReads();
+    }
+
     /** Streams the file at {@code path} on the device directly into {@code localFile}. */
     public void getFile(MTPDeviceIdentifier deviceId, String path, java.nio.file.Path localFile) throws IOException {
         connectionLock.readLock().lock();

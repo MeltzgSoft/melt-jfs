@@ -715,6 +715,38 @@ public class MTPFileSystemIntegrationTest {
     }
 
     @Test
+    public void partialReadPullsAudioHeaderWithoutTransferringWholeObject() throws IOException {
+        var storage = requireFirstStorage();
+        var audio = findFirstAudioFile(storage, 4);
+        assumeTrue("No audio files found in first 4 levels of " + storage, audio != null);
+
+        var bridge = MTPDeviceBridge.getInstance();
+        var deviceId = fs.getDeviceIdentifier();
+        var absPath = audio.toAbsolutePath().toString();
+        long fullSize = Files.size(audio);
+
+        long start = System.nanoTime();
+        // 64 KB comfortably covers a FLAC STREAMINFO + VORBIS_COMMENT block for tag reading.
+        byte[] head = bridge.readPartial(deviceId, absPath, 0, 64 * 1024);
+        long elapsedMillis = (System.nanoTime() - start) / 1_000_000;
+
+        System.out.printf("readPartial(64KB) of %s (%d bytes total) returned %d bytes in %dms%n",
+            audio, fullSize, head.length, elapsedMillis);
+
+        assertTrue("expected some header bytes", head.length > 0);
+        assertTrue("ranged read must not transfer the whole object", head.length <= 64 * 1024);
+        assertTrue("a ranged header read of a few KB should be far cheaper than a whole-object transfer",
+            elapsedMillis < 5_000);
+
+        // Proves we pulled real file bytes (the container magic), not device-indexed metadata.
+        if (audio.getFileName().toString().toLowerCase().endsWith(".flac")) {
+            assertTrue("FLAC header should be at least the 4-byte magic", head.length >= 4);
+            assertEquals("expected FLAC 'fLaC' stream marker",
+                "fLaC", new String(head, 0, 4, java.nio.charset.StandardCharsets.US_ASCII));
+        }
+    }
+
+    @Test
     public void trackMetadataIsNullForDirectories() throws IOException {
         var storage = requireFirstStorage();
         var bridge = MTPDeviceBridge.getInstance();
