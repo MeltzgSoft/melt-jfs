@@ -6,7 +6,6 @@ import org.junit.*;
 import org.meltzg.fs.mtp.audio.FlacMetadataReader;
 import org.meltzg.fs.mtp.audio.RangedByteSource;
 import org.meltzg.fs.mtp.types.MTPDeviceIdentifier;
-import org.meltzg.fs.mtp.types.MTPTrackMetadata;
 
 import java.io.IOException;
 import java.net.URI;
@@ -918,10 +917,10 @@ public class MTPFileSystemIntegrationTest {
     }
 
     @Test
-    public void uploadedTrackTagsAreReadBackCorrectly() throws IOException, InterruptedException {
+    public void uploadedId3v23Mp3TagsAreReadBackViaAudioView() throws IOException {
         var storage = requireFirstStorage();
 
-        // A ~1s silent MP3 carrying these exact ID3 tags, checked in under integrationTest resources.
+        // A ~1s silent MP3 carrying these exact ID3v2.3 tags, checked in under integrationTest resources.
         byte[] fixture;
         try (var in = getClass().getResourceAsStream(META_FIXTURE)) {
             // The fixture is checked into integrationTest resources, so a missing one is a build
@@ -931,36 +930,25 @@ public class MTPFileSystemIntegrationTest {
         }
 
         var target = storage.resolve(META_FILE_NAME);
-        var bridge = MTPDeviceBridge.getInstance();
-        var deviceId = fs.getDeviceIdentifier();
-        var absPath = target.toAbsolutePath().toString();
-
         Files.write(target, fixture);
         try {
-            // sendFile stamps an audio filetype from the .mp3 extension, so the device indexes the
-            // object and exposes its tags. Indexing can be asynchronous, so poll within a budget.
-            MTPTrackMetadata meta = null;
-            long deadlineNanos = System.nanoTime() + java.time.Duration.ofSeconds(30).toNanos();
-            while (System.nanoTime() < deadlineNanos) {
-                meta = bridge.getTrackMetadata(deviceId, absPath);
-                if (meta != null && meta.title() != null) break;
-                Thread.sleep(1_000);
-            }
-            // Reaching here without indexed metadata is a real regression (upload stamped the wrong
-            // filetype, or the tags never became readable), not an environmental skip — fail on it.
-            assertTrue("device did not index the uploaded track within 30s",
-                meta != null && meta.title() != null);
+            // Read the embedded tags back through the "audio" view: it parses the file's own bytes over
+            // ranged reads, so it recovers the real ID3 tags immediately. (The device's "mtp" index is
+            // not asserted here — many devices, e.g. this Pixel, report the filename as the title and
+            // expose no other fields, which is exactly why the "audio" view exists.)
+            var attrs = Files.readAttributes(target, "audio:*");
 
-            assertEquals("melt-jfs Test Title",  meta.title());
-            assertEquals("melt-jfs Test Artist", meta.artist());
-            assertEquals("melt-jfs Test Album",  meta.album());
-            assertEquals("Jazz",                 meta.genre());
-            assertEquals(7,                      meta.trackNumber());
-            // The fixture is ~1045ms of audio; the device reports its own duration in milliseconds.
-            // A band (not an exact match) allows for rounding/derivation differences across devices
-            // while still proving the value is milliseconds — not seconds (~1) or 100ns units (~10.4M).
-            assertTrue("duration should be ~1s in millis, was " + meta.durationMillis(),
-                meta.durationMillis() > 500 && meta.durationMillis() < 2_000);
+            assertEquals("melt-jfs Test Title",  attrs.get("title"));
+            assertEquals("melt-jfs Test Artist", attrs.get("artist"));
+            assertEquals("melt-jfs Test Album",  attrs.get("album"));
+            assertEquals("Jazz",                 attrs.get("genre"));
+            assertEquals(7,                      attrs.get("trackNumber"));
+            // The fixture is ~1045ms of audio; duration is derived from the MP3 frames, in milliseconds.
+            // A band (not an exact match) allows for rounding/derivation differences while still proving
+            // the value is milliseconds — not seconds (~1) or 100ns units (~10.4M).
+            long durationMillis = (Long) attrs.get("durationMillis");
+            assertTrue("duration should be ~1s in millis, was " + durationMillis,
+                durationMillis > 500 && durationMillis < 2_000);
         } finally {
             Files.deleteIfExists(target);
         }
