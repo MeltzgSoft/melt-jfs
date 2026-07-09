@@ -6,6 +6,8 @@ import org.meltzg.fs.mtp.types.MTPItemInfo;
 import org.meltzg.fs.mtp.types.MTPTrackMetadata;
 
 import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -103,9 +105,15 @@ class FakeLibMTP implements MtpBackend {
     @Override
     public void deleteObject(DeviceHandle device, String itemId) throws IOException {}
 
+    // Counts whole-object transfers, so tests can assert a copy took the bulk path (not ranged reads).
+    volatile int getFileCalls = 0;
+
     @Override
     public void getFile(DeviceHandle device, String itemId, String destPath) throws IOException {
-        // No content in the in-memory fake; leave destPath as the (empty) temp file.
+        getFileCalls++;
+        var bytes = content.get(itemId);
+        // Write seeded content when present; otherwise leave destPath as the (empty) temp file.
+        if (bytes != null) Files.write(Path.of(destPath), bytes);
     }
 
     // Total bytes served through readPartial, so tests can assert a ranged read stayed bounded.
