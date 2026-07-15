@@ -3,6 +3,8 @@ package org.meltzg.fs.mtp;
 import org.jaudiotagger.audio.AudioFileIO;
 import org.jaudiotagger.tag.FieldKey;
 import org.junit.*;
+import org.junit.runner.RunWith;
+import org.junit.runners.Parameterized;
 import org.meltzg.fs.mtp.audio.FlacMetadataReader;
 import org.meltzg.fs.mtp.audio.RangedByteSource;
 import org.meltzg.fs.mtp.types.MTPDeviceIdentifier;
@@ -14,6 +16,7 @@ import java.nio.file.attribute.BasicFileAttributeView;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.nio.file.attribute.FileTime;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.List;
 import java.util.Set;
 import java.util.stream.Collectors;
@@ -22,11 +25,14 @@ import static org.junit.Assert.*;
 import static org.junit.Assume.assumeTrue;
 
 /**
- * Integration tests that exercise the MTP filesystem provider against a physically connected device.
+ * Integration tests that exercise the MTP filesystem provider against every physically connected
+ * device: the parameterized runner enumerates the attached devices and each device's storages, running
+ * every test once per (device, storage) so operations are exercised on all storages of all devices.
  * Skipped automatically when no device is present or libmtp is not installed.
  *
- * Run with: ./gradlew test --tests '*FileSystemIntegration*'
+ * Run with: ./gradlew integrationTest --tests '*FileSystemIntegration*'
  */
+@RunWith(Parameterized.class)
 public class MTPFileSystemIntegrationTest {
 
     private static final String TEST_DIR_NAME = "__melt_jfs_test__";
@@ -48,22 +54,97 @@ public class MTPFileSystemIntegrationTest {
     private static final int FIXTURE_TRACK = 7;
     private static final long FIXTURE_DURATION_SECONDS = 4;
 
+    /**
+     * One parameter set per (device, storage), labelled with the device's friendly name: every attached
+     * device is opened and each of its storages contributes a row, so the storage-level operation tests
+     * run once per storage on every device. When the native backend is unavailable, no device is
+     * connected, or a device exposes no storages, a single placeholder row is emitted so the class still
+     * runs and self-skips in {@link #setUp()} rather than failing the build with an empty parameter list.
+     */
+    @Parameterized.Parameters(name = "{1} storage={2}")
+    public static Collection<Object[]> deviceStorages() throws IOException {
+        var params = new ArrayList<Object[]>();
+        for (var row : MTPDeviceBridgeIntegrationTest.connectedDevices()) {
+            var deviceId = (MTPDeviceIdentifier) row[0];
+            var deviceName = (String) row[1];
+            if (deviceId == null) {
+                params.add(new Object[]{null, deviceName, null});
+                continue;
+            }
+            var provider = new MTPFileSystemProvider();
+            try (var fs = provider.newFileSystem(URI.create("mtp://" + deviceId + "/"), null)) {
+                var storages = storageNames(fs);
+                if (storages.isEmpty()) {
+                    params.add(new Object[]{deviceId, deviceName, null});
+                } else {
+                    for (var storage : storages) {
+                        params.add(new Object[]{deviceId, deviceName, storage});
+                    }
+                }
+            } finally {
+                MTPDeviceBridge.INSTANCE.close();
+            }
+        }
+        return params;
+    }
+
+    /** Logs a reason to stdout whenever a test is skipped, so skips aren't silent in the run output. */
+    @Rule
+    public final org.junit.rules.TestWatcher skipReasonLogger =
+        MTPDeviceBridgeIntegrationTest.skipReasonLogger();
+
+    private final MTPDeviceIdentifier deviceId;
+    private final String deviceName;
+    private final String storageName;
     private MTPFileSystemProvider provider;
     private MTPFileSystem fs;
+    private Path storage;
+
+    public MTPFileSystemIntegrationTest(MTPDeviceIdentifier deviceId, String deviceName, String storageName) {
+        this.deviceId = deviceId;
+        this.deviceName = deviceName;
+        this.storageName = storageName;
+    }
 
     @Before
     public void setUp() throws IOException {
         assumeTrue("native MTP backend not available", isBackendAvailable());
+        assumeTrue("no MTP device connected", deviceId != null);
+        assumeTrue("device exposes no storages: " + deviceName, storageName != null);
         MTPDeviceBridge.INSTANCE.close();
         var bridge = MTPDeviceBridge.getInstance();
-        assumeTrue("No MTP device connected", !bridge.getDeviceConns().isEmpty());
+        assumeTrue("device no longer connected: " + deviceName,
+            bridge.getDeviceConns().containsKey(deviceId));
 
-        MTPDeviceIdentifier deviceId = bridge.getDeviceConns().keySet().iterator().next();
         provider = new MTPFileSystemProvider();
         fs = provider.newFileSystem(URI.create("mtp://" + deviceId + "/"), null);
 
+        storage = findStorageByName(storageName);
+        assumeTrue("storage no longer present: " + storageName + " on " + deviceName, storage != null);
+
         // Best-effort cleanup of any leftovers from a previous failed run
         cleanUpTestArtifacts();
+    }
+
+    /** Names of the storages a device exposes at its root, used to fan out the parameter sets. */
+    private static List<String> storageNames(MTPFileSystem fs) throws IOException {
+        var names = new ArrayList<String>();
+        try (var stream = Files.newDirectoryStream(fs.getPath("/"))) {
+            for (var s : stream) {
+                names.add(s.getFileName().toString());
+            }
+        }
+        return names;
+    }
+
+    /** Resolves the parameterized storage against the live root listing, or null if it is gone. */
+    private Path findStorageByName(String name) throws IOException {
+        try (var stream = Files.newDirectoryStream(fs.getPath("/"))) {
+            for (var s : stream) {
+                if (s.getFileName().toString().equals(name)) return s;
+            }
+        }
+        return null;
     }
 
     @After
@@ -77,7 +158,6 @@ public class MTPFileSystemIntegrationTest {
 
     private void cleanUpTestArtifacts() {
         try {
-            var storage = firstStorageOrNull();
             if (storage != null) {
                 Files.deleteIfExists(storage.resolve(TEST_FILE_NAME));
                 Files.deleteIfExists(storage.resolve(TEST_FILE_NAME2));
@@ -125,7 +205,7 @@ public class MTPFileSystemIntegrationTest {
 
     @Test
     public void fileStoreReportsConsistentCapacity() throws IOException {
-        var storage = requireFirstStorage();
+        var storage = requireStorage();
         var store = Files.getFileStore(storage);
         assertTrue("Total space should be > 0", store.getTotalSpace() > 0);
         assertTrue("Usable space should be >= 0", store.getUsableSpace() >= 0);
@@ -137,7 +217,7 @@ public class MTPFileSystemIntegrationTest {
 
     @Test
     public void createDirectoryAppearsInListing() throws IOException {
-        var storage = requireFirstStorage();
+        var storage = requireStorage();
         var testDir = storage.resolve(TEST_DIR_NAME);
 
         Files.createDirectory(testDir);
@@ -155,7 +235,7 @@ public class MTPFileSystemIntegrationTest {
 
     @Test
     public void deleteDirectoryDisappearsFromListing() throws IOException {
-        var storage = requireFirstStorage();
+        var storage = requireStorage();
         var testDir = storage.resolve(TEST_DIR_NAME);
 
         Files.createDirectory(testDir);
@@ -170,7 +250,7 @@ public class MTPFileSystemIntegrationTest {
 
     @Test(expected = NoSuchFileException.class)
     public void deleteNonExistentThrows() throws IOException {
-        var storage = requireFirstStorage();
+        var storage = requireStorage();
         Files.delete(storage.resolve(TEST_DIR_NAME));
     }
 
@@ -187,7 +267,7 @@ public class MTPFileSystemIntegrationTest {
 
     @Test
     public void walkStorageIncludesRootEntry() throws IOException {
-        var storage = requireFirstStorage();
+        var storage = requireStorage();
         var walked = Files.walk(storage, 1).collect(Collectors.toList());
         assertFalse("Walk should produce at least the storage root itself", walked.isEmpty());
         assertTrue("Walk should include the storage root", walked.contains(storage));
@@ -197,9 +277,8 @@ public class MTPFileSystemIntegrationTest {
 
     @Test
     public void fileAttributesAreConsistent() throws IOException {
-        var storage = requireFirstStorage();
-        var file = findFirstFile(storage, 2);
-        assumeTrue("No regular files found in first 2 levels of " + storage, file != null);
+        var storage = requireStorage();
+        var file = requireRegularFile(storage);
 
         var attrs = Files.readAttributes(file, BasicFileAttributes.class);
         assertTrue("File should report isRegularFile=true", attrs.isRegularFile());
@@ -210,9 +289,8 @@ public class MTPFileSystemIntegrationTest {
 
     @Test
     public void readFileBytesMatchReportedSize() throws IOException {
-        var storage = requireFirstStorage();
-        var file = findFirstFile(storage, 2);
-        assumeTrue("No regular files found in first 2 levels of " + storage, file != null);
+        var storage = requireStorage();
+        var file = requireRegularFile(storage);
 
         long reportedSize = Files.size(file);
         byte[] content = Files.readAllBytes(file);
@@ -224,7 +302,7 @@ public class MTPFileSystemIntegrationTest {
 
     @Test
     public void writeThenReadRoundTrips() throws IOException {
-        var storage = requireFirstStorage();
+        var storage = requireStorage();
         var file = storage.resolve(TEST_FILE_NAME);
         var payload = "melt-jfs write path éñ 🎵".getBytes(java.nio.charset.StandardCharsets.UTF_8);
 
@@ -247,7 +325,7 @@ public class MTPFileSystemIntegrationTest {
 
     @Test
     public void overwriteReplacesContent() throws IOException {
-        var storage = requireFirstStorage();
+        var storage = requireStorage();
         var file = storage.resolve(TEST_FILE_NAME);
 
         Files.write(file, "first-and-longer".getBytes(java.nio.charset.StandardCharsets.UTF_8));
@@ -265,7 +343,7 @@ public class MTPFileSystemIntegrationTest {
 
     @Test(expected = FileAlreadyExistsException.class)
     public void createNewFailsWhenFileExists() throws IOException {
-        var storage = requireFirstStorage();
+        var storage = requireStorage();
         var file = storage.resolve(TEST_FILE_NAME);
         Files.write(file, new byte[]{1, 2, 3});
         try {
@@ -277,7 +355,7 @@ public class MTPFileSystemIntegrationTest {
 
     @Test
     public void deleteWrittenFileDisappearsFromListing() throws IOException {
-        var storage = requireFirstStorage();
+        var storage = requireStorage();
         var file = storage.resolve(TEST_FILE_NAME);
 
         Files.write(file, new byte[]{4, 5, 6});
@@ -290,7 +368,7 @@ public class MTPFileSystemIntegrationTest {
 
     @Test
     public void moveRenamesWithinSameDirectory() throws IOException {
-        var storage = requireFirstStorage();
+        var storage = requireStorage();
         var src = storage.resolve(TEST_FILE_NAME);
         var dst = storage.resolve(TEST_FILE_NAME2);
         var payload = "rename me".getBytes(java.nio.charset.StandardCharsets.UTF_8);
@@ -309,7 +387,7 @@ public class MTPFileSystemIntegrationTest {
 
     @Test
     public void moveRelocatesIntoSubdirectory() throws IOException {
-        var storage = requireFirstStorage();
+        var storage = requireStorage();
         var dir = storage.resolve(TEST_DIR_NAME);
         var src = storage.resolve(TEST_FILE_NAME);
         var dst = dir.resolve(TEST_FILE_NAME);
@@ -336,7 +414,7 @@ public class MTPFileSystemIntegrationTest {
 
     @Test(expected = FileAlreadyExistsException.class)
     public void moveFailsWhenTargetExistsWithoutReplace() throws IOException {
-        var storage = requireFirstStorage();
+        var storage = requireStorage();
         var src = storage.resolve(TEST_FILE_NAME);
         var dst = storage.resolve(TEST_FILE_NAME2);
         Files.write(src, new byte[]{1});
@@ -351,7 +429,7 @@ public class MTPFileSystemIntegrationTest {
 
     @Test
     public void moveReplacesExistingTarget() throws IOException {
-        var storage = requireFirstStorage();
+        var storage = requireStorage();
         var src = storage.resolve(TEST_FILE_NAME);
         var dst = storage.resolve(TEST_FILE_NAME2);
         Files.write(src, "winner".getBytes(java.nio.charset.StandardCharsets.UTF_8));
@@ -368,7 +446,7 @@ public class MTPFileSystemIntegrationTest {
 
     @Test
     public void moveEmptyDirectorySucceeds() throws IOException {
-        var storage = requireFirstStorage();
+        var storage = requireStorage();
         var srcDir = storage.resolve(TEST_DIR_NAME);
         var dstDir = storage.resolve(TEST_DIR_NAME2);
 
@@ -390,7 +468,7 @@ public class MTPFileSystemIntegrationTest {
         // emulation must fail with DirectoryNotEmptyException rather than recursively copy. Devices
         // that do implement MoveObject relocate the tree in one native operation, so the emulation
         // path under test is never reached there; probe the device and skip when that is the case.
-        var storage = requireFirstStorage();
+        var storage = requireStorage();
         var srcDir = storage.resolve(TEST_DIR_NAME);
         var destParent = storage.resolve(TEST_DIR_NAME2);
         var moved = destParent.resolve(TEST_DIR_NAME);
@@ -422,7 +500,7 @@ public class MTPFileSystemIntegrationTest {
 
     @Test
     public void copyFileCreatesIndependentCopy() throws IOException {
-        var storage = requireFirstStorage();
+        var storage = requireStorage();
         var src = storage.resolve(TEST_FILE_NAME);
         var dst = storage.resolve(TEST_FILE_NAME2);
         var payload = "copy me".getBytes(java.nio.charset.StandardCharsets.UTF_8);
@@ -441,7 +519,7 @@ public class MTPFileSystemIntegrationTest {
 
     @Test(expected = FileAlreadyExistsException.class)
     public void copyFailsWhenTargetExistsWithoutReplace() throws IOException {
-        var storage = requireFirstStorage();
+        var storage = requireStorage();
         var src = storage.resolve(TEST_FILE_NAME);
         var dst = storage.resolve(TEST_FILE_NAME2);
         Files.write(src, new byte[]{1});
@@ -456,7 +534,7 @@ public class MTPFileSystemIntegrationTest {
 
     @Test
     public void copyReplacesExistingTarget() throws IOException {
-        var storage = requireFirstStorage();
+        var storage = requireStorage();
         var src = storage.resolve(TEST_FILE_NAME);
         var dst = storage.resolve(TEST_FILE_NAME2);
         Files.write(src, "new".getBytes(java.nio.charset.StandardCharsets.UTF_8));
@@ -473,7 +551,7 @@ public class MTPFileSystemIntegrationTest {
 
     @Test
     public void copyDirectoryIsNonRecursive() throws IOException {
-        var storage = requireFirstStorage();
+        var storage = requireStorage();
         var srcDir = storage.resolve(TEST_DIR_NAME);
         var dstDir = storage.resolve(TEST_DIR_NAME2);
         Files.createDirectory(srcDir);
@@ -494,7 +572,7 @@ public class MTPFileSystemIntegrationTest {
 
     @Test
     public void appendExtendsExistingFile() throws IOException {
-        var storage = requireFirstStorage();
+        var storage = requireStorage();
         var file = storage.resolve(TEST_FILE_NAME);
         Files.write(file, "first".getBytes(java.nio.charset.StandardCharsets.UTF_8));
         try {
@@ -509,7 +587,7 @@ public class MTPFileSystemIntegrationTest {
 
     @Test
     public void largeFileRoundTripStreams() throws IOException {
-        var storage = requireFirstStorage();
+        var storage = requireStorage();
         var file = storage.resolve(TEST_FILE_NAME);
         var payload = new byte[4 * 1024 * 1024]; // 4 MiB: exercises the streamed read/write path
         for (int i = 0; i < payload.length; i++) {
@@ -529,7 +607,7 @@ public class MTPFileSystemIntegrationTest {
 
     @Test
     public void isSameFileTrueForEquivalentPaths() throws IOException {
-        var storage = requireFirstStorage();
+        var storage = requireStorage();
         var a = storage.resolve(TEST_FILE_NAME);
         var b = storage.resolve(TEST_FILE_NAME);
         Files.write(a, new byte[]{1});
@@ -544,7 +622,7 @@ public class MTPFileSystemIntegrationTest {
 
     @Test
     public void isSameFileFalseForDifferentPaths() throws IOException {
-        var storage = requireFirstStorage();
+        var storage = requireStorage();
         var a = storage.resolve(TEST_FILE_NAME);
         var b = storage.resolve(TEST_FILE_NAME2);
         Files.write(a, new byte[]{1});
@@ -561,7 +639,7 @@ public class MTPFileSystemIntegrationTest {
 
     @Test
     public void isHiddenAlwaysFalse() throws IOException {
-        var storage = requireFirstStorage();
+        var storage = requireStorage();
         var file = storage.resolve(TEST_FILE_NAME);
         Files.write(file, new byte[]{7});
         try {
@@ -576,7 +654,7 @@ public class MTPFileSystemIntegrationTest {
 
     @Test
     public void checkAccessSucceedsForReadAndWriteOnExistingFile() throws IOException {
-        var storage = requireFirstStorage();
+        var storage = requireStorage();
         var file = storage.resolve(TEST_FILE_NAME);
         Files.write(file, new byte[]{1, 2, 3});
         try {
@@ -591,7 +669,7 @@ public class MTPFileSystemIntegrationTest {
 
     @Test
     public void checkAccessExecuteThrowsAccessDenied() throws IOException {
-        var storage = requireFirstStorage();
+        var storage = requireStorage();
         var file = storage.resolve(TEST_FILE_NAME);
         Files.write(file, new byte[]{1});
         try {
@@ -604,7 +682,7 @@ public class MTPFileSystemIntegrationTest {
 
     @Test(expected = NoSuchFileException.class)
     public void checkAccessThrowsForMissingFile() throws IOException {
-        var storage = requireFirstStorage();
+        var storage = requireStorage();
         provider.checkAccess(storage.resolve(TEST_FILE_NAME));
     }
 
@@ -612,7 +690,7 @@ public class MTPFileSystemIntegrationTest {
 
     @Test
     public void basicFileAttributeViewReadsAttributes() throws IOException {
-        var storage = requireFirstStorage();
+        var storage = requireStorage();
         var file = storage.resolve(TEST_FILE_NAME);
         var payload = new byte[]{1, 2, 3, 4, 5};
         Files.write(file, payload);
@@ -629,7 +707,7 @@ public class MTPFileSystemIntegrationTest {
 
     @Test
     public void setTimesViaViewIsUnsupported() throws IOException {
-        var storage = requireFirstStorage();
+        var storage = requireStorage();
         var file = storage.resolve(TEST_FILE_NAME);
         Files.write(file, new byte[]{1});
         try {
@@ -643,7 +721,7 @@ public class MTPFileSystemIntegrationTest {
 
     @Test
     public void readStringAttributesReturnsRequestedKeys() throws IOException {
-        var storage = requireFirstStorage();
+        var storage = requireStorage();
         var file = storage.resolve(TEST_FILE_NAME);
         var payload = new byte[]{1, 2, 3, 4};
         Files.write(file, payload);
@@ -660,7 +738,7 @@ public class MTPFileSystemIntegrationTest {
 
     @Test
     public void readStringAttributesWildcardReturnsAllBasicKeys() throws IOException {
-        var storage = requireFirstStorage();
+        var storage = requireStorage();
         var file = storage.resolve(TEST_FILE_NAME);
         Files.write(file, new byte[]{1});
         try {
@@ -676,7 +754,7 @@ public class MTPFileSystemIntegrationTest {
 
     @Test
     public void readUnknownStringAttributeThrows() throws IOException {
-        var storage = requireFirstStorage();
+        var storage = requireStorage();
         var file = storage.resolve(TEST_FILE_NAME);
         Files.write(file, new byte[]{1});
         try {
@@ -689,7 +767,7 @@ public class MTPFileSystemIntegrationTest {
 
     @Test
     public void setAttributeIsUnsupported() throws IOException {
-        var storage = requireFirstStorage();
+        var storage = requireStorage();
         var file = storage.resolve(TEST_FILE_NAME);
         Files.write(file, new byte[]{1});
         try {
@@ -704,9 +782,8 @@ public class MTPFileSystemIntegrationTest {
 
     @Test
     public void trackMetadataViewHasExpectedShape() throws IOException {
-        var storage = requireFirstStorage();
-        var file = findFirstFile(storage, 2);
-        assumeTrue("No regular files found in first 2 levels of " + storage, file != null);
+        var storage = requireStorage();
+        var file = requireRegularFile(storage);
 
         var attrs = Files.readAttributes(file, "mtp:*");
         assertEquals(Set.of("title", "artist", "album", "genre", "trackNumber", "durationMillis"),
@@ -715,9 +792,8 @@ public class MTPFileSystemIntegrationTest {
 
     @Test
     public void trackMetadataReadsForAudioFileWithoutTransferringContent() throws IOException {
-        var storage = requireFirstStorage();
-        var audio = findFirstAudioFile(storage, 4);
-        assumeTrue("No audio files found in first 4 levels of " + storage, audio != null);
+        var storage = requireStorage();
+        var audio = requireAudioFile(storage);
 
         long start = System.nanoTime();
         var attrs = Files.readAttributes(audio, "mtp:*");
@@ -734,9 +810,8 @@ public class MTPFileSystemIntegrationTest {
 
     @Test
     public void partialReadPullsAudioHeaderWithoutTransferringWholeObject() throws IOException {
-        var storage = requireFirstStorage();
-        var audio = findFirstAudioFile(storage, 4);
-        assumeTrue("No audio files found in first 4 levels of " + storage, audio != null);
+        var storage = requireStorage();
+        var audio = requireAudioFile(storage);
 
         var bridge = MTPDeviceBridge.getInstance();
         var deviceId = fs.getDeviceIdentifier();
@@ -766,9 +841,8 @@ public class MTPFileSystemIntegrationTest {
 
     @Test
     public void flacTagsReadFromHeaderRecoverRealTitle() throws Exception {
-        var storage = requireFirstStorage();
-        var flac = findFirstFlac(storage, 4);
-        assumeTrue("No .flac files found in first 4 levels of " + storage, flac != null);
+        var storage = requireStorage();
+        var flac = requireFlac(storage);
 
         var bridge = MTPDeviceBridge.getInstance();
         var deviceId = fs.getDeviceIdentifier();
@@ -819,9 +893,8 @@ public class MTPFileSystemIntegrationTest {
 
     @Test
     public void audioViewRecoversEmbeddedTagsFromFlac() throws IOException {
-        var storage = requireFirstStorage();
-        var flac = findFirstFlac(storage, 4);
-        assumeTrue("No .flac files found in first 4 levels of " + storage, flac != null);
+        var storage = requireStorage();
+        var flac = requireFlac(storage);
 
         // The pure-NIO seam: read embedded tags straight off the file via the "audio" attribute view.
         var audio = Files.readAttributes(flac, "audio:title,artist,album,durationMillis");
@@ -838,7 +911,7 @@ public class MTPFileSystemIntegrationTest {
 
     @Test
     public void trackMetadataIsNullForDirectories() throws IOException {
-        var storage = requireFirstStorage();
+        var storage = requireStorage();
         var bridge = MTPDeviceBridge.getInstance();
         var deviceId = fs.getDeviceIdentifier();
         assertNull(bridge.getTrackMetadata(deviceId, storage.toAbsolutePath().toString()));
@@ -892,7 +965,7 @@ public class MTPFileSystemIntegrationTest {
             fixture = in.readAllBytes();
         }
 
-        var storage = requireFirstStorage();
+        var storage = requireStorage();
         var extension = fixtureName.substring(fixtureName.lastIndexOf('.'));
         var target = storage.resolve(AUDIO_FIXTURE_BASE + extension);
 
@@ -918,7 +991,7 @@ public class MTPFileSystemIntegrationTest {
 
     @Test
     public void uploadedId3v23Mp3TagsAreReadBackViaAudioView() throws IOException {
-        var storage = requireFirstStorage();
+        var storage = requireStorage();
 
         // A ~1s silent MP3 carrying these exact ID3v2.3 tags, checked in under integrationTest resources.
         byte[] fixture;
@@ -958,6 +1031,45 @@ public class MTPFileSystemIntegrationTest {
 
     private static final List<String> AUDIO_EXTENSIONS =
         List.of(".mp3", ".flac", ".ogg", ".m4a", ".wma", ".wav", ".opus", ".aac");
+
+    // The read-path tests want real on-device content to exercise. Rather than skip on a device (or a
+    // blank SD card) that happens to hold no suitable file, these helpers stage one from the checked-in
+    // fixtures so the test still runs. Anything staged uses the test-artifact names that
+    // cleanUpTestArtifacts() deletes in both setUp and tearDown, so nothing is left on the device.
+
+    /** An existing regular file under {@code storage}, or a freshly staged one when it has none. */
+    private Path requireRegularFile(Path storage) throws IOException {
+        var found = findFirstFile(storage, 2);
+        if (found != null) return found;
+        var staged = storage.resolve(TEST_FILE_NAME);
+        Files.write(staged, "melt-jfs staged content".getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        return staged;
+    }
+
+    /** An existing audio file under {@code storage}, or a staged FLAC fixture when it has none. */
+    private Path requireAudioFile(Path storage) throws IOException {
+        var found = findFirstAudioFile(storage, 4);
+        return found != null ? found : stageFlacFixture(storage);
+    }
+
+    /** An existing .flac under {@code storage}, or a staged FLAC fixture when it has none. */
+    private Path requireFlac(Path storage) throws IOException {
+        var found = findFirstFlac(storage, 4);
+        return found != null ? found : stageFlacFixture(storage);
+    }
+
+    /** Uploads the checked-in FLAC fixture to {@code storage} and returns its path. */
+    private Path stageFlacFixture(Path storage) throws IOException {
+        byte[] fixture;
+        try (var in = getClass().getResourceAsStream("/fixtures/fixture.flac")) {
+            // Checked into integrationTest resources, so a missing one is a build packaging bug.
+            assertNotNull("fixture /fixtures/fixture.flac not on classpath", in);
+            fixture = in.readAllBytes();
+        }
+        var target = storage.resolve(AUDIO_FIXTURE_BASE + ".flac");
+        Files.write(target, fixture);
+        return target;
+    }
 
     private Path findFirstAudioFile(Path dir, int depthRemaining) throws IOException {
         try (var stream = Files.newDirectoryStream(dir)) {
@@ -1001,15 +1113,9 @@ public class MTPFileSystemIntegrationTest {
         }
     }
 
-    private Path requireFirstStorage() throws IOException {
-        var storage = firstStorageOrNull();
-        assumeTrue("No storages available on device", storage != null);
+    private Path requireStorage() {
+        assumeTrue("No storage available on device", storage != null);
         return storage;
-    }
-
-    private Path firstStorageOrNull() throws IOException {
-        var storages = listChildren(fs.getPath("/"));
-        return storages.isEmpty() ? null : storages.get(0);
     }
 
     private List<Path> listChildren(Path dir) throws IOException {

@@ -80,8 +80,12 @@ tasks.register<Test>("integrationTest") {
 
     // These tests self-skip (via JUnit assumptions) when no device is attached, so make skips
     // visible on the console — otherwise an all-skipped run is indistinguishable from a passing one.
+    // showStandardStreams forwards the forked test JVM's stdout so the per-test "[SKIPPED] … -> reason"
+    // lines (and the on-device diagnostics these tests print) reach the console; Gradle otherwise
+    // captures and hides them.
     testLogging {
         events(TestLogEvent.PASSED, TestLogEvent.SKIPPED, TestLogEvent.FAILED)
+        showStandardStreams = true
     }
 
     // Opt-in guard: `-PrequireDevice` turns an all-skipped run into a build failure, so a run meant
