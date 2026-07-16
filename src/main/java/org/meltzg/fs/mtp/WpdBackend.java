@@ -75,6 +75,7 @@ class WpdBackend implements MtpBackend {
     private static final MemorySegment KEY_CLIENT_MINOR_VERSION;
     private static final MemorySegment KEY_CLIENT_REVISION;
     private static final MemorySegment KEY_DEVICE_PROTOCOL;
+    private static final MemorySegment KEY_DEVICE_SERIAL_NUMBER;
 
     // ---- SendCommand / MTP pass-through keys (readPartial) ----
     // The MTP-extension command category; SendCommand routes to it and picks the command by pid.
@@ -177,6 +178,9 @@ class WpdBackend implements MtpBackend {
         // WPD_DEVICE_PROTOCOL (WPD_DEVICE_PROPERTIES_V1) — a string such as "MTP: 1.00", "PTP:",
         // "MSC:", read by isMtpDevice to filter out the non-MTP devices WPD also enumerates.
         KEY_DEVICE_PROTOCOL = propertyKey(a, "26d4979a-e643-4626-9e2b-736dc0c92fdc", 6);
+        // WPD_DEVICE_SERIAL_NUMBER (same fmtid, pid 9) — the device's MTP serial, used as the identity's
+        // serial so it matches the libmtp backend instead of a Windows-local PnP instance id.
+        KEY_DEVICE_SERIAL_NUMBER = propertyKey(a, "26d4979a-e643-4626-9e2b-736dc0c92fdc", 9);
 
         // WPD_CATEGORY_COMMON keys used to address any SendCommand invocation (PortableDevice.h).
         String commonFmt = "f0422a9c-5dc8-4440-b5bd-5df28835658a";
@@ -353,7 +357,7 @@ class WpdBackend implements MtpBackend {
             var description = deviceStringProp(manager, deviceId, MGR_DESCRIPTION, arena);
             var manufacturer = deviceStringProp(manager, deviceId, MGR_MANUFACTURER, arena);
 
-            var id = parseIdentifier(deviceId);
+            var id = parseIdentifier(deviceId, deviceSerialNumber(props));
             var info = new MTPDeviceInfo(id, friendly, description, manufacturer, 0, 0);
             return new OpenedDevice(id, info, new WpdDevice(device, content, props));
         } catch (Throwable t) {
@@ -393,17 +397,35 @@ class WpdBackend implements MtpBackend {
         }
     }
 
-    private MTPDeviceIdentifier parseIdentifier(String deviceId) {
+    private MTPDeviceIdentifier parseIdentifier(String deviceId, String wpdSerial) {
         String lower = deviceId.toLowerCase();
         int vendor = 0, product = 0;
         Matcher mv = VID.matcher(lower);
         if (mv.find()) vendor = Integer.parseInt(mv.group(1), 16);
         Matcher mp = PID.matcher(lower);
         if (mp.find()) product = Integer.parseInt(mp.group(1), 16);
-        // The instance id (typically the device serial) is the 3rd '#'-delimited segment.
+        // Prefer the device-reported MTP serial (WPD_DEVICE_SERIAL_NUMBER) so the identity matches the
+        // libmtp backend. Fall back to the Windows PnP instance id (3rd '#'-delimited segment) for a
+        // device that reports no serial — that id is bus-generated (e.g. "b&27c98feb&0&0000").
         var segments = deviceId.split("#");
-        String serial = segments.length >= 3 ? segments[2] : deviceId.replaceAll("[^0-9A-Za-z]", "");
+        String raw = !wpdSerial.isEmpty() ? wpdSerial
+            : (segments.length >= 3 ? segments[2] : deviceId);
+        // MTPDeviceIdentifier's serial must be word characters (it flows into a mtp:// URI and matches
+        // \w+), so collapse any run of non-word characters to a single underscore.
+        String serial = raw.replaceAll("[^0-9A-Za-z_]+", "_").replaceAll("^_+|_+$", "");
+        if (serial.isEmpty()) serial = "unknown";
         return new MTPDeviceIdentifier(vendor, product, serial);
+    }
+
+    /** Reads WPD_DEVICE_SERIAL_NUMBER from the device object, or "" when the device reports none. */
+    private String deviceSerialNumber(MemorySegment props) {
+        var values = getValues(props, WPD_DEVICE_OBJECT_ID, KEY_DEVICE_SERIAL_NUMBER);
+        if (MemorySegment.NULL.equals(values)) return "";
+        try {
+            return getString(values, KEY_DEVICE_SERIAL_NUMBER);
+        } finally {
+            release(values);
+        }
     }
 
     @Override
