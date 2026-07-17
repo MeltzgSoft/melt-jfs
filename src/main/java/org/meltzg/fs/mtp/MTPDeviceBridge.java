@@ -46,6 +46,25 @@ public enum MTPDeviceBridge implements Closeable {
 
     private record ChildListing(MTPItemInfo[] items, long fetchedNanos) {}
 
+    // Objects this bridge has deleted or moved away that the device may keep reporting where they
+    // no longer are: some devices (observed on an Android-based player's SD-card storage) update
+    // their MTP database asynchronously, so listings fetched right after a successful DeleteObject
+    // or MoveObject can still contain the stale entry. Acting on such a ghost fails (deleting a
+    // dead handle errors) or lies (the path still "exists"), so tombstoned ids are filtered out of
+    // listings until the folder the object left lists without them — i.e. the device has caught
+    // up. A deleted id is dead device-wide and filtered from every listing; a moved id still
+    // exists at its new location and is filtered only from the listing it left. Keyed per device;
+    // cleared when connections are torn down.
+    private final Map<TombstoneKey, Tombstone> tombstones = new ConcurrentHashMap<>();
+
+    private record TombstoneKey(MTPDeviceIdentifier deviceId, String itemId) {}
+
+    private record Tombstone(ListingKey leftFrom, boolean everywhere) {}
+
+    // Backoff schedule for re-sending a file whose same-named predecessor was just deleted; devices
+    // with an asynchronous MTP database can reject the send until the delete propagates.
+    private static final long[] SEND_RETRY_DELAYS_MILLIS = {250, 500, 1000, 2000};
+
     // Signatures of the devices seen at the last scan, used to detect hot-plug/unplug/reconnect
     // without reopening still-present devices.
     private Set<String> lastSignature = Set.of();
@@ -227,6 +246,12 @@ public enum MTPDeviceBridge implements Closeable {
                     var item = resolveItemUnsafe(conn, parts);
                     if (item == null) throw new NoSuchFileException(path);
                     backend().deleteObject(conn.handle(), item.itemId());
+                    if (parts.length >= 2) {
+                        // The containing listing was keyed with ROOT_PARENT for storage-root
+                        // children (the device-reported parent_id is unreliable there).
+                        var parentId = parts.length == 2 ? MtpBackend.ROOT_PARENT : item.parentId();
+                        tombstoneUnsafe(conn, item.itemId(), item.storageId(), parentId);
+                    }
                 } finally {
                     invalidateListings();
                 }
@@ -269,11 +294,23 @@ public enum MTPDeviceBridge implements Closeable {
                         if (!existing.isFile()) {
                             throw new IOException("Target exists and is a directory: " + path);
                         }
+                        // Rewrite the existing object in place when the device supports it: the id
+                        // and name never change, so this cannot trip the asynchronous-delete window
+                        // that makes a delete + same-name send fail (see the tombstones field).
+                        if (backend.supportsObjectEditing(conn.handle())) {
+                            try {
+                                backend.overwriteFile(conn.handle(), existing.itemId(), localFile.toString());
+                                return existing.itemId();
+                            } catch (IOException editFailed) {
+                                // Fall through: delete the (possibly half-written) object and resend.
+                            }
+                        }
                         backend.deleteObject(conn.handle(), existing.itemId());
+                        tombstoneUnsafe(conn, existing.itemId(), storage.storageId(), parentId);
                     }
                     long size = java.nio.file.Files.size(localFile);
-                    return backend.sendFile(conn.handle(), localFile.toString(),
-                        name, parentId, storage.storageId(), size);
+                    return sendFileUnsafe(backend, conn, localFile, name, parentId,
+                        storage.storageId(), size, existing != null);
                 } finally {
                     invalidateListings();
                 }
@@ -327,6 +364,15 @@ public enum MTPDeviceBridge implements Closeable {
                     if (!existingTgt.isFile() && hasChildrenUnsafe(conn, existingTgt)) {
                         throw new DirectoryNotEmptyException(targetPath);
                     }
+                    if (existingTgt.isFile()) {
+                        // Deleting the target and then moving/renaming onto its name trips the same
+                        // asynchronous-delete window as a replacing send (the device can keep the
+                        // name "taken" for the rest of the session). Have the caller emulate with a
+                        // replacing copy — which rewrites the target in place when the device
+                        // supports object editing — followed by a delete of the source.
+                        throw new MTPOperationUnsupportedException(
+                            "Replacing a file target is emulated: " + sourcePath + " -> " + targetPath, null);
+                    }
                 }
 
                 // libmtp reports an inconsistent parent_id for storage-root items, so detect a pure
@@ -338,9 +384,13 @@ public enum MTPDeviceBridge implements Closeable {
                 try {
                     if (existingTgt != null) {
                         backend.deleteObject(conn.handle(), existingTgt.itemId());
+                        tombstoneUnsafe(conn, existingTgt.itemId(), tgtStorage.storageId(), tgtParentId);
                     }
                     if (!sameDirectory) {
                         backend.moveObject(conn.handle(), source.itemId(), tgtStorage.storageId(), tgtParentId);
+                        // A stale listing of the folder the object left may keep showing it there.
+                        var srcParentId = srcParts.length == 2 ? MtpBackend.ROOT_PARENT : source.parentId();
+                        tombstoneMovedUnsafe(conn, source.itemId(), source.storageId(), srcParentId);
                     }
                     if (!source.filename().equals(tgtName)) {
                         backend.setFileName(conn.handle(), source.itemId(), tgtName);
@@ -485,6 +535,7 @@ public enum MTPDeviceBridge implements Closeable {
         deviceInfo.clear();
         deviceConns.clear();
         invalidateListings();
+        tombstones.clear();
         lastSignature = Set.of();
         devicesDetected = false;
     }
@@ -569,9 +620,74 @@ public enum MTPDeviceBridge implements Closeable {
         if (cached != null && System.nanoTime() - cached.fetchedNanos() < LISTING_TTL_NANOS) {
             return cached.items();
         }
-        var items = backend().getChildItems(conn.handle(), storageId, parentId);
+        var items = reconcileTombstones(key, backend().getChildItems(conn.handle(), storageId, parentId));
         listingCache.put(key, new ChildListing(items, System.nanoTime()));
         return items;
+    }
+
+    /**
+     * Records that {@code itemId} was deleted out of the listing {@code (storageId, parentId)}, so
+     * ghost entries the device keeps reporting for it are suppressed until that listing comes back
+     * without it. Callers must hold the read lock and the connection monitor.
+     */
+    private void tombstoneUnsafe(MTPDeviceConnection conn, String itemId, String storageId, String parentId) {
+        tombstones.put(new TombstoneKey(conn.deviceId(), itemId),
+            new Tombstone(new ListingKey(conn.deviceId(), storageId, parentId), true));
+    }
+
+    /**
+     * Records that {@code itemId} was moved out of the listing {@code (storageId, parentId)}: the
+     * object is alive at its new location, so it is suppressed only from the listing it left, until
+     * that listing comes back without it. Callers must hold the read lock and the connection monitor.
+     */
+    private void tombstoneMovedUnsafe(MTPDeviceConnection conn, String itemId, String storageId, String parentId) {
+        tombstones.put(new TombstoneKey(conn.deviceId(), itemId),
+            new Tombstone(new ListingKey(conn.deviceId(), storageId, parentId), false));
+    }
+
+    /**
+     * Drops tombstones whose origin listing {@code key} no longer reports them (the device's
+     * database has caught up), then filters the still-tombstoned ids out of {@code items}. Ids are
+     * unique per device, so a deleted handle is suppressed from every listing — its ghost can also
+     * linger in a stale listing of a folder the object had previously been moved out of — while a
+     * moved id is suppressed only from the listing it left.
+     */
+    private MTPItemInfo[] reconcileTombstones(ListingKey key, MTPItemInfo[] items) {
+        if (tombstones.isEmpty()) return items;
+        tombstones.entrySet().removeIf(e -> e.getValue().leftFrom().equals(key)
+            && Arrays.stream(items).noneMatch(i -> i.itemId().equals(e.getKey().itemId())));
+        if (tombstones.isEmpty()) return items;
+        return Arrays.stream(items)
+            .filter(i -> {
+                var tombstone = tombstones.get(new TombstoneKey(key.deviceId(), i.itemId()));
+                return tombstone == null || !(tombstone.everywhere() || tombstone.leftFrom().equals(key));
+            })
+            .toArray(MTPItemInfo[]::new);
+    }
+
+    /**
+     * Uploads {@code localFile}, retrying briefly when this write replaced an existing file: a
+     * device with an asynchronous MTP database can reject a send that reuses a just-deleted
+     * filename until the delete propagates. A send that did not replace anything fails immediately.
+     */
+    private String sendFileUnsafe(MtpBackend backend, MTPDeviceConnection conn, java.nio.file.Path localFile,
+                                  String name, String parentId, String storageId, long size,
+                                  boolean replacedExisting) throws IOException {
+        int attempt = 0;
+        while (true) {
+            try {
+                return backend.sendFile(conn.handle(), localFile.toString(), name, parentId, storageId, size);
+            } catch (IOException e) {
+                if (!replacedExisting || attempt >= SEND_RETRY_DELAYS_MILLIS.length) throw e;
+                try {
+                    Thread.sleep(SEND_RETRY_DELAYS_MILLIS[attempt++]);
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    e.addSuppressed(interrupted);
+                    throw e;
+                }
+            }
+        }
     }
 
     /** Drops every cached listing. Called after any mutation and when connections are torn down. */
