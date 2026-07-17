@@ -32,13 +32,31 @@ match **`NativeLibMTP`** (libmtp, Linux/macOS). **Keep this file updated wheneve
 | Lazy read channel (`newByteChannel`) | ✅ lazy | ✅ lazy | none |
 | `audio` view (embedded tags) | ✅ | ✅ (lit up by `readPartial`) | none |
 | Audio tag readers (FLAC/MP3/MP4/Ogg/Opus/WAV) | ✅ (neutral) | ✅ (neutral) | none — pure Java, backend-agnostic |
+| In-place object editing (`supportsObjectEditing` / `overwriteFile`) | ✅ (Android edit extension, gated by `LIBMTP_Check_Capability`) | ⚠️ falls back to delete + send | benign — see note below |
 
 Legend: ✅ done · ⚠️ works via fallback · ❌ missing.
 
-At parity: verified end-to-end on a real Windows host (Astell&Kern AK100_II) — the full
+Functional parity: verified end-to-end on a real Windows host (Astell&Kern AK100_II) — the full
 `MTPFileSystemIntegrationTest` suite passes on WPD across both storages, including
 `partialReadPullsAudioHeaderWithoutTransferringWholeObject` and the `audioViewReadsUploaded*Tags` /
-`uploadedId3v23Mp3TagsAreReadBackViaAudioView` suites.
+`uploadedId3v23Mp3TagsAreReadBackViaAudioView` suites. The one open gap (in-place object editing) is
+behavioral only — every operation still succeeds on WPD through its fallback.
+
+### The in-place editing gap
+
+`MTPDeviceBridge.writeFile` rewrites an existing object in place (BeginEditObject / TruncateObject /
+SendPartialObject / EndEditObject) when the backend reports `supportsObjectEditing`, because some
+devices apply deletes to their MTP database asynchronously and reject a send that reuses a
+just-deleted name for the rest of the session (observed on the FiiO M11 Plus SD card; see the
+tombstone handling in `MTPDeviceBridge`). `WpdBackend` inherits the SPI default (`false`) and takes
+the delete + send fallback.
+
+This is fine on Windows: the WPD driver (WpdMtpDr) keeps its own host-side object model and creates
+objects via `SendObjectPropList`, which masks the asynchronous-delete device behavior — the FiiO
+failures never reproduced over WPD. If in-place editing is ever wanted on Windows anyway, the seam
+already exists: the Android opcodes (`BeginEditObject` 0x95C4, `SendPartialObject` 0x95C2,
+`TruncateObject` 0x95C3, `EndEditObject` 0x95C5) can be issued through the same
+`IPortableDevice::SendCommand` MTP pass-through that `readPartial` uses.
 
 ## How `readPartial` works on WPD
 
