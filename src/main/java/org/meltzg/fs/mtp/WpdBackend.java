@@ -89,7 +89,11 @@ class WpdBackend implements MtpBackend {
     private static final MemorySegment KEY_MTP_TRANSFER_CONTEXT;
     private static final MemorySegment KEY_MTP_TRANSFER_TOTAL_SIZE;
     private static final MemorySegment KEY_MTP_NUM_BYTES_TO_READ;
+    private static final MemorySegment KEY_MTP_NUM_BYTES_TO_WRITE;
     private static final MemorySegment KEY_MTP_TRANSFER_DATA;
+    // The device's vendor-extended MTP opcodes (WPD_PROPERTY_MTP_EXT_VENDOR_OPERATION_CODES), returned
+    // by GET_SUPPORTED_VENDOR_OPCODES and used to gate in-place object editing (BeginEditObject is one).
+    private static final MemorySegment KEY_MTP_OPERATION_CODES;
 
     // ---- content-type / category GUID values ----
     private static final MemorySegment CONTENT_TYPE_FOLDER;
@@ -123,9 +127,9 @@ class WpdBackend implements MtpBackend {
     private static final int RES_GET_STREAM = 5;
     private static final int VAL_GET_VALUE = 6, VAL_SET_STRING = 7, VAL_GET_STRING = 8, VAL_SET_U4 = 9,
         VAL_GET_U4 = 10, VAL_SET_U8 = 13, VAL_GET_U8 = 14, VAL_GET_ERROR = 20, VAL_SET_GUID = 27,
-        VAL_GET_GUID = 28, VAL_SET_BUFFER = 29, VAL_GET_BUFFER = 30, VAL_SET_PVCOLL = 33;
+        VAL_GET_GUID = 28, VAL_SET_BUFFER = 29, VAL_GET_BUFFER = 30, VAL_SET_PVCOLL = 33, VAL_GET_PVCOLL = 34;
     private static final int KEYCOLL_ADD = 5;
-    private static final int PVCOLL_ADD = 5;
+    private static final int PVCOLL_GET_COUNT = 3, PVCOLL_GET_AT = 4, PVCOLL_ADD = 5;
     private static final int STREAM_READ = 3, STREAM_WRITE = 4, STREAM_COMMIT = 8;
     private static final int DATASTREAM_GET_OBJECT_ID = 14;
 
@@ -197,7 +201,9 @@ class WpdBackend implements MtpBackend {
         KEY_MTP_TRANSFER_CONTEXT = propertyKey(a, mtpExt, 1006);
         KEY_MTP_TRANSFER_TOTAL_SIZE = propertyKey(a, mtpExt, 1007);
         KEY_MTP_NUM_BYTES_TO_READ = propertyKey(a, mtpExt, 1008);
+        KEY_MTP_NUM_BYTES_TO_WRITE = propertyKey(a, mtpExt, 1010);
         KEY_MTP_TRANSFER_DATA = propertyKey(a, mtpExt, 1012);
+        KEY_MTP_OPERATION_CODES = propertyKey(a, mtpExt, 1005);
 
         CONTENT_TYPE_FOLDER = guid(a, "27e2e392-a111-48e0-ab0c-e17705a05f85");
         CONTENT_TYPE_FUNCTIONAL_OBJECT = guid(a, "99ed0160-17ff-4c44-9d98-1d7a6f941921");
@@ -223,8 +229,16 @@ class WpdBackend implements MtpBackend {
     // 0x2005 is Operation_Not_Supported.
     private static final int OP_GET_PARTIAL_OBJECT = 0x101B, OP_GET_PARTIAL_OBJECT_64 = 0x95C1;
     private static final int MTP_RESPONSE_OK = 0x2001, MTP_RESPONSE_OP_NOT_SUPPORTED = 0x2005;
-    // Chunk size for the READ_DATA phase; audio-tag reads are well under this, so it is one round trip.
+    // Chunk size for the READ_DATA / WRITE_DATA phases; well above a typical tagged file, so most
+    // transfers are a single round trip.
     private static final int READ_DATA_CHUNK = 256 * 1024;
+
+    // The Android in-place object-edit extension (used by overwriteFile so replacing a file's bytes
+    // keeps the object id and name, avoiding a delete + same-name re-create that some devices reject
+    // for the rest of the session). A device advertises these in its supported-operations list;
+    // supportsObjectEditing gates on BeginEditObject being present.
+    private static final int OP_BEGIN_EDIT_OBJECT = 0x95C4, OP_SEND_PARTIAL_OBJECT = 0x95C2,
+        OP_TRUNCATE_OBJECT = 0x95C3, OP_END_EDIT_OBJECT = 0x95C5;
 
     private static final WpdBackend INSTANCE = new WpdBackend();
 
@@ -236,6 +250,9 @@ class WpdBackend implements MtpBackend {
 
     // The GetPartialObject opcode this device honoured, cached after the first successful probe
     // (0 until then). Written at most once per opcode; a stale read only costs one extra probe.
+    // (Self-correcting for multi-device: getPartialObject falls through to the other opcode on a
+    // cache miss. Object-editing support is not cached — see supportsObjectEditing — because a wrong
+    // cached "no" would silently disable the in-place path for a different device that does support it.)
     private volatile int partialReadOpcode = 0;
 
     /** Live WPD handle: the device plus its content and properties interfaces. */
@@ -793,8 +810,255 @@ class WpdBackend implements MtpBackend {
         }
     }
 
-    // MTP-ext command pids within MTP_EXT_CATEGORY (WpdMtpExtensions.h).
-    private static final int PID_EXECUTE_WITH_DATA_TO_READ = 13, PID_READ_DATA = 15, PID_END_DATA_TRANSFER = 17;
+    @Override
+    public boolean supportsObjectEditing(DeviceHandle handle) {
+        // BeginEditObject is a vendor-extended opcode, so the device's supported-vendor-opcodes list
+        // is authoritative when the driver answers it. Some WpdMtp builds return E_NOTIMPL for that
+        // query, though; there we are optimistic — overwriteFile probes BeginEditObject and cleanly
+        // falls back if the device rejects it, so a hopeful "yes" costs at most one round trip. Not
+        // cached on the singleton: with several devices attached a wrong "no" from one would wrongly
+        // disable the in-place path for another.
+        try {
+            return deviceSupportsOperation(dev(handle).device(), OP_BEGIN_EDIT_OBJECT);
+        } catch (IOException queryUnsupported) {
+            return true;
+        }
+    }
+
+    /**
+     * Replaces the bytes of {@code itemId} in place with the content of {@code localPath} using the
+     * Android object-edit extension (BeginEditObject → SendPartialObject → TruncateObject → EndEditObject)
+     * over the same {@code SendCommand} MTP pass-through as {@link #readPartial}. The object keeps its id
+     * and name, so this never trips the asynchronous-delete window that makes a delete + same-name
+     * re-create fail on some devices. The edit session is always closed (EndEditObject) even when a phase
+     * fails, so the device is never left mid-edit.
+     */
+    @Override
+    public void overwriteFile(DeviceHandle handle, String itemId, String localPath) throws IOException {
+        long objectHandle = parseObjectHandle(itemId);
+        var d = dev(handle);
+        var device = d.device();
+        long size = Files.size(Path.of(localPath));
+        if (size > 0xFFFFFFFFL) {
+            // SendPartialObject's length parameter is 32-bit; let the caller fall back for huge files.
+            throw new IOException("in-place edit exceeds SendPartialObject's 32-bit length: " + size);
+        }
+
+        // Only rewrite in place when the new content is no larger than the object's current allocation.
+        // These devices reliably overwrite existing bytes and shrink (SendPartialObject + TruncateObject),
+        // but growing an object beyond its original size is unreliable: it either fails outright or writes
+        // the bytes yet leaves the reported size stale (observed on the AK100_II and the FiiO M11 Plus
+        // FAT32 SD card, while the FiiO internal storage grows correctly). Refusing a grow up front — before
+        // any edit command — leaves the object untouched so the caller (MTPDeviceBridge.writeFile) can fall
+        // back to delete + send.
+        long currentSize = objectSize(d, itemId);
+        if (currentSize >= 0 && size > currentSize) {
+            throw new IOException("in-place grow unsupported (" + currentSize + " -> " + size + "): " + itemId);
+        }
+
+        checkMtpResponse(executeWithoutData(device, OP_BEGIN_EDIT_OBJECT, (int) objectHandle),
+            "BeginEditObject");
+        try {
+            // Truncate to zero, then stream the whole file from offset 0 (matching the libmtp backend):
+            // SendPartialObject only extends when writing from the object's current end, so it must start
+            // from an emptied object; the old tail beyond the new (never-larger) length is dropped.
+            checkMtpResponse(executeWithoutData(device, OP_TRUNCATE_OBJECT, (int) objectHandle, 0, 0),
+                "TruncateObject");
+            if (size > 0) {
+                try (var in = Files.newInputStream(Path.of(localPath))) {
+                    sendPartialObject(device, objectHandle, size, in);
+                }
+            }
+        } finally {
+            executeWithoutData(device, OP_END_EDIT_OBJECT, (int) objectHandle); // best-effort close
+        }
+    }
+
+    /** The device-reported size of {@code itemId}, or -1 when it cannot be read. */
+    private long objectSize(WpdDevice d, String itemId) {
+        var values = getValues(d.properties(), itemId, KEY_OBJECT_SIZE);
+        if (MemorySegment.NULL.equals(values)) return -1;
+        try {
+            return getU8(values, KEY_OBJECT_SIZE);
+        } finally {
+            release(values);
+        }
+    }
+
+    /** Whether the device advertises {@code opcode} in its supported-operations list. */
+    private boolean deviceSupportsOperation(MemorySegment device, int opcode) throws IOException {
+        try (var arena = Arena.ofConfined()) {
+            var cmd = createCommand(MTP_EXT_CATEGORY, PID_GET_SUPPORTED_VENDOR_OPCODES);
+            try {
+                var results = sendCommand(device, cmd, arena);
+                try {
+                    checkDriverHr(results, "GET_SUPPORTED_OPERATIONS");
+                    var collOut = arena.allocate(ADDRESS);
+                    int hr = call(results, VAL_GET_PVCOLL,
+                        FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, ADDRESS),
+                        KEY_MTP_OPERATION_CODES, collOut);
+                    if (failed(hr)) return false;
+                    var coll = collOut.get(ADDRESS, 0);
+                    try {
+                        return propVariantCollectionContainsU4(coll, opcode);
+                    } finally {
+                        release(coll);
+                    }
+                } finally {
+                    release(results);
+                }
+            } finally {
+                release(cmd);
+            }
+        }
+    }
+
+    /** Whether an IPortableDevicePropVariantCollection of VT_UI4 values contains {@code value}. */
+    private boolean propVariantCollectionContainsU4(MemorySegment coll, int value) {
+        try (var arena = Arena.ofConfined()) {
+            var countOut = arena.allocate(JAVA_INT);
+            if (failed(call(coll, PVCOLL_GET_COUNT,
+                    FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS), countOut))) return false;
+            int count = countOut.get(JAVA_INT, 0);
+            var pv = arena.allocate(PROPVARIANT_SIZE);
+            for (int i = 0; i < count; i++) {
+                if (failed(call(coll, PVCOLL_GET_AT,
+                        FunctionDescriptor.of(JAVA_INT, ADDRESS, JAVA_INT, ADDRESS), i, pv))) continue;
+                if (pv.get(JAVA_SHORT, 0) == VT_UI4 && pv.get(JAVA_INT, 8) == value) return true;
+            }
+            return false;
+        }
+    }
+
+    /**
+     * Runs a no-data-phase MTP command ({@code opcode} with {@code params}) via SendCommand and returns
+     * the device's MTP response code (0x2001 on success).
+     */
+    private int executeWithoutData(MemorySegment device, int opcode, int... params) throws IOException {
+        try (var arena = Arena.ofConfined()) {
+            var cmd = createCommand(MTP_EXT_CATEGORY, PID_EXECUTE_WITHOUT_DATA_PHASE);
+            try {
+                setU4(cmd, KEY_MTP_OP_CODE, opcode);
+                setOpParams(cmd, arena, params);
+                var results = sendCommand(device, cmd, arena);
+                try {
+                    checkDriverHr(results, "MTP op 0x" + Integer.toHexString(opcode));
+                    return (int) getU4(results, KEY_MTP_RESPONSE_CODE);
+                } finally {
+                    release(results);
+                }
+            } finally {
+                release(cmd);
+            }
+        }
+    }
+
+    /**
+     * Sends {@code size} bytes from {@code in} as one SendPartialObject transaction at offset 0:
+     * initiate (WITH_DATA_TO_WRITE), stream the data phase in chunks (WRITE_DATA), then always close it
+     * (END_DATA_TRANSFER), whose MTP response code must be OK.
+     */
+    private void sendPartialObject(MemorySegment device, long objectHandle, long size, InputStream in)
+            throws IOException {
+        String context;
+        try (var arena = Arena.ofConfined()) {
+            var cmd = createCommand(MTP_EXT_CATEGORY, PID_EXECUTE_WITH_DATA_TO_WRITE);
+            try {
+                setU4(cmd, KEY_MTP_OP_CODE, OP_SEND_PARTIAL_OBJECT);
+                // SendPartialObject params: object handle, offset low, offset high, length.
+                setOpParams(cmd, arena, (int) objectHandle, 0, 0, (int) size);
+                setU8(cmd, KEY_MTP_TRANSFER_TOTAL_SIZE, size);
+                var results = sendCommand(device, cmd, arena);
+                try {
+                    checkDriverHr(results, "initiate SendPartialObject");
+                    context = getString(results, KEY_MTP_TRANSFER_CONTEXT);
+                } finally {
+                    release(results);
+                }
+            } finally {
+                release(cmd);
+            }
+        }
+
+        int responseCode;
+        try {
+            writeDataPhase(device, context, in, size);
+        } finally {
+            responseCode = endDataTransfer(device, context);
+        }
+        checkMtpResponse(responseCode, "SendPartialObject");
+    }
+
+    /** Streams {@code total} bytes from {@code in} to the open transfer {@code context} in chunks. */
+    private void writeDataPhase(MemorySegment device, String context, InputStream in, long total)
+            throws IOException {
+        byte[] heap = new byte[(int) Math.min(Math.max(total, 1), READ_DATA_CHUNK)];
+        long remaining = total;
+        while (remaining > 0) {
+            int want = (int) Math.min(remaining, heap.length);
+            int got = readFully(in, heap, want);
+            if (got < want) throw new IOException("local file ended before the declared edit length");
+            try (var arena = Arena.ofConfined()) {
+                var cmd = createCommand(MTP_EXT_CATEGORY, PID_WRITE_DATA);
+                try {
+                    setString(cmd, KEY_MTP_TRANSFER_CONTEXT, wstr(arena, context));
+                    var buf = arena.allocate(got);
+                    MemorySegment.copy(heap, 0, buf, JAVA_BYTE, 0, got);
+                    call(cmd, VAL_SET_BUFFER,
+                        FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, ADDRESS, JAVA_INT),
+                        KEY_MTP_TRANSFER_DATA, buf, got);
+                    setU4(cmd, KEY_MTP_NUM_BYTES_TO_WRITE, got);
+                    var results = sendCommand(device, cmd, arena);
+                    try {
+                        checkDriverHr(results, "WRITE_DATA");
+                    } finally {
+                        release(results);
+                    }
+                } finally {
+                    release(cmd);
+                }
+            }
+            remaining -= got;
+        }
+    }
+
+    /** Fills {@code buf[0..want)} from {@code in}, returning the count read (short only at EOF). */
+    private static int readFully(InputStream in, byte[] buf, int want) throws IOException {
+        int off = 0;
+        while (off < want) {
+            int r = in.read(buf, off, want - off);
+            if (r < 0) break;
+            off += r;
+        }
+        return off;
+    }
+
+    /** Attaches an IPortableDevicePropVariantCollection of the given VT_UI4 values as the op params. */
+    private void setOpParams(MemorySegment cmd, Arena arena, int... values) throws IOException {
+        var params = createInstance(CLSID_PROPVARIANT_COLLECTION, IID_PROPVARIANT_COLLECTION,
+            "create MTP operation params");
+        try {
+            for (int v : values) addU4(params, arena, v);
+            call(cmd, VAL_SET_PVCOLL,
+                FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, ADDRESS), KEY_MTP_OP_PARAMS, params);
+        } finally {
+            release(params);
+        }
+    }
+
+    /** Throws unless {@code responseCode} is the MTP "OK" (0x2001). */
+    private void checkMtpResponse(int responseCode, String op) throws IOException {
+        if (responseCode != MTP_RESPONSE_OK) {
+            throw new IOException(op + " failed (MTP response 0x" + Integer.toHexString(responseCode) + ")");
+        }
+    }
+
+    // MTP-ext command pids within MTP_EXT_CATEGORY (WpdMtpExtensions.h). The read/write execute and
+    // data commands form one contiguous block 12..17 (without-data, to-read, to-write, read-data,
+    // write-data, end); GET_SUPPORTED_VENDOR_OPCODES (11) reports the device's vendor-extended opcodes.
+    private static final int PID_GET_SUPPORTED_VENDOR_OPCODES = 11, PID_EXECUTE_WITHOUT_DATA_PHASE = 12,
+        PID_EXECUTE_WITH_DATA_TO_READ = 13, PID_EXECUTE_WITH_DATA_TO_WRITE = 14,
+        PID_READ_DATA = 15, PID_WRITE_DATA = 16, PID_END_DATA_TRANSFER = 17;
 
     /** Builds an {@code IPortableDeviceValues} addressed to one MTP-ext command (category + pid). */
     private MemorySegment createCommand(MemorySegment category, int commandPid) throws IOException {
