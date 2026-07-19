@@ -37,11 +37,12 @@ match **`NativeLibMTP`** (libmtp, Linux/macOS). **Keep this file updated wheneve
 Legend: ✅ done · ⚠️ works via fallback · ❌ missing.
 
 Functional parity: verified end-to-end on a real Windows host against **two** devices — an
-Astell&Kern AK100_II and a FiiO M11 Plus — across all four of their storages. The full
-`MTPFileSystemIntegrationTest` suite passes (204/208, 2 skipped) including
+Astell&Kern AK100_II and a FiiO M11 Plus — across all four of their storages. The full integration
+suite is green over WPD (208 tests: 206 passed, 2 legitimate skips, 0 failures), including
 `partialReadPullsAudioHeaderWithoutTransferringWholeObject` and the `audioViewReadsUploaded*Tags` /
-`uploadedId3v23Mp3TagsAreReadBackViaAudioView` suites. The 2 remaining failures are a device
-limitation on the FiiO M11 Plus SD card only — see "Growing a file" below.
+`uploadedId3v23Mp3TagsAreReadBackViaAudioView` suites, and it is green on Linux/libmtp with the same
+devices. Two intermittent FiiO caveats remain — the mid-request stall and the growing-replace race on
+its SD card — see "Growing a file" and the Notes below.
 
 ### In-place object editing on WPD
 
@@ -117,8 +118,8 @@ correct primitive because the transaction is bounded and self-completing — it 
   `IStream::Write` failures, a storage transiently disappearing, and renames whose old name lingers
   in listings — the last is compensated by the bridge's rename overlay, which patches the new name
   into listings until the device reports it). Because WpdMtpDr serializes every WPD client through
-  one queue, a stall blocks *all*
-  of them — the test run hangs, and File Explorer opened against the same device hangs too (Windows
+  one queue, a stall blocks *all* of them — the test run hangs, and File Explorer opened against the
+  same device hangs too (Windows
   eventually kills it with an Application Hang event). Explorer's forced restart tears down its WPD
   handles, which cancels the outstanding I/O and unblocks the queue; the request that was in flight
   fails (e.g. HRESULT 0x8007065d). If a run appears hung on the FiiO, this — not the test code — is
