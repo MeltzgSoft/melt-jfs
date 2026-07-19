@@ -13,7 +13,7 @@ The Windows backend drives the WPD COM API entirely through FFM, so it works wit
 
 ## Requirements
 
-- **Java 22+** (the FFM API is finalized in Java 22; `--enable-native-access=ALL-UNNAMED` is set automatically by the build)
+- **Java 22+** to use the library (the FFM API is finalized in Java 22). Building needs no particular JDK: the build pins a Java 22 toolchain and auto-provisions it (Foojay resolver) when not installed, and sets `--enable-native-access=ALL-UNNAMED` automatically.
 - **Gradle** — use the included wrapper (`./gradlew`); no separate Gradle installation needed
 - **libmtp** on Linux/macOS (see below); nothing extra on Windows
 

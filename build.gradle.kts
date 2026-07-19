@@ -15,8 +15,13 @@ version = System.getenv("VERSION") ?: "0.0.0-SNAPSHOT"
 
 java {
     // FFM (java.lang.foreign) was finalized in Java 22, so no --enable-preview is needed.
-    sourceCompatibility = JavaVersion.VERSION_22
-    targetCompatibility = JavaVersion.VERSION_22
+    // A toolchain (rather than source/targetCompatibility) pins the exact JDK that compiles and runs
+    // this project, independent of whichever JVM happens to launch Gradle — the VS Code Gradle
+    // extension starts its daemon on a bundled JRE, which otherwise fails with "invalid source
+    // release". settings.gradle.kts wires up auto-provisioning so the JDK is fetched when missing.
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(22)
+    }
 }
 
 // Compile sources as UTF-8 regardless of the platform default, so non-ASCII literals (e.g. the MP4
