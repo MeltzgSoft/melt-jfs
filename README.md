@@ -320,8 +320,8 @@ embedded album art are skipped, so the read stays small (typically a few KB) reg
 and it recovers the real embedded title even on devices whose `mtp` index only reports the filename —
 immediately after upload, with no wait for the device's media scanner. Values are `null` when the object
 is not a file, its format is unsupported, or the header is unreadable; `discNumber` is `0` for containers
-that don't carry it (e.g. WAV/RIFF `INFO`). Requires a backend with ranged-read support (libmtp; the WPD
-backend is a pending follow-up).
+that don't carry it (e.g. WAV/RIFF `INFO`). Requires ranged-read support, which both backends provide
+(libmtp's `GetPartialObject`; the same MTP operation via the WPD `SendCommand` pass-through on Windows).
 
 ### JVM flags
 
