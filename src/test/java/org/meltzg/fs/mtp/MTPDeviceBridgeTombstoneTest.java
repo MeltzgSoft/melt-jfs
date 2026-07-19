@@ -22,8 +22,10 @@ import static org.junit.Assert.*;
  * Verifies the bridge's handling of devices whose MTP database applies deletes asynchronously
  * (observed on an Android-based player's SD-card storage): listings fetched right after a
  * successful DeleteObject can still contain the deleted handle ("ghost"), and a send that reuses a
- * just-deleted filename can be transiently rejected. The bridge tombstones deleted ids out of
- * listings until the device catches up, and retries the replacing send.
+ * just-deleted filename can be transiently rejected. The same devices keep listing a renamed object
+ * under its old filename for a while after a successful SetObjectName. The bridge tombstones deleted
+ * ids out of listings until the device catches up, retries the replacing send, and overlays the new
+ * filename onto renamed items until the device reports it.
  */
 public class MTPDeviceBridgeTombstoneTest {
 
@@ -155,6 +157,72 @@ public class MTPDeviceBridgeTombstoneTest {
         } finally {
             Files.deleteIfExists(local);
         }
+    }
+
+    @Test
+    public void renamedItemListsUnderNewNameWhileDeviceReportsOldName() throws IOException {
+        var bridge = MTPDeviceBridge.getInstance();
+        bridge.move(id, "/Store/f1", "/Store/f1-renamed", false); // pure rename, same directory
+
+        // The device (setFileName while ghosting) still lists the old name; the overlay must
+        // present the new one.
+        var names = Arrays.stream(bridge.listChildren(id, "/Store"))
+            .map(MTPItemInfo::filename).toList();
+        assertTrue("renamed file must list under its new name", names.contains("f1-renamed"));
+        assertFalse("old name must no longer be listed", names.contains("f1"));
+        assertEquals("new name must resolve to the same object", "2",
+            bridge.resolveItem(id, "/Store/f1-renamed").itemId());
+        assertThrows("old name must not resolve", NoSuchFileException.class,
+            () -> bridge.resolveItem(id, "/Store/f1"));
+    }
+
+    @Test
+    public void moveWithRenameOverlaysNewNameAtDestination() throws IOException {
+        var bridge = MTPDeviceBridge.getInstance();
+        bridge.move(id, "/Store/f1", "/Store/dir/f1-renamed", false);
+
+        var rootNames = Arrays.stream(bridge.listChildren(id, "/Store"))
+            .map(MTPItemInfo::filename).toList();
+        assertFalse("moved file must not be listed where it left", rootNames.contains("f1"));
+        var dirNames = Arrays.stream(bridge.listChildren(id, "/Store/dir"))
+            .map(MTPItemInfo::filename).toList();
+        assertTrue("moved file must list under its new name at the destination",
+            dirNames.contains("f1-renamed"));
+        assertFalse("moved file must not list under its old name at the destination",
+            dirNames.contains("f1"));
+    }
+
+    @Test
+    public void renameOverlayClearsOnceDeviceReportsTheNewName() throws IOException {
+        var bridge = MTPDeviceBridge.getInstance();
+        bridge.move(id, "/Store/f1", "/Store/f1-renamed", false);
+        backend.applyRenames(); // device catches up
+
+        // This fetch sees the device reporting the new name, which resolves the overlay.
+        var names = Arrays.stream(bridge.listChildren(id, "/Store"))
+            .map(MTPItemInfo::filename).toList();
+        assertTrue(names.contains("f1-renamed"));
+
+        // A later device-side rename must now show through: a still-active overlay would pin the
+        // filename to "f1-renamed" and hide it.
+        backend.renameEntry("2", "external");
+        bridge.createDirectory(id, "/Store/poke"); // mutation drops the listing cache
+        names = Arrays.stream(bridge.listChildren(id, "/Store"))
+            .map(MTPItemInfo::filename).toList();
+        assertTrue("resolved overlay must not pin the old overlay name", names.contains("external"));
+        assertFalse(names.contains("f1-renamed"));
+    }
+
+    @Test
+    public void renamedThenDeletedItemIsFullySuppressed() throws IOException {
+        var bridge = MTPDeviceBridge.getInstance();
+        bridge.move(id, "/Store/f1", "/Store/f1-renamed", false);
+        bridge.delete(id, "/Store/f1-renamed"); // resolves through the overlay
+
+        var names = Arrays.stream(bridge.listChildren(id, "/Store"))
+            .map(MTPItemInfo::filename).toList();
+        assertFalse("deleted item must not appear under its new name", names.contains("f1-renamed"));
+        assertFalse("deleted item must not appear under its old name", names.contains("f1"));
     }
 
     @Test
@@ -299,11 +367,36 @@ public class MTPDeviceBridgeTombstoneTest {
             return List.of(new StorageResult("Store", STORAGE_ID));
         }
 
+        @Override
+        public void setFileName(DeviceHandle device, String itemId, String newName) {
+            // Like deletes, renames apply to the device's database asynchronously: listings keep
+            // reporting the old filename until the device catches up (applyRenames).
+            pendingRenames.put(itemId, newName);
+            if (!ghosting) {
+                applyRenames();
+            }
+        }
+
+        /** The device's database catches up: renames become visible in listings. */
+        void applyRenames() {
+            pendingRenames.forEach(this::renameEntry);
+            pendingRenames.clear();
+        }
+
+        /** Rewrites the filename of {@code itemId} directly in the listings (a device-side rename). */
+        void renameEntry(String itemId, String name) {
+            tree.values().forEach(children -> children.replaceAll(c -> c.itemId().equals(itemId)
+                ? new MTPItemInfo(c.parentId(), c.itemId(), c.storageId(), c.isFile(),
+                    c.filesize(), c.modificationDate(), name)
+                : c));
+        }
+
+        private final Map<String, String> pendingRenames = new java.util.HashMap<>();
+
         @Override public long getCapacity(DeviceHandle device, String storageId) { return 0; }
         @Override public long getFreeSpace(DeviceHandle device, String storageId) { return 0; }
         @Override public String createFolder(DeviceHandle device, String name, String parentId, String storageId) { return "50"; }
         @Override public void getFile(DeviceHandle device, String itemId, String destPath) {}
-        @Override public void setFileName(DeviceHandle device, String itemId, String newName) {}
         @Override public void releaseDevice(DeviceHandle device) {}
     }
 }

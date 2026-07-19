@@ -73,16 +73,21 @@ Two things to know when touching this code:
 
 `overwriteFile` refuses up front (before issuing any edit command, so the object is left untouched)
 when the new content is **larger** than the object's current size, and the caller falls back to
-delete + send. Growing an object in place is unreliable across devices: the AK100_II and the FiiO's
-FAT32 SD card accept every edit command with an MTP OK response but either do not extend the object
-or write the bytes while leaving the reported size stale. Only the FiiO's internal storage grows
-correctly. Overwrites that shrink or keep the size — the common case, and the one that matters for
-the asynchronous-delete devices — stay on the in-place path.
+delete + send. Growing an object in place is unreliable **over WPD**: on the AK100_II and the FiiO's
+FAT32 SD card every edit command returns MTP OK and the new bytes read back correctly via
+`GetPartialObject`, yet the WPD-reported object size stays at the old value, so whole-object reads
+come back truncated. The same devices grow correctly through libmtp with the same opcodes (the full
+suite passes on Linux), which points at the Windows path — most likely WpdMtpDr's host-side object
+cache not refreshing `WPD_OBJECT_SIZE` after pass-through edits — rather than the device firmware.
+Until a way to refresh the driver's view is found, grows fall back; overwrites that shrink or keep
+the size — the common case, and the one that matters for the asynchronous-delete devices — stay on
+the in-place path.
 
-The residual gap: on the **FiiO M11 Plus SD card**, a growing replace can neither be done in place
-nor via delete + send (that storage rejects re-creating a just-deleted name), so
-`appendExtendsExistingFile` and `moveReplacesExistingTarget` fail there. This is a device limitation,
-not a backend one.
+The residual gap: on the **FiiO M11 Plus SD card**, the delete + send fallback for a growing replace
+races that storage's asynchronous delete. The retry backoff usually wins, but
+`appendExtendsExistingFile` and `moveReplacesExistingTarget` have been observed failing there in one
+session and passing in the next. Windows-only; on Linux/libmtp the grow happens in place and the race
+never starts.
 
 ## How `readPartial` works on WPD
 
@@ -108,6 +113,16 @@ correct primitive because the transaction is bounded and self-completing — it 
 
 ## Notes
 
+- **The FiiO M11 Plus can stall its MTP session mid-request** (observed as intermittent
+  `IStream::Write` failures, a storage transiently disappearing, and renames whose old name lingers
+  in listings — the last is compensated by the bridge's rename overlay, which patches the new name
+  into listings until the device reports it). Because WpdMtpDr serializes every WPD client through
+  one queue, a stall blocks *all*
+  of them — the test run hangs, and File Explorer opened against the same device hangs too (Windows
+  eventually kills it with an Application Hang event). Explorer's forced restart tears down its WPD
+  handles, which cancels the outstanding I/O and unblocks the queue; the request that was in flight
+  fails (e.g. HRESULT 0x8007065d). If a run appears hung on the FiiO, this — not the test code — is
+  the likely cause.
 - **Integration-test artifact names are unique per run.** `MTPFileSystemIntegrationTest` derives every
   file/directory name from a token unique to the JVM run and test-method invocation. On a device that
   applies deletes asynchronously, a name deleted by one test cannot be re-created for the rest of the

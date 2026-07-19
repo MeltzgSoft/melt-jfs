@@ -55,11 +55,18 @@ public enum MTPDeviceBridge implements Closeable {
     // up. A deleted id is dead device-wide and filtered from every listing; a moved id still
     // exists at its new location and is filtered only from the listing it left. Keyed per device;
     // cleared when connections are torn down.
-    private final Map<TombstoneKey, Tombstone> tombstones = new ConcurrentHashMap<>();
+    private final Map<ItemKey, Tombstone> tombstones = new ConcurrentHashMap<>();
 
-    private record TombstoneKey(MTPDeviceIdentifier deviceId, String itemId) {}
+    private record ItemKey(MTPDeviceIdentifier deviceId, String itemId) {}
 
     private record Tombstone(ListingKey leftFrom, boolean everywhere) {}
+
+    // Renames the device may not have applied to its listings yet: the same asynchronous-database
+    // devices that ghost deletes also keep reporting a renamed object under its old filename for a
+    // while after a successful SetObjectName. The overlay rewrites the item's filename by id in
+    // every listing until the device itself reports the new name, at which point it is dropped.
+    // Keyed per device; cleared when connections are torn down.
+    private final Map<ItemKey, String> renameOverlays = new ConcurrentHashMap<>();
 
     // Backoff schedule for re-sending a file whose same-named predecessor was just deleted; devices
     // with an asynchronous MTP database can reject the send until the delete propagates.
@@ -394,6 +401,9 @@ public enum MTPDeviceBridge implements Closeable {
                     }
                     if (!source.filename().equals(tgtName)) {
                         backend.setFileName(conn.handle(), source.itemId(), tgtName);
+                        // Stale listings may keep reporting the old filename until the device's
+                        // database catches up; overlay the new name by id until it does.
+                        renameOverlays.put(new ItemKey(conn.deviceId(), source.itemId()), tgtName);
                     }
                 } catch (IOException nativeError) {
                     // Many devices do not implement MoveObject/SetObjectName; let the caller emulate.
@@ -536,6 +546,7 @@ public enum MTPDeviceBridge implements Closeable {
         deviceConns.clear();
         invalidateListings();
         tombstones.clear();
+        renameOverlays.clear();
         lastSignature = Set.of();
         devicesDetected = false;
     }
@@ -620,7 +631,8 @@ public enum MTPDeviceBridge implements Closeable {
         if (cached != null && System.nanoTime() - cached.fetchedNanos() < LISTING_TTL_NANOS) {
             return cached.items();
         }
-        var items = reconcileTombstones(key, backend().getChildItems(conn.handle(), storageId, parentId));
+        var items = reconcileRenames(key,
+            reconcileTombstones(key, backend().getChildItems(conn.handle(), storageId, parentId)));
         listingCache.put(key, new ChildListing(items, System.nanoTime()));
         return items;
     }
@@ -631,8 +643,9 @@ public enum MTPDeviceBridge implements Closeable {
      * without it. Callers must hold the read lock and the connection monitor.
      */
     private void tombstoneUnsafe(MTPDeviceConnection conn, String itemId, String storageId, String parentId) {
-        tombstones.put(new TombstoneKey(conn.deviceId(), itemId),
-            new Tombstone(new ListingKey(conn.deviceId(), storageId, parentId), true));
+        var key = new ItemKey(conn.deviceId(), itemId);
+        tombstones.put(key, new Tombstone(new ListingKey(conn.deviceId(), storageId, parentId), true));
+        renameOverlays.remove(key); // a deleted id has no name left to overlay
     }
 
     /**
@@ -641,7 +654,7 @@ public enum MTPDeviceBridge implements Closeable {
      * that listing comes back without it. Callers must hold the read lock and the connection monitor.
      */
     private void tombstoneMovedUnsafe(MTPDeviceConnection conn, String itemId, String storageId, String parentId) {
-        tombstones.put(new TombstoneKey(conn.deviceId(), itemId),
+        tombstones.put(new ItemKey(conn.deviceId(), itemId),
             new Tombstone(new ListingKey(conn.deviceId(), storageId, parentId), false));
     }
 
@@ -659,8 +672,30 @@ public enum MTPDeviceBridge implements Closeable {
         if (tombstones.isEmpty()) return items;
         return Arrays.stream(items)
             .filter(i -> {
-                var tombstone = tombstones.get(new TombstoneKey(key.deviceId(), i.itemId()));
+                var tombstone = tombstones.get(new ItemKey(key.deviceId(), i.itemId()));
                 return tombstone == null || !(tombstone.everywhere() || tombstone.leftFrom().equals(key));
+            })
+            .toArray(MTPItemInfo[]::new);
+    }
+
+    /**
+     * Drops rename overlays the device has caught up with (this listing already reports the item
+     * under its new name), then rewrites the filename of any still-overlaid item. Ids are unique
+     * per device, so the overlay applies wherever the item is listed — including a listing it was
+     * simultaneously moved into, when a move combined relocation with a rename.
+     */
+    private MTPItemInfo[] reconcileRenames(ListingKey key, MTPItemInfo[] items) {
+        if (renameOverlays.isEmpty()) return items;
+        renameOverlays.entrySet().removeIf(e -> e.getKey().deviceId().equals(key.deviceId())
+            && Arrays.stream(items).anyMatch(i -> i.itemId().equals(e.getKey().itemId())
+                && i.filename().equals(e.getValue())));
+        if (renameOverlays.isEmpty()) return items;
+        return Arrays.stream(items)
+            .map(i -> {
+                var newName = renameOverlays.get(new ItemKey(key.deviceId(), i.itemId()));
+                return newName == null ? i
+                    : new MTPItemInfo(i.parentId(), i.itemId(), i.storageId(), i.isFile(),
+                        i.filesize(), i.modificationDate(), newName);
             })
             .toArray(MTPItemInfo[]::new);
     }
