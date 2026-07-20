@@ -14,6 +14,7 @@ import java.lang.foreign.MemorySegment;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Locale;
 import java.util.regex.Matcher;
@@ -73,6 +74,22 @@ class WpdBackend implements MtpBackend {
     private static final MemorySegment KEY_CLIENT_MAJOR_VERSION;
     private static final MemorySegment KEY_CLIENT_MINOR_VERSION;
     private static final MemorySegment KEY_CLIENT_REVISION;
+    private static final MemorySegment KEY_DEVICE_PROTOCOL;
+    private static final MemorySegment KEY_DEVICE_SERIAL_NUMBER;
+
+    // ---- SendCommand / MTP pass-through keys (readPartial) ----
+    // The MTP-extension command category; SendCommand routes to it and picks the command by pid.
+    private static final MemorySegment MTP_EXT_CATEGORY;
+    private static final MemorySegment KEY_COMMON_COMMAND_CATEGORY;
+    private static final MemorySegment KEY_COMMON_COMMAND_ID;
+    private static final MemorySegment KEY_COMMON_HRESULT;
+    private static final MemorySegment KEY_MTP_OP_CODE;
+    private static final MemorySegment KEY_MTP_OP_PARAMS;
+    private static final MemorySegment KEY_MTP_RESPONSE_CODE;
+    private static final MemorySegment KEY_MTP_TRANSFER_CONTEXT;
+    private static final MemorySegment KEY_MTP_TRANSFER_TOTAL_SIZE;
+    private static final MemorySegment KEY_MTP_NUM_BYTES_TO_READ;
+    private static final MemorySegment KEY_MTP_TRANSFER_DATA;
 
     // ---- content-type / category GUID values ----
     private static final MemorySegment CONTENT_TYPE_FOLDER;
@@ -95,7 +112,7 @@ class WpdBackend implements MtpBackend {
 
     // ---- vtable indices (after IUnknown's QueryInterface=0, AddRef=1, Release=2) ----
     private static final int MGR_GET_DEVICES = 3, MGR_FRIENDLY_NAME = 5, MGR_DESCRIPTION = 6, MGR_MANUFACTURER = 7;
-    private static final int DEV_OPEN = 3, DEV_CONTENT = 5, DEV_CLOSE = 8;
+    private static final int DEV_OPEN = 3, DEV_SEND_COMMAND = 4, DEV_CONTENT = 5, DEV_CLOSE = 8;
     // IPortableDeviceContent vtable order (after IUnknown): EnumObjects(3), Properties(4), Transfer(5),
     // CreateObjectWithPropertiesOnly(6), CreateObjectWithPropertiesAndData(7), Delete(8),
     // GetObjectIDsFromPersistentUniqueIDs(9), Cancel(10), Move(11), Copy(12).
@@ -105,7 +122,8 @@ class WpdBackend implements MtpBackend {
     private static final int PROPS_GET_VALUES = 5, PROPS_SET_VALUES = 6;
     private static final int RES_GET_STREAM = 5;
     private static final int VAL_GET_VALUE = 6, VAL_SET_STRING = 7, VAL_GET_STRING = 8, VAL_SET_U4 = 9,
-        VAL_GET_U4 = 10, VAL_SET_U8 = 13, VAL_GET_U8 = 14, VAL_SET_GUID = 27, VAL_GET_GUID = 28;
+        VAL_GET_U4 = 10, VAL_SET_U8 = 13, VAL_GET_U8 = 14, VAL_GET_ERROR = 20, VAL_SET_GUID = 27,
+        VAL_GET_GUID = 28, VAL_SET_BUFFER = 29, VAL_GET_BUFFER = 30, VAL_SET_PVCOLL = 33;
     private static final int KEYCOLL_ADD = 5;
     private static final int PVCOLL_ADD = 5;
     private static final int STREAM_READ = 3, STREAM_WRITE = 4, STREAM_COMMIT = 8;
@@ -157,6 +175,29 @@ class WpdBackend implements MtpBackend {
         KEY_CLIENT_MAJOR_VERSION = propertyKey(a, clientFmt, 3);
         KEY_CLIENT_MINOR_VERSION = propertyKey(a, clientFmt, 4);
         KEY_CLIENT_REVISION = propertyKey(a, clientFmt, 5);
+        // WPD_DEVICE_PROTOCOL (WPD_DEVICE_PROPERTIES_V1) — a string such as "MTP: 1.00", "PTP:",
+        // "MSC:", read by isMtpDevice to filter out the non-MTP devices WPD also enumerates.
+        KEY_DEVICE_PROTOCOL = propertyKey(a, "26d4979a-e643-4626-9e2b-736dc0c92fdc", 6);
+        // WPD_DEVICE_SERIAL_NUMBER (same fmtid, pid 9) — the device's MTP serial, used as the identity's
+        // serial so it matches the libmtp backend instead of a Windows-local PnP instance id.
+        KEY_DEVICE_SERIAL_NUMBER = propertyKey(a, "26d4979a-e643-4626-9e2b-736dc0c92fdc", 9);
+
+        // WPD_CATEGORY_COMMON keys used to address any SendCommand invocation (PortableDevice.h).
+        String commonFmt = "f0422a9c-5dc8-4440-b5bd-5df28835658a";
+        KEY_COMMON_COMMAND_CATEGORY = propertyKey(a, commonFmt, 1001);
+        KEY_COMMON_COMMAND_ID = propertyKey(a, commonFmt, 1002);
+        KEY_COMMON_HRESULT = propertyKey(a, commonFmt, 1003);
+        // WPD_CATEGORY_MTP_EXT_VENDOR_OPERATIONS command/property keys (WpdMtpExtensions.h). The
+        // category doubles as every MTP-ext command's fmtid; the command is selected by its pid.
+        String mtpExt = "4d545058-1a2e-4106-a357-771e0819fc56";
+        MTP_EXT_CATEGORY = guid(a, mtpExt);
+        KEY_MTP_OP_CODE = propertyKey(a, mtpExt, 1001);
+        KEY_MTP_OP_PARAMS = propertyKey(a, mtpExt, 1002);
+        KEY_MTP_RESPONSE_CODE = propertyKey(a, mtpExt, 1003);
+        KEY_MTP_TRANSFER_CONTEXT = propertyKey(a, mtpExt, 1006);
+        KEY_MTP_TRANSFER_TOTAL_SIZE = propertyKey(a, mtpExt, 1007);
+        KEY_MTP_NUM_BYTES_TO_READ = propertyKey(a, mtpExt, 1008);
+        KEY_MTP_TRANSFER_DATA = propertyKey(a, mtpExt, 1012);
 
         CONTENT_TYPE_FOLDER = guid(a, "27e2e392-a111-48e0-ab0c-e17705a05f85");
         CONTENT_TYPE_FUNCTIONAL_OBJECT = guid(a, "99ed0160-17ff-4c44-9d98-1d7a6f941921");
@@ -176,6 +217,15 @@ class WpdBackend implements MtpBackend {
         FUNCTIONAL_CATEGORY_STORAGE = guid(a, "23f05bbc-15de-4c2a-a55b-a9af5ce412ef");
     }
 
+    // Standard MTP GetPartialObject (0x101B, 32-bit offset) and the Android GetPartialObject64
+    // extension (0x95C1, 64-bit offset). A device advertises one or the other; readPartial probes
+    // 0x101B first, then 0x95C1, and caches whichever the device honoured. MTP response 0x2001 is OK,
+    // 0x2005 is Operation_Not_Supported.
+    private static final int OP_GET_PARTIAL_OBJECT = 0x101B, OP_GET_PARTIAL_OBJECT_64 = 0x95C1;
+    private static final int MTP_RESPONSE_OK = 0x2001, MTP_RESPONSE_OP_NOT_SUPPORTED = 0x2005;
+    // Chunk size for the READ_DATA phase; audio-tag reads are well under this, so it is one round trip.
+    private static final int READ_DATA_CHUNK = 256 * 1024;
+
     private static final WpdBackend INSTANCE = new WpdBackend();
 
     static WpdBackend getInstance() {
@@ -183,6 +233,10 @@ class WpdBackend implements MtpBackend {
     }
 
     private WpdBackend() {}
+
+    // The GetPartialObject opcode this device honoured, cached after the first successful probe
+    // (0 until then). Written at most once per opcode; a stale read only costs one extra probe.
+    private volatile int partialReadOpcode = 0;
 
     /** Live WPD handle: the device plus its content and properties interfaces. */
     private record WpdDevice(MemorySegment device, MemorySegment content, MemorySegment properties)
@@ -292,11 +346,18 @@ class WpdBackend implements MtpBackend {
                 "IPortableDeviceContent::Properties");
             var props = propsOut.get(ADDRESS, 0);
 
+            // WPD enumerates every portable device (PTP cameras, mass-storage, phones in other modes),
+            // not just MTP ones. Skip anything that isn't MTP so callers only ever see usable devices.
+            if (!isMtpDevice(props)) {
+                releaseDevice(new WpdDevice(device, content, props));
+                return null;
+            }
+
             var friendly = deviceStringProp(manager, deviceId, MGR_FRIENDLY_NAME, arena);
             var description = deviceStringProp(manager, deviceId, MGR_DESCRIPTION, arena);
             var manufacturer = deviceStringProp(manager, deviceId, MGR_MANUFACTURER, arena);
 
-            var id = parseIdentifier(deviceId);
+            var id = parseIdentifier(deviceId, deviceSerialNumber(props));
             var info = new MTPDeviceInfo(id, friendly, description, manufacturer, 0, 0);
             return new OpenedDevice(id, info, new WpdDevice(device, content, props));
         } catch (Throwable t) {
@@ -319,17 +380,52 @@ class WpdBackend implements MtpBackend {
         return failed(hr) ? "" : readWstr(buf);
     }
 
-    private MTPDeviceIdentifier parseIdentifier(String deviceId) {
+    /**
+     * Whether the opened device speaks MTP, read from WPD_DEVICE_PROTOCOL on the device object. WPD
+     * reports a transport-protocol string ("MTP: 1.00", "PTP:", "MSC:", ...); only a value that
+     * clearly names a non-MTP protocol excludes the device. An absent or unreadable protocol keeps
+     * the device (fail-open), so a quirky-but-usable MTP device is never dropped.
+     */
+    private boolean isMtpDevice(MemorySegment props) {
+        var values = getValues(props, WPD_DEVICE_OBJECT_ID, KEY_DEVICE_PROTOCOL);
+        if (MemorySegment.NULL.equals(values)) return true;
+        try {
+            String protocol = getString(values, KEY_DEVICE_PROTOCOL);
+            return protocol.isEmpty() || protocol.regionMatches(true, 0, "MTP", 0, 3);
+        } finally {
+            release(values);
+        }
+    }
+
+    private MTPDeviceIdentifier parseIdentifier(String deviceId, String wpdSerial) {
         String lower = deviceId.toLowerCase();
         int vendor = 0, product = 0;
         Matcher mv = VID.matcher(lower);
         if (mv.find()) vendor = Integer.parseInt(mv.group(1), 16);
         Matcher mp = PID.matcher(lower);
         if (mp.find()) product = Integer.parseInt(mp.group(1), 16);
-        // The instance id (typically the device serial) is the 3rd '#'-delimited segment.
+        // Prefer the device-reported MTP serial (WPD_DEVICE_SERIAL_NUMBER) so the identity matches the
+        // libmtp backend. Fall back to the Windows PnP instance id (3rd '#'-delimited segment) for a
+        // device that reports no serial — that id is bus-generated (e.g. "b&27c98feb&0&0000").
         var segments = deviceId.split("#");
-        String serial = segments.length >= 3 ? segments[2] : deviceId.replaceAll("[^0-9A-Za-z]", "");
+        String raw = !wpdSerial.isEmpty() ? wpdSerial
+            : (segments.length >= 3 ? segments[2] : deviceId);
+        // MTPDeviceIdentifier's serial must be word characters (it flows into a mtp:// URI and matches
+        // \w+), so collapse any run of non-word characters to a single underscore.
+        String serial = raw.replaceAll("[^0-9A-Za-z_]+", "_").replaceAll("^_+|_+$", "");
+        if (serial.isEmpty()) serial = "unknown";
         return new MTPDeviceIdentifier(vendor, product, serial);
+    }
+
+    /** Reads WPD_DEVICE_SERIAL_NUMBER from the device object, or "" when the device reports none. */
+    private String deviceSerialNumber(MemorySegment props) {
+        var values = getValues(props, WPD_DEVICE_OBJECT_ID, KEY_DEVICE_SERIAL_NUMBER);
+        if (MemorySegment.NULL.equals(values)) return "";
+        try {
+            return getString(values, KEY_DEVICE_SERIAL_NUMBER);
+        } finally {
+            release(values);
+        }
     }
 
     @Override
@@ -536,6 +632,243 @@ class WpdBackend implements MtpBackend {
             } finally {
                 release(resources);
             }
+        }
+    }
+
+    @Override
+    public boolean supportsPartialReads() {
+        // Implemented through MTP GetPartialObject, sent as a raw command via IPortableDevice::SendCommand.
+        // Device-level support (which GetPartialObject variant, if any) is probed on first use.
+        return true;
+    }
+
+    /**
+     * Ranged read via the MTP GetPartialObject operation, issued as a raw MTP command through
+     * {@code IPortableDevice::SendCommand} (the WPD MTP pass-through). Unlike the whole-object resource
+     * stream used by {@link #getFile}, this is a bounded request/data/response transaction, so it
+     * transfers only the requested bytes and never leaves the device mid-transfer.
+     */
+    @Override
+    public byte[] readPartial(DeviceHandle handle, String itemId, long offset, int maxBytes) throws IOException {
+        if (offset < 0) throw new IllegalArgumentException("offset must be non-negative: " + offset);
+        if (maxBytes < 0) throw new IllegalArgumentException("maxBytes must be non-negative: " + maxBytes);
+        if (maxBytes == 0) return new byte[0];
+        long objectHandle = parseObjectHandle(itemId);
+        var d = dev(handle);
+
+        // Try the cached opcode first, then the other; a 32-bit-offset op is skipped when the offset
+        // needs more than 32 bits. getPartialObject returns null when the device reports the opcode
+        // unsupported (MTP 0x2005), so we fall through to the next candidate.
+        int cached = partialReadOpcode;
+        int[] order = cached == OP_GET_PARTIAL_OBJECT_64
+            ? new int[]{OP_GET_PARTIAL_OBJECT_64, OP_GET_PARTIAL_OBJECT}
+            : new int[]{OP_GET_PARTIAL_OBJECT, OP_GET_PARTIAL_OBJECT_64};
+        // An unsupported opcode can surface either as MTP 0x2005 (getPartialObject returns null) or as a
+        // driver-level error; in both cases fall through to the other variant before giving up.
+        IOException pending = null;
+        for (int opcode : order) {
+            if (opcode == OP_GET_PARTIAL_OBJECT && (offset >>> 32) != 0) continue; // needs 64-bit offset
+            try {
+                byte[] result = getPartialObject(d, objectHandle, offset, maxBytes, opcode);
+                if (result != null) {
+                    partialReadOpcode = opcode;
+                    return result;
+                }
+            } catch (IOException e) {
+                pending = e;
+            }
+        }
+        if (pending != null) throw pending;
+        throw new IOException("device supports neither GetPartialObject (0x101B) nor "
+            + "GetPartialObject64 (0x95C1) for id: " + itemId);
+    }
+
+    /**
+     * Runs one GetPartialObject transaction with {@code opcode}: initiate (WITH_DATA_TO_READ), read the
+     * data phase in chunks (READ_DATA), then always close it (END_DATA_TRANSFER). Returns the bytes read
+     * (possibly empty near/at end-of-object), or {@code null} when the device reports the opcode
+     * unsupported so the caller can try the other variant.
+     */
+    private byte[] getPartialObject(WpdDevice d, long objectHandle, long offset, int maxBytes, int opcode)
+            throws IOException {
+        String context;
+        long total;
+        try (var arena = Arena.ofConfined()) {
+            var initParams = createCommand(MTP_EXT_CATEGORY, PID_EXECUTE_WITH_DATA_TO_READ);
+            try {
+                setU4(initParams, KEY_MTP_OP_CODE, opcode);
+                var params = createInstance(CLSID_PROPVARIANT_COLLECTION, IID_PROPVARIANT_COLLECTION,
+                    "create MTP operation params");
+                try {
+                    addU4(params, arena, (int) objectHandle);
+                    if (opcode == OP_GET_PARTIAL_OBJECT) {
+                        addU4(params, arena, (int) offset);
+                        addU4(params, arena, maxBytes);
+                    } else { // GetPartialObject64: object handle, offset low, offset high, max bytes
+                        addU4(params, arena, (int) offset);
+                        addU4(params, arena, (int) (offset >>> 32));
+                        addU4(params, arena, maxBytes);
+                    }
+                    call(initParams, VAL_SET_PVCOLL,
+                        FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, ADDRESS), KEY_MTP_OP_PARAMS, params);
+                } finally {
+                    release(params);
+                }
+                var initResults = sendCommand(d.device(), initParams, arena);
+                try {
+                    checkDriverHr(initResults, "initiate GetPartialObject");
+                    context = getString(initResults, KEY_MTP_TRANSFER_CONTEXT);
+                    total = Math.min(Math.max(getU4(initResults, KEY_MTP_TRANSFER_TOTAL_SIZE), 0), maxBytes);
+                } finally {
+                    release(initResults);
+                }
+            } finally {
+                release(initParams);
+            }
+        }
+
+        // Once initiated, the transfer must be closed even if reading fails, so the device is not left
+        // mid-transaction. END_DATA_TRANSFER carries the MTP response code.
+        byte[] out = new byte[(int) total];
+        int read = 0;
+        int responseCode;
+        try {
+            read = readDataPhase(d.device(), context, out);
+        } finally {
+            responseCode = endDataTransfer(d.device(), context);
+        }
+        if (responseCode == MTP_RESPONSE_OP_NOT_SUPPORTED) return null;
+        return read == out.length ? out : Arrays.copyOf(out, read);
+    }
+
+    /** Reads the data phase into {@code out} in chunks, returning the number of bytes read. */
+    private int readDataPhase(MemorySegment device, String context, byte[] out) throws IOException {
+        int read = 0;
+        while (read < out.length) {
+            int chunk = Math.min(out.length - read, READ_DATA_CHUNK);
+            try (var arena = Arena.ofConfined()) {
+                var params = createCommand(MTP_EXT_CATEGORY, PID_READ_DATA);
+                try {
+                    setString(params, KEY_MTP_TRANSFER_CONTEXT, wstr(arena, context));
+                    // WPD requires an input buffer of the requested size even though the data comes back
+                    // through the results (a WDF quirk noted in the WPD docs).
+                    call(params, VAL_SET_BUFFER,
+                        FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, ADDRESS, JAVA_INT),
+                        KEY_MTP_TRANSFER_DATA, arena.allocate(chunk), chunk);
+                    setU4(params, KEY_MTP_NUM_BYTES_TO_READ, chunk);
+                    var results = sendCommand(device, params, arena);
+                    try {
+                        checkDriverHr(results, "READ_DATA");
+                        int got = copyBufferValue(results, out, read);
+                        if (got <= 0) break; // device sent less than it promised; stop at what we have
+                        read += got;
+                    } finally {
+                        release(results);
+                    }
+                } finally {
+                    release(params);
+                }
+            }
+        }
+        return read;
+    }
+
+    /** Sends END_DATA_TRANSFER for {@code context}; returns the MTP response code (-1 if unavailable). */
+    private int endDataTransfer(MemorySegment device, String context) {
+        try (var arena = Arena.ofConfined()) {
+            var params = createCommand(MTP_EXT_CATEGORY, PID_END_DATA_TRANSFER);
+            try {
+                setString(params, KEY_MTP_TRANSFER_CONTEXT, wstr(arena, context));
+                var results = sendCommand(device, params, arena);
+                try {
+                    return (int) getU4(results, KEY_MTP_RESPONSE_CODE);
+                } finally {
+                    release(results);
+                }
+            } finally {
+                release(params);
+            }
+        } catch (IOException | RuntimeException e) {
+            return -1; // best-effort close; the read result is already in hand
+        }
+    }
+
+    // MTP-ext command pids within MTP_EXT_CATEGORY (WpdMtpExtensions.h).
+    private static final int PID_EXECUTE_WITH_DATA_TO_READ = 13, PID_READ_DATA = 15, PID_END_DATA_TRANSFER = 17;
+
+    /** Builds an {@code IPortableDeviceValues} addressed to one MTP-ext command (category + pid). */
+    private MemorySegment createCommand(MemorySegment category, int commandPid) throws IOException {
+        var values = createInstance(CLSID_VALUES, IID_VALUES, "create command parameters");
+        setGuid(values, KEY_COMMON_COMMAND_CATEGORY, category);
+        setU4(values, KEY_COMMON_COMMAND_ID, commandPid);
+        return values;
+    }
+
+    /** IPortableDevice::SendCommand; returns the results IPortableDeviceValues (caller releases). */
+    private MemorySegment sendCommand(MemorySegment device, MemorySegment params, Arena arena) throws IOException {
+        var out = arena.allocate(ADDRESS);
+        checkHr(call(device, DEV_SEND_COMMAND,
+                FunctionDescriptor.of(JAVA_INT, ADDRESS, JAVA_INT, ADDRESS, ADDRESS), 0, params, out),
+            "IPortableDevice::SendCommand");
+        return out.get(ADDRESS, 0);
+    }
+
+    /** Throws when the driver failed to relay the command (WPD_PROPERTY_COMMON_HRESULT). */
+    private void checkDriverHr(MemorySegment results, String op) throws IOException {
+        try (var arena = Arena.ofConfined()) {
+            var out = arena.allocate(JAVA_INT);
+            int hr = call(results, VAL_GET_ERROR,
+                FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, ADDRESS), KEY_COMMON_HRESULT, out);
+            if (!failed(hr)) checkHr(out.get(JAVA_INT, 0), op + " (driver HRESULT)");
+        }
+    }
+
+    private void setU4(MemorySegment values, MemorySegment key, int value) {
+        call(values, VAL_SET_U4, FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, JAVA_INT), key, value);
+    }
+
+    /** Appends a VT_UI4 value to an IPortableDevicePropVariantCollection. */
+    private void addU4(MemorySegment coll, Arena arena, int value) {
+        var pv = arena.allocate(PROPVARIANT_SIZE); // zero-filled
+        pv.set(JAVA_SHORT, 0, VT_UI4);
+        pv.set(JAVA_INT, 8, value);
+        call(coll, PVCOLL_ADD, FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS), pv);
+    }
+
+    /**
+     * Copies the byte buffer returned in {@code results} under WPD_PROPERTY_MTP_EXT_TRANSFER_DATA into
+     * {@code out} at {@code dstOffset}, frees the device-allocated buffer, and returns the count copied.
+     */
+    private int copyBufferValue(MemorySegment results, byte[] out, int dstOffset) {
+        try (var arena = Arena.ofConfined()) {
+            var ptrOut = arena.allocate(ADDRESS);
+            var cbOut = arena.allocate(JAVA_INT);
+            int hr = call(results, VAL_GET_BUFFER,
+                FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, ADDRESS, ADDRESS),
+                KEY_MTP_TRANSFER_DATA, ptrOut, cbOut);
+            if (failed(hr)) return 0;
+            int cb = cbOut.get(JAVA_INT, 0);
+            var ptr = ptrOut.get(ADDRESS, 0);
+            if (cb <= 0 || MemorySegment.NULL.equals(ptr)) return 0;
+            int n = Math.min(cb, out.length - dstOffset);
+            MemorySegment.copy(ptr.reinterpret(n), JAVA_BYTE, 0, out, dstOffset, n);
+            coTaskMemFree(ptr);
+            return n;
+        }
+    }
+
+    /**
+     * Derives the numeric MTP object handle from a WPD object-id string. The Microsoft WpdMtp driver
+     * renders object ids as {@code "o"} followed by the hex object handle; the leading letter is
+     * dropped and the rest parsed as hex.
+     */
+    private static long parseObjectHandle(String itemId) throws IOException {
+        String hex = (!itemId.isEmpty() && (itemId.charAt(0) == 'o' || itemId.charAt(0) == 'O'))
+            ? itemId.substring(1) : itemId;
+        try {
+            return Long.parseUnsignedLong(hex, 16) & 0xFFFFFFFFL;
+        } catch (NumberFormatException e) {
+            throw new IOException("cannot derive an MTP object handle from WPD id: " + itemId);
         }
     }
 

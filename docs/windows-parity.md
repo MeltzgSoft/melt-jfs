@@ -27,44 +27,44 @@ match **`NativeLibMTP`** (libmtp, Linux/macOS). **Keep this file updated wheneve
 | Eager `newInputStream` / `Files.copy` | ✅ | ✅ | none |
 | `mtp` view (device-index metadata) | ✅ | ✅ | none |
 | `sendFile` audio object-format inference | ✅ | ✅ (`audioFormatForFilename`) | none |
-| **Ranged read (`readPartial`)** | ✅ | ❌ | **implement via IStream Seek+Read** |
-| `supportsPartialReads()` | ✅ `true` | ❌ `false` (default) | flip to `true` once `readPartial` lands |
-| Lazy read channel (`newByteChannel`) | ✅ lazy | ⚠️ eager fallback | correct, but not lazy until `readPartial` lands |
-| `audio` view (embedded tags) | ✅ | ❌ (gated off) | needs `readPartial`; then automatic |
+| **Ranged read (`readPartial`)** | ✅ | ✅ (MTP GetPartialObject via `SendCommand`) | none |
+| `supportsPartialReads()` | ✅ `true` | ✅ `true` | none |
+| Lazy read channel (`newByteChannel`) | ✅ lazy | ✅ lazy | none |
+| `audio` view (embedded tags) | ✅ | ✅ (lit up by `readPartial`) | none |
 | Audio tag readers (FLAC/MP3/MP4/Ogg/Opus/WAV) | ✅ (neutral) | ✅ (neutral) | none — pure Java, backend-agnostic |
 
 Legend: ✅ done · ⚠️ works via fallback · ❌ missing.
 
-## Tasks
+At parity: verified end-to-end on a real Windows host (Astell&Kern AK100_II) — the full
+`MTPFileSystemIntegrationTest` suite passes on WPD across both storages, including
+`partialReadPullsAudioHeaderWithoutTransferringWholeObject` and the `audioViewReadsUploaded*Tags` /
+`uploadedId3v23Mp3TagsAreReadBackViaAudioView` suites.
 
-### 1. `WpdBackend.readPartial` — the one blocking gap
-Implement `byte[] readPartial(DeviceHandle, String itemId, long offset, int maxBytes)` and override
-`supportsPartialReads()` to return `true`.
+## How `readPartial` works on WPD
 
-- WPD already streams whole objects through an `IStream` in `getFile` (`IStream::Read`). Reuse that path:
-  open the object's default resource stream, `IStream::Seek(offset, STREAM_SEEK_SET)`, then read up to
-  `maxBytes`.
-- Match `NativeLibMTP.readPartial`'s contract exactly: return the bytes actually read — shorter than
-  `maxBytes` near end-of-object, empty at or past it.
-- **Payoff:** once this lands, the lazy channel, the `audio` attribute view, and *every* current and
-  future audio tag reader work on Windows with no further changes.
-- **Caveat:** confirm the resource `IStream` supports arbitrary `Seek` (`STGM`/seek capability). If a
-  device or stream does not, either fall back to reading-and-discarding up to `offset`, or leave
-  `supportsPartialReads()` device-conditional so the higher layers keep degrading gracefully.
+`WpdBackend.readPartial` issues the MTP **GetPartialObject** operation as a raw MTP command through
+`IPortableDevice::SendCommand` (the WPD MTP pass-through, `WPD_CATEGORY_MTP_EXT_VENDOR_OPERATIONS`).
+Each call is a bounded request→data→response transaction: initiate
+(`WPD_COMMAND_MTP_EXT_EXECUTE_COMMAND_WITH_DATA_TO_READ`), read the data phase in chunks
+(`…_READ_DATA`), then always close it (`…_END_DATA_TRANSFER`).
 
-### 2. Verify capability gating end-to-end on Windows
-With `readPartial` implemented, confirm on a real Windows host that:
-- `supportsPartialReads()` → `true` routes `newReadableByteChannel` to `MTPLazyReadChannel`, and
-- `Files.readAttributes(path, "audio:*")` returns embedded tags (currently null on Windows).
+- The MTP object handle is the hex after the `"o"` prefix of the WPD object-id string (the Microsoft
+  WpdMtp driver's id convention).
+- Opcode is probed on first use: standard `GetPartialObject` (0x101B, 32-bit offset), falling back to
+  the Android `GetPartialObject64` (0x95C1, 64-bit offset); the working opcode is cached. The AK100_II
+  uses 0x101B.
 
-Mirror the libmtp device tests in `MTPFileSystemIntegrationTest`: the `audioViewReadsUploaded*Tags`
-suite (uploads a known-tagged fixture per format and reads `audio:*` back — the same assertions should
-pass on WPD once `readPartial` lands), plus `partialReadPullsAudioHeaderWithoutTransferringWholeObject`.
+### Why *not* the resource `IStream`
+An earlier attempt reused `getFile`'s path — `IPortableDeviceResources::GetStream` + `IStream::Seek` +
+`Read`. That stream is a **whole-object** transfer (a full MTP `GetObject` data phase): reading only a
+prefix and releasing the stream leaves the device mid-transfer and **hard-wedges** it (it drops off the
+bus). Aborting with `IPortableDeviceContent::Cancel` avoided the disconnect but corrupted the MTP
+session, cascading `IOException`s into the *next* operations. `SendCommand`/`GetPartialObject` is the
+correct primitive because the transaction is bounded and self-completing — it is also what libmtp uses.
 
 ## Notes
 
 - The audio tag readers require **no** per-platform work — they operate on `RangedByteSource`, which any
-  backend satisfies through `readPartial`. All formats currently wired into `AudioTagReaders` (FLAC, MP3,
-  MP4/M4A, Ogg Vorbis, Opus, WAV) — and any added later — inherit Windows support for free once task 1 is
-  done.
+  backend satisfies through `readPartial`. All formats wired into `AudioTagReaders` (FLAC, MP3, MP4/M4A,
+  Ogg Vorbis, Opus, WAV) — and any added later — get Windows support for free.
 - Keep the status table current as new formats and features land.
