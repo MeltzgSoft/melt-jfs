@@ -844,15 +844,19 @@ class WpdBackend implements MtpBackend {
             throw new IOException("in-place edit exceeds SendPartialObject's 32-bit length: " + size);
         }
 
-        // Only rewrite in place when the new content is no larger than the object's current allocation.
-        // These devices reliably overwrite existing bytes and shrink (SendPartialObject + TruncateObject),
-        // but growing an object beyond its original size is unreliable: it either fails outright or writes
-        // the bytes yet leaves the reported size stale (observed on the AK100_II and the FiiO M11 Plus
-        // FAT32 SD card, while the FiiO internal storage grows correctly). Refusing a grow up front — before
-        // any edit command — leaves the object untouched so the caller (MTPDeviceBridge.writeFile) can fall
-        // back to delete + send.
+        // Only rewrite in place when the new content is provably no larger than the object's current
+        // size. These devices reliably overwrite existing bytes and shrink (SendPartialObject +
+        // TruncateObject), but growing an object beyond its original size is unreliable: it either fails
+        // outright or writes the bytes yet leaves the reported size stale (observed on the AK100_II and
+        // the FiiO M11 Plus FAT32 SD card, while the FiiO internal storage grows correctly). An unreadable
+        // current size is treated the same as a grow. Refusing up front — before any edit command —
+        // leaves the object untouched so the caller (MTPDeviceBridge.writeFile) can fall back to
+        // delete + send.
         long currentSize = objectSize(d, itemId);
-        if (currentSize >= 0 && size > currentSize) {
+        if (currentSize < 0) {
+            throw new IOException("cannot read the current size for an in-place edit: " + itemId);
+        }
+        if (size > currentSize) {
             throw new IOException("in-place grow unsupported (" + currentSize + " -> " + size + "): " + itemId);
         }
 
@@ -892,7 +896,7 @@ class WpdBackend implements MtpBackend {
             try {
                 var results = sendCommand(device, cmd, arena);
                 try {
-                    checkDriverHr(results, "GET_SUPPORTED_OPERATIONS");
+                    checkDriverHr(results, "GET_SUPPORTED_VENDOR_OPCODES");
                     var collOut = arena.allocate(ADDRESS);
                     int hr = call(results, VAL_GET_PVCOLL,
                         FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, ADDRESS),
