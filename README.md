@@ -92,14 +92,18 @@ The unit tests use a `FakeLibMTP` test double — no physical device and no nati
 ### Testing against a real device (local only)
 
 Integration tests live in a separate `integrationTest` source set and run via their own task, in a
-fresh JVM per test class (`forkEvery = 1`) so they never share `libmtp`/device state with the
-fake-backed unit tests. They require libmtp installed (see above) and the device connected, and skip
-automatically when no device is accessible. They are not part of `test`/`check`.
+fresh JVM per test class (`forkEvery = 1`) so they never share native-backend/device state with the
+fake-backed unit tests. They run against whichever backend the platform selects — libmtp on
+Linux/macOS (install it first, see above), WPD on Windows (nothing extra) — need the device
+connected, and skip automatically when no device is accessible. They are not part of `test`/`check`.
 
 ```bash
-# Connect the device, then release the USB interface from any OS-level MTP mount so libmtp can claim it:
+# Connect the device. On Linux/macOS, release the USB interface from any OS-level MTP mount so
+# libmtp can claim it:
 #   Linux — eject the device in your file manager (so GVFS lets go)
 #   macOS — quit Android File Transfer (or any app holding the device)
+# Windows needs no release step: WPD access is shared with the OS (the device just has to be
+# visible in File Explorer).
 ./gradlew integrationTest
 ```
 
@@ -109,6 +113,9 @@ automatically when no device is accessible. They are not part of `test`/`check`.
 ./gradlew browse            # full depth (one USB round-trip per directory)
 ./gradlew browse --args="2" # limit to 2 levels deep
 ```
+
+A second dev tool, `./gradlew growProbe`, probes what a connected device reports after growing an
+object in place (see `MTPGrowProbe` and the "Growing a file" section of `docs/windows-parity.md`).
 
 ## Project structure
 
@@ -133,6 +140,7 @@ src/
     types/                       # Value records
   dev/java/org/meltzg/fs/mtp/
     MTPBrowser.java              # CLI tree walker (not included in the published JAR)
+    MTPGrowProbe.java            # Diagnostic: what a device reports after an in-place grow
   test/java/org/meltzg/fs/mtp/
     FakeLibMTP.java              # In-memory MtpBackend test double (no native libs)
     MTPDeviceBridgeTest.java     # Unit tests using FakeLibMTP
