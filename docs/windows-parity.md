@@ -148,7 +148,9 @@ do not release only the device pointer on an open failure.
 This is the sharpest libmtp/WPD asymmetry in the codebase. `LIBMTP_Release_Device` closes a USB
 handle: no reference graph to get wrong, no driver-side session to strand. So the integration
 suite's per-test `MTPDeviceBridge.close()` + reopen — 50+ full device open/close cycles per storage —
-costs libmtp nothing while it was steadily poisoning the WPD driver. That churn is a useful leak
+does libmtp no harm while it was steadily poisoning the WPD driver. (It does cost libmtp wall-clock
+time — each reopen re-claims the USB interface and re-enumerates storages, the largest fixed cost of
+the Linux suite — but that is the price of the churn's diagnostic value.) That churn is a useful leak
 detector; prefer fixing what it exposes over reducing it.
 
 ## Resource ownership
