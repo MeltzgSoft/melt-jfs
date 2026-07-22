@@ -136,6 +136,11 @@ class WpdBackend implements MtpBackend {
 
     private static final int PORTABLE_DEVICE_DELETE_NO_RECURSION = 0;
 
+    // A busy device can fail the property reads that classify its functional objects, which would
+    // otherwise silently shorten the storage list. Retry the whole enumeration before giving up.
+    private static final int STORAGE_ENUM_ATTEMPTS = 3;
+    private static final long STORAGE_ENUM_RETRY_MILLIS = 250;
+
     private static final Pattern VID = Pattern.compile("vid_([0-9a-fA-F]{4})");
     private static final Pattern PID = Pattern.compile("pid_([0-9a-fA-F]{4})");
 
@@ -518,33 +523,58 @@ class WpdBackend implements MtpBackend {
         var cached = d.storages().get();
         if (cached != null) return cached;
 
-        var results = new ArrayList<StorageResult>();
-        boolean complete = true;
-        try {
-            for (String childId : enumChildren(d.content(), WPD_DEVICE_OBJECT_ID)) {
-                var values = getValues(d.properties(), childId, KEY_FUNCTIONAL_CATEGORY, KEY_NAME);
-                if (MemorySegment.NULL.equals(values)) {
-                    complete = false; // unreadable child: it may well have been a storage
-                    continue;
+        IOException lastFailure = null;
+        for (int attempt = 0; attempt < STORAGE_ENUM_ATTEMPTS; attempt++) {
+            if (attempt > 0) sleepQuietly(STORAGE_ENUM_RETRY_MILLIS);
+            try {
+                var results = enumerateStorages(d);
+                if (!results.isEmpty()) {
+                    d.storages().set(List.copyOf(results));
                 }
-                try (var arena = Arena.ofConfined()) {
-                    var guidBuf = arena.allocate(GUID_SIZE);
-                    if (getGuid(values, KEY_FUNCTIONAL_CATEGORY, guidBuf)
-                        && guidEquals(guidBuf, FUNCTIONAL_CATEGORY_STORAGE)) {
-                        var name = getString(values, KEY_NAME);
-                        results.add(new StorageResult(name.isEmpty() ? childId : name, childId));
-                    }
-                } finally {
-                    release(values);
-                }
+                return results;
+            } catch (IOException incomplete) {
+                lastFailure = incomplete;
             }
-        } catch (IOException e) {
-            throw new RuntimeException("Failed to list WPD storages", e);
         }
-        if (complete && !results.isEmpty()) {
-            d.storages().set(List.copyOf(results));
+        throw new RuntimeException("Failed to list WPD storages", lastFailure);
+    }
+
+    /**
+     * One complete pass over the device's functional objects, or an {@link IOException} if any of
+     * them could not be classified. Answering with the storages we *could* read would be worse than
+     * failing: the caller cannot tell a partial list from a real one, so a storage that momentarily
+     * failed a property read would simply cease to exist and every path under it would become a
+     * {@link java.nio.file.NoSuchFileException}. Observed on the FiiO M11 Plus while its Android
+     * media database was still rebuilding after a reboot.
+     */
+    private List<StorageResult> enumerateStorages(WpdDevice d) throws IOException {
+        var results = new ArrayList<StorageResult>();
+        for (String childId : enumChildren(d.content(), WPD_DEVICE_OBJECT_ID)) {
+            var values = getValues(d.properties(), childId, KEY_FUNCTIONAL_CATEGORY, KEY_NAME);
+            if (MemorySegment.NULL.equals(values)) {
+                throw new IOException("cannot read the functional category of device object "
+                    + childId + "; the storage list would be incomplete");
+            }
+            try (var arena = Arena.ofConfined()) {
+                var guidBuf = arena.allocate(GUID_SIZE);
+                if (getGuid(values, KEY_FUNCTIONAL_CATEGORY, guidBuf)
+                    && guidEquals(guidBuf, FUNCTIONAL_CATEGORY_STORAGE)) {
+                    var name = getString(values, KEY_NAME);
+                    results.add(new StorageResult(name.isEmpty() ? childId : name, childId));
+                }
+            } finally {
+                release(values);
+            }
         }
         return results;
+    }
+
+    private static void sleepQuietly(long millis) {
+        try {
+            Thread.sleep(millis);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
     }
 
     @Override

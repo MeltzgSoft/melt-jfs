@@ -274,14 +274,23 @@ public class MTPDeviceBridgeTombstoneTest {
     }
 
     @Test
-    public void freshCreateDoesNotRetryFailedSend() throws IOException {
-        backend.sendFailuresRemaining = Integer.MAX_VALUE;
+    public void freshCreateAlsoRetriesFailedSend() throws IOException {
+        // A device still rebuilding its media database rejects sends of names it has never seen,
+        // not just ones that reuse a just-deleted name, so a create that replaced nothing is worth
+        // retrying too. A permanently failing send still ends in an IOException, just later.
+        backend.sendFailuresRemaining = 2;
         var bridge = MTPDeviceBridge.getInstance();
         var local = Files.createTempFile("melt-jfs-tombstone", ".bin");
         try {
             Files.write(local, new byte[]{1});
-            assertThrows(IOException.class, () -> bridge.writeFile(id, "/Store/brand-new.bin", local));
-            assertEquals("a create that replaced nothing must not retry", 1, backend.sendCalls.get());
+            assertEquals("retry must carry a fresh create through a transient rejection",
+                "100", bridge.writeFile(id, "/Store/brand-new.bin", local));
+            assertEquals(3, backend.sendCalls.get());
+
+            backend.sendCalls.set(0);
+            backend.sendFailuresRemaining = Integer.MAX_VALUE;
+            assertThrows(IOException.class, () -> bridge.writeFile(id, "/Store/brand-new2.bin", local));
+            assertEquals("retries are bounded", 5, backend.sendCalls.get());
         } finally {
             Files.deleteIfExists(local);
         }

@@ -334,7 +334,7 @@ public enum MTPDeviceBridge implements Closeable {
                     }
                     long size = java.nio.file.Files.size(localFile);
                     return sendFileUnsafe(backend, conn, localFile, name, parentId,
-                        storage.storageId(), size, existing != null);
+                        storage.storageId(), size);
                 } finally {
                     invalidateListings();
                 }
@@ -741,19 +741,23 @@ public enum MTPDeviceBridge implements Closeable {
     }
 
     /**
-     * Uploads {@code localFile}, retrying briefly when this write replaced an existing file: a
-     * device with an asynchronous MTP database can reject a send that reuses a just-deleted
-     * filename until the delete propagates. A send that did not replace anything fails immediately.
+     * Uploads {@code localFile}, retrying briefly on failure.
+     *
+     * <p>This used to retry only when the write replaced an existing file, on the reasoning that the
+     * one transient failure worth waiting out was a device rejecting a send that reused a
+     * just-deleted filename. That was too narrow: a device whose media database is still rebuilding
+     * — after a reboot, say — rejects sends of names it has never seen either. Retrying regardless
+     * costs a doomed create the backoff schedule and nothing else, since a failed send cleans up the
+     * partial object it may have left behind, so every attempt starts from a clean slate.
      */
     private String sendFileUnsafe(MtpBackend backend, MTPDeviceConnection conn, java.nio.file.Path localFile,
-                                  String name, String parentId, String storageId, long size,
-                                  boolean replacedExisting) throws IOException {
+                                  String name, String parentId, String storageId, long size) throws IOException {
         int attempt = 0;
         while (true) {
             try {
                 return backend.sendFile(conn.handle(), localFile.toString(), name, parentId, storageId, size);
             } catch (IOException e) {
-                if (!replacedExisting || attempt >= SEND_RETRY_DELAYS_MILLIS.length) throw e;
+                if (attempt >= SEND_RETRY_DELAYS_MILLIS.length) throw e;
                 try {
                     Thread.sleep(SEND_RETRY_DELAYS_MILLIS[attempt++]);
                 } catch (InterruptedException interrupted) {
