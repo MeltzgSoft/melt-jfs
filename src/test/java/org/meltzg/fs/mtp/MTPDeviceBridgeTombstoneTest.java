@@ -129,6 +129,54 @@ public class MTPDeviceBridgeTombstoneTest {
     }
 
     @Test
+    public void inPlaceRewriteReportsTheWrittenSizeWhileTheDeviceReportsTheOldOne() throws IOException {
+        backend.objectEditing = true;
+        var bridge = MTPDeviceBridge.getInstance();
+        var local = Files.createTempFile("melt-jfs-tombstone", ".bin");
+        try {
+            Files.write(local, new byte[]{1, 2, 3, 4, 5, 6, 7, 8});
+            bridge.writeFile(id, "/Store/f1", local);
+
+            assertEquals("device is still reporting the pre-edit size",
+                0, backend.listedSize("2"));
+            assertEquals("resolved size must be the length actually written",
+                8, bridge.resolveItem(id, "/Store/f1").filesize());
+            assertEquals("listings must report it too", 8,
+                Arrays.stream(bridge.listChildren(id, "/Store"))
+                    .filter(i -> i.itemId().equals("2")).findFirst().orElseThrow().filesize());
+        } finally {
+            Files.deleteIfExists(local);
+        }
+    }
+
+    @Test
+    public void sizeOverlayIsDroppedOnceTheDeviceReportsTheNewSize() throws IOException {
+        backend.objectEditing = true;
+        var bridge = MTPDeviceBridge.getInstance();
+        var local = Files.createTempFile("melt-jfs-tombstone", ".bin");
+        try {
+            Files.write(local, new byte[]{1, 2, 3, 4, 5, 6, 7, 8});
+            bridge.writeFile(id, "/Store/f1", local);
+            assertEquals(8, bridge.resolveItem(id, "/Store/f1").filesize());
+
+            // The device catches up. This fetch sees it reporting the written length, which
+            // resolves the overlay.
+            backend.resizeEntry("2", 8);
+            bridge.createDirectory(id, "/Store/poke"); // mutation drops the listing cache
+            assertEquals(8, bridge.resolveItem(id, "/Store/f1").filesize());
+
+            // A later device-side change must now show through: a still-active overlay would pin
+            // the size to 8 and hide it.
+            backend.resizeEntry("2", 99);
+            bridge.createDirectory(id, "/Store/poke2");
+            assertEquals("resolved overlay must not outlive the device catching up",
+                99, bridge.resolveItem(id, "/Store/f1").filesize());
+        } finally {
+            Files.deleteIfExists(local);
+        }
+    }
+
+    @Test
     public void failedInPlaceEditFallsBackToDeleteAndSend() throws IOException {
         backend.objectEditing = true;
         backend.failEdits = true;
@@ -381,6 +429,25 @@ public class MTPDeviceBridgeTombstoneTest {
         void applyRenames() {
             pendingRenames.forEach(this::renameEntry);
             pendingRenames.clear();
+        }
+
+        /** The size this device reports for {@code itemId}, or -1 when it lists no such item. */
+        long listedSize(String itemId) {
+            return tree.values().stream().flatMap(List::stream)
+                .filter(i -> i.itemId().equals(itemId))
+                .mapToLong(MTPItemInfo::filesize).findFirst().orElse(-1);
+        }
+
+        /**
+         * Rewrites the size of {@code itemId} directly in the listings. Models a device catching up
+         * after an in-place edit: overwriteFile deliberately leaves the listed size alone, as the
+         * real devices do, so the bridge's overlay is what makes the new length visible until this.
+         */
+        void resizeEntry(String itemId, long size) {
+            tree.values().forEach(children -> children.replaceAll(c -> c.itemId().equals(itemId)
+                ? new MTPItemInfo(c.parentId(), c.itemId(), c.storageId(), c.isFile(),
+                    size, c.modificationDate(), c.filename())
+                : c));
         }
 
         /** Rewrites the filename of {@code itemId} directly in the listings (a device-side rename). */

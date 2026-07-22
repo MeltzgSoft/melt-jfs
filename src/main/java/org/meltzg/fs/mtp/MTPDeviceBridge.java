@@ -68,6 +68,17 @@ public enum MTPDeviceBridge implements Closeable {
     // Keyed per device; cleared when connections are torn down.
     private final Map<ItemKey, String> renameOverlays = new ConcurrentHashMap<>();
 
+    // Sizes the device has not caught up with after an in-place rewrite. Editing an object's bytes
+    // in place (BeginEditObject / TruncateObject / SendPartialObject / EndEditObject) reliably lands
+    // the new content — it reads back correctly through both a ranged read and a whole-object
+    // transfer — but several storages keep reporting the object's *previous* length afterwards
+    // (measured on three of the four storages across both test devices; see docs/windows-parity.md).
+    // A stale length is not cosmetic: it is what the attribute views and the read channel bound
+    // reads by, so an un-corrected short value truncates every subsequent read of a file that grew.
+    // The overlay reports the length actually written until the device agrees, then drops itself.
+    // Keyed per device; cleared when connections are torn down.
+    private final Map<ItemKey, Long> sizeOverlays = new ConcurrentHashMap<>();
+
     // Backoff schedule for re-sending a file whose same-named predecessor was just deleted; devices
     // with an asynchronous MTP database can reject the send until the delete propagates.
     private static final long[] SEND_RETRY_DELAYS_MILLIS = {250, 500, 1000, 2000};
@@ -307,6 +318,12 @@ public enum MTPDeviceBridge implements Closeable {
                         if (backend.supportsObjectEditing(conn.handle())) {
                             try {
                                 backend.overwriteFile(conn.handle(), existing.itemId(), localFile.toString());
+                                // Several devices keep reporting the object's previous length after an
+                                // in-place rewrite even though the new bytes are there; carry the length
+                                // we actually wrote until the device agrees, so reads of a file that grew
+                                // are not bounded by the old, shorter value.
+                                sizeOverlays.put(new ItemKey(conn.deviceId(), existing.itemId()),
+                                    java.nio.file.Files.size(localFile));
                                 return existing.itemId();
                             } catch (IOException editFailed) {
                                 // Fall through: delete the (possibly half-written) object and resend.
@@ -547,6 +564,7 @@ public enum MTPDeviceBridge implements Closeable {
         invalidateListings();
         tombstones.clear();
         renameOverlays.clear();
+        sizeOverlays.clear();
         lastSignature = Set.of();
         devicesDetected = false;
     }
@@ -631,8 +649,8 @@ public enum MTPDeviceBridge implements Closeable {
         if (cached != null && System.nanoTime() - cached.fetchedNanos() < LISTING_TTL_NANOS) {
             return cached.items();
         }
-        var items = reconcileRenames(key,
-            reconcileTombstones(key, backend().getChildItems(conn.handle(), storageId, parentId)));
+        var items = reconcileSizes(key, reconcileRenames(key,
+            reconcileTombstones(key, backend().getChildItems(conn.handle(), storageId, parentId))));
         listingCache.put(key, new ChildListing(items, System.nanoTime()));
         return items;
     }
@@ -646,6 +664,7 @@ public enum MTPDeviceBridge implements Closeable {
         var key = new ItemKey(conn.deviceId(), itemId);
         tombstones.put(key, new Tombstone(new ListingKey(conn.deviceId(), storageId, parentId), true));
         renameOverlays.remove(key); // a deleted id has no name left to overlay
+        sizeOverlays.remove(key);   // nor a size
     }
 
     /**
@@ -684,6 +703,27 @@ public enum MTPDeviceBridge implements Closeable {
      * per device, so the overlay applies wherever the item is listed — including a listing it was
      * simultaneously moved into, when a move combined relocation with a rename.
      */
+    /**
+     * Drops size overlays the device has caught up with (this listing already reports the item at
+     * the overlaid length), then rewrites the size of any still-overlaid item. Ids are unique per
+     * device, so the overlay applies wherever the item is listed.
+     */
+    private MTPItemInfo[] reconcileSizes(ListingKey key, MTPItemInfo[] items) {
+        if (sizeOverlays.isEmpty()) return items;
+        sizeOverlays.entrySet().removeIf(e -> e.getKey().deviceId().equals(key.deviceId())
+            && Arrays.stream(items).anyMatch(i -> i.itemId().equals(e.getKey().itemId())
+                && i.filesize() == e.getValue()));
+        if (sizeOverlays.isEmpty()) return items;
+        return Arrays.stream(items)
+            .map(i -> {
+                var size = sizeOverlays.get(new ItemKey(key.deviceId(), i.itemId()));
+                return size == null ? i
+                    : new MTPItemInfo(i.parentId(), i.itemId(), i.storageId(), i.isFile(),
+                        size, i.modificationDate(), i.filename());
+            })
+            .toArray(MTPItemInfo[]::new);
+    }
+
     private MTPItemInfo[] reconcileRenames(ListingKey key, MTPItemInfo[] items) {
         if (renameOverlays.isEmpty()) return items;
         renameOverlays.entrySet().removeIf(e -> e.getKey().deviceId().equals(key.deviceId())
