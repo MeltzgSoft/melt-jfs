@@ -26,8 +26,10 @@ public enum MTPDeviceBridge implements Closeable {
     // How long a cached directory listing is trusted before the device is re-queried. Keeps a
     // full walk fast (every path is re-resolved from the storage root, so the same parents are
     // listed repeatedly within milliseconds) while still letting out-of-band changes on the
-    // device surface within a couple of seconds.
-    private static final long LISTING_TTL_NANOS = TimeUnit.SECONDS.toNanos(2);
+    // device surface within a couple of seconds. Mutations made through this bridge never wait
+    // for expiry: they patch the cached listings they affect (see the listing*Unsafe helpers).
+    // Non-final so tests can shrink the window to exercise the fetch-reconciliation path.
+    static volatile long listingTtlNanos = TimeUnit.SECONDS.toNanos(2);
 
     private ReentrantReadWriteLock connectionLock;
     private Map<MTPDeviceIdentifier, MTPDeviceInfo> deviceInfo;
@@ -39,7 +41,11 @@ public enum MTPDeviceBridge implements Closeable {
     // Short-lived cache of directory listings, scoped to the currently-open connections. Without
     // it, walking a tree of N nodes at depth D issues O(N*D) USB listings because every path is
     // re-resolved from the storage root; with it, each directory is listed at most once per TTL
-    // window. Cleared on any mutation and whenever the open connections are torn down.
+    // window. Mutations made through this bridge keep it consistent with copy-on-write patches
+    // instead of dropping it — refetching is expensive where it matters most (libmtp's uncached
+    // enumeration pays one GetObjectInfo round-trip per entry, so re-listing a large directory
+    // after every mutation dominates bulk operations). It is dropped wholesale only when a
+    // mutation fails (the device's state is no longer known) and when connections are torn down.
     private final Map<ListingKey, ChildListing> listingCache = new ConcurrentHashMap<>();
 
     private record ListingKey(MTPDeviceIdentifier deviceId, String storageId, String parentId) {}
@@ -234,20 +240,25 @@ public enum MTPDeviceBridge implements Closeable {
             }
             var conn = requireConnection(deviceId);
             synchronized (conn) {
-                try {
-                    var backend = backend();
-                    var storage = backend.findStorage(conn.handle(), parts[0]);
-                    if (storage == null) throw new NoSuchFileException("/" + parts[0]);
-                    String parentId = MtpBackend.ROOT_PARENT;
-                    if (parts.length > 2) {
-                        var parentParts = Arrays.copyOf(parts, parts.length - 1);
-                        var parentItem = resolveItemUnsafe(conn, parentParts);
-                        parentId = parentItem.itemId();
-                    }
-                    backend.createFolder(conn.handle(), parts[parts.length - 1], parentId, storage.storageId());
-                } finally {
-                    invalidateListings();
+                var backend = backend();
+                var storage = backend.findStorage(conn.handle(), parts[0]);
+                if (storage == null) throw new NoSuchFileException("/" + parts[0]);
+                String parentId = MtpBackend.ROOT_PARENT;
+                if (parts.length > 2) {
+                    var parentParts = Arrays.copyOf(parts, parts.length - 1);
+                    var parentItem = resolveItemUnsafe(conn, parentParts);
+                    parentId = parentItem.itemId();
                 }
+                var name = parts[parts.length - 1];
+                String folderId;
+                try {
+                    folderId = backend.createFolder(conn.handle(), name, parentId, storage.storageId());
+                } catch (IOException | RuntimeException e) {
+                    invalidateListings(); // the device's state is unknown after a failed mutation
+                    throw e;
+                }
+                listingAddUnsafe(conn, new MTPItemInfo(parentId, folderId, storage.storageId(),
+                    false, 0, nowEpochSeconds(), name));
             }
         } finally {
             connectionLock.readLock().unlock();
@@ -260,19 +271,21 @@ public enum MTPDeviceBridge implements Closeable {
             var parts = pathParts(path);
             var conn = requireConnection(deviceId);
             synchronized (conn) {
+                var item = resolveItemUnsafe(conn, parts);
+                if (item == null) throw new NoSuchFileException(path);
                 try {
-                    var item = resolveItemUnsafe(conn, parts);
-                    if (item == null) throw new NoSuchFileException(path);
                     backend().deleteObject(conn.handle(), item.itemId());
-                    if (parts.length >= 2) {
-                        // The containing listing was keyed with ROOT_PARENT for storage-root
-                        // children (the device-reported parent_id is unreliable there).
-                        var parentId = parts.length == 2 ? MtpBackend.ROOT_PARENT : item.parentId();
-                        tombstoneUnsafe(conn, item.itemId(), item.storageId(), parentId);
-                    }
-                } finally {
-                    invalidateListings();
+                } catch (IOException | RuntimeException e) {
+                    invalidateListings(); // the device's state is unknown after a failed mutation
+                    throw e;
                 }
+                if (parts.length >= 2) {
+                    // The containing listing was keyed with ROOT_PARENT for storage-root
+                    // children (the device-reported parent_id is unreliable there).
+                    var parentId = parts.length == 2 ? MtpBackend.ROOT_PARENT : item.parentId();
+                    tombstoneUnsafe(conn, item.itemId(), item.storageId(), parentId);
+                }
+                listingRemoveUnsafe(conn, item.itemId());
             }
         } finally {
             connectionLock.readLock().unlock();
@@ -293,25 +306,26 @@ public enum MTPDeviceBridge implements Closeable {
             }
             var conn = requireConnection(deviceId);
             synchronized (conn) {
-                try {
-                    var backend = backend();
-                    var storage = backend.findStorage(conn.handle(), parts[0]);
-                    if (storage == null) throw new NoSuchFileException("/" + parts[0]);
-                    String parentId = MtpBackend.ROOT_PARENT;
-                    if (parts.length > 2) {
-                        var parentParts = Arrays.copyOf(parts, parts.length - 1);
-                        var parentItem = resolveItemUnsafe(conn, parentParts);
-                        if (parentItem.isFile()) {
-                            throw new NotDirectoryException("/" + String.join("/", parentParts));
-                        }
-                        parentId = parentItem.itemId();
+                var backend = backend();
+                var storage = backend.findStorage(conn.handle(), parts[0]);
+                if (storage == null) throw new NoSuchFileException("/" + parts[0]);
+                String parentId = MtpBackend.ROOT_PARENT;
+                if (parts.length > 2) {
+                    var parentParts = Arrays.copyOf(parts, parts.length - 1);
+                    var parentItem = resolveItemUnsafe(conn, parentParts);
+                    if (parentItem.isFile()) {
+                        throw new NotDirectoryException("/" + String.join("/", parentParts));
                     }
-                    var name = parts[parts.length - 1];
-                    var existing = findChildUnsafe(conn, storage.storageId(), parentId, name);
+                    parentId = parentItem.itemId();
+                }
+                var name = parts[parts.length - 1];
+                var existing = findChildUnsafe(conn, storage.storageId(), parentId, name);
+                if (existing != null && !existing.isFile()) {
+                    throw new IOException("Target exists and is a directory: " + path);
+                }
+                try {
+                    long size = java.nio.file.Files.size(localFile);
                     if (existing != null) {
-                        if (!existing.isFile()) {
-                            throw new IOException("Target exists and is a directory: " + path);
-                        }
                         // Rewrite the existing object in place when the device supports it: the id
                         // and name never change, so this cannot trip the asynchronous-delete window
                         // that makes a delete + same-name send fail (see the tombstones field).
@@ -322,8 +336,10 @@ public enum MTPDeviceBridge implements Closeable {
                                 // in-place rewrite even though the new bytes are there; carry the length
                                 // we actually wrote until the device agrees, so reads of a file that grew
                                 // are not bounded by the old, shorter value.
-                                sizeOverlays.put(new ItemKey(conn.deviceId(), existing.itemId()),
-                                    java.nio.file.Files.size(localFile));
+                                sizeOverlays.put(new ItemKey(conn.deviceId(), existing.itemId()), size);
+                                listingPatchUnsafe(conn, existing.itemId(),
+                                    i -> new MTPItemInfo(i.parentId(), i.itemId(), i.storageId(),
+                                        i.isFile(), size, i.modificationDate(), i.filename()));
                                 return existing.itemId();
                             } catch (IOException editFailed) {
                                 // Fall through: delete the (possibly half-written) object and resend.
@@ -331,12 +347,16 @@ public enum MTPDeviceBridge implements Closeable {
                         }
                         backend.deleteObject(conn.handle(), existing.itemId());
                         tombstoneUnsafe(conn, existing.itemId(), storage.storageId(), parentId);
+                        listingRemoveUnsafe(conn, existing.itemId());
                     }
-                    long size = java.nio.file.Files.size(localFile);
-                    return sendFileUnsafe(backend, conn, localFile, name, parentId,
+                    var newId = sendFileUnsafe(backend, conn, localFile, name, parentId,
                         storage.storageId(), size);
-                } finally {
-                    invalidateListings();
+                    listingAddUnsafe(conn, new MTPItemInfo(parentId, newId, storage.storageId(),
+                        true, size, nowEpochSeconds(), name));
+                    return newId;
+                } catch (IOException | RuntimeException e) {
+                    invalidateListings(); // the device's state is unknown after a failed mutation
+                    throw e;
                 }
             }
         } finally {
@@ -409,25 +429,32 @@ public enum MTPDeviceBridge implements Closeable {
                     if (existingTgt != null) {
                         backend.deleteObject(conn.handle(), existingTgt.itemId());
                         tombstoneUnsafe(conn, existingTgt.itemId(), tgtStorage.storageId(), tgtParentId);
+                        listingRemoveUnsafe(conn, existingTgt.itemId());
                     }
                     if (!sameDirectory) {
                         backend.moveObject(conn.handle(), source.itemId(), tgtStorage.storageId(), tgtParentId);
                         // A stale listing of the folder the object left may keep showing it there.
                         var srcParentId = srcParts.length == 2 ? MtpBackend.ROOT_PARENT : source.parentId();
                         tombstoneMovedUnsafe(conn, source.itemId(), source.storageId(), srcParentId);
+                        listingRemoveUnsafe(conn, source.itemId());
+                        listingAddUnsafe(conn, new MTPItemInfo(tgtParentId, source.itemId(),
+                            tgtStorage.storageId(), source.isFile(), source.filesize(),
+                            source.modificationDate(), source.filename()));
                     }
                     if (!source.filename().equals(tgtName)) {
                         backend.setFileName(conn.handle(), source.itemId(), tgtName);
                         // Stale listings may keep reporting the old filename until the device's
                         // database catches up; overlay the new name by id until it does.
                         renameOverlays.put(new ItemKey(conn.deviceId(), source.itemId()), tgtName);
+                        listingPatchUnsafe(conn, source.itemId(),
+                            i -> new MTPItemInfo(i.parentId(), i.itemId(), i.storageId(),
+                                i.isFile(), i.filesize(), i.modificationDate(), tgtName));
                     }
                 } catch (IOException nativeError) {
+                    invalidateListings(); // a partially applied native move: refetch rather than guess
                     // Many devices do not implement MoveObject/SetObjectName; let the caller emulate.
                     throw new MTPOperationUnsupportedException(
                         "Native move failed for " + sourcePath + " -> " + targetPath, nativeError);
-                } finally {
-                    invalidateListings();
                 }
             }
         } finally {
@@ -646,7 +673,7 @@ public enum MTPDeviceBridge implements Closeable {
     private MTPItemInfo[] cachedChildItems(MTPDeviceConnection conn, String storageId, String parentId) throws IOException {
         var key = new ListingKey(conn.deviceId(), storageId, parentId);
         var cached = listingCache.get(key);
-        if (cached != null && System.nanoTime() - cached.fetchedNanos() < LISTING_TTL_NANOS) {
+        if (cached != null && System.nanoTime() - cached.fetchedNanos() < listingTtlNanos) {
             return cached.items();
         }
         var items = reconcileSizes(key, reconcileRenames(key,
@@ -769,7 +796,78 @@ public enum MTPDeviceBridge implements Closeable {
         }
     }
 
-    /** Drops every cached listing. Called after any mutation and when connections are torn down. */
+    /**
+     * Reflects a newly created object (folder, sent file, or move destination) in the cached
+     * listing of its parent, when one is cached. A synthesized entry's modification date is
+     * provisional; the device's own value replaces it the next time the listing is fetched.
+     * Callers must hold the read lock and the connection monitor.
+     */
+    private void listingAddUnsafe(MTPDeviceConnection conn, MTPItemInfo item) {
+        // The device handing this id out means a dead-everywhere tombstone for it is obsolete
+        // (id reuse after a delete); a scoped moved-away tombstone still guards the listing the
+        // object left, so it stays.
+        tombstones.computeIfPresent(new ItemKey(conn.deviceId(), item.itemId()),
+            (k, t) -> t.everywhere() ? null : t);
+        listingCache.computeIfPresent(
+            new ListingKey(conn.deviceId(), item.storageId(), item.parentId()),
+            (k, listing) -> {
+                var items = Arrays.copyOf(listing.items(), listing.items().length + 1);
+                items[items.length - 1] = item;
+                return new ChildListing(items, listing.fetchedNanos());
+            });
+    }
+
+    /**
+     * Drops {@code itemId} from every cached listing of {@code conn}'s device (deletes make the id
+     * dead everywhere; moves are followed by a {@link #listingAddUnsafe} at the destination), and
+     * conservatively drops the cached listing of the object's own children. Callers must hold the
+     * read lock and the connection monitor.
+     */
+    private void listingRemoveUnsafe(MTPDeviceConnection conn, String itemId) {
+        listingCache.keySet().removeIf(k ->
+            k.deviceId().equals(conn.deviceId()) && k.parentId().equals(itemId));
+        listingCache.replaceAll((k, listing) -> {
+            if (!k.deviceId().equals(conn.deviceId())
+                    || Arrays.stream(listing.items()).noneMatch(i -> i.itemId().equals(itemId))) {
+                return listing;
+            }
+            return new ChildListing(
+                Arrays.stream(listing.items())
+                    .filter(i -> !i.itemId().equals(itemId))
+                    .toArray(MTPItemInfo[]::new),
+                listing.fetchedNanos());
+        });
+    }
+
+    /**
+     * Rewrites every cached entry for {@code itemId} through {@code patch} (copy-on-write), used to
+     * reflect a rename or an in-place resize without refetching. Callers must hold the read lock
+     * and the connection monitor.
+     */
+    private void listingPatchUnsafe(MTPDeviceConnection conn, String itemId,
+                                    java.util.function.UnaryOperator<MTPItemInfo> patch) {
+        listingCache.replaceAll((k, listing) -> {
+            if (!k.deviceId().equals(conn.deviceId())
+                    || Arrays.stream(listing.items()).noneMatch(i -> i.itemId().equals(itemId))) {
+                return listing;
+            }
+            return new ChildListing(
+                Arrays.stream(listing.items())
+                    .map(i -> i.itemId().equals(itemId) ? patch.apply(i) : i)
+                    .toArray(MTPItemInfo[]::new),
+                listing.fetchedNanos());
+        });
+    }
+
+    /** Provisional modification date for a just-created entry, in the backends' epoch-second unit. */
+    private static long nowEpochSeconds() {
+        return System.currentTimeMillis() / 1000;
+    }
+
+    /**
+     * Drops every cached listing. Called when a mutation fails (the device's state is no longer
+     * known, so patching would guess) and when connections are torn down.
+     */
     private void invalidateListings() {
         listingCache.clear();
     }
