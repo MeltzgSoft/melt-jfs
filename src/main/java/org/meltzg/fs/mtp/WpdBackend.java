@@ -17,6 +17,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Locale;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -255,9 +256,16 @@ class WpdBackend implements MtpBackend {
     // cached "no" would silently disable the in-place path for a different device that does support it.)
     private volatile int partialReadOpcode = 0;
 
-    /** Live WPD handle: the device plus its content and properties interfaces. */
-    private record WpdDevice(MemorySegment device, MemorySegment content, MemorySegment properties)
-        implements DeviceHandle {}
+    /**
+     * Live WPD handle: the device plus its content and properties interfaces, and the storage list
+     * enumerated on first use (see {@link #listStorages}).
+     */
+    private record WpdDevice(MemorySegment device, MemorySegment content, MemorySegment properties,
+                             AtomicReference<List<StorageResult>> storages) implements DeviceHandle {
+        WpdDevice(MemorySegment device, MemorySegment content, MemorySegment properties) {
+            this(device, content, properties, new AtomicReference<>());
+        }
+    }
 
     private static WpdDevice dev(DeviceHandle handle) {
         return (WpdDevice) handle;
@@ -339,35 +347,40 @@ class WpdBackend implements MtpBackend {
 
     private OpenedDevice openDevice(MemorySegment manager, String deviceId) throws IOException {
         var device = createInstance(CLSID_DEVICE_FTM, IID_DEVICE, "create PortableDevice");
+        var content = MemorySegment.NULL;
+        var props = MemorySegment.NULL;
+        boolean handedOff = false;
         try (var arena = Arena.ofConfined()) {
             var clientInfo = createInstance(CLSID_VALUES, IID_VALUES, "create client info");
-            // WPD generates the per-connection client context from these during Open; some device
-            // operations (notably object creation) misbehave when the version fields are absent.
-            call(clientInfo, VAL_SET_STRING, FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, ADDRESS),
-                KEY_CLIENT_NAME, wstr(arena, "melt-jfs"));
-            call(clientInfo, VAL_SET_U4, FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, JAVA_INT), KEY_CLIENT_MAJOR_VERSION, 1);
-            call(clientInfo, VAL_SET_U4, FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, JAVA_INT), KEY_CLIENT_MINOR_VERSION, 0);
-            call(clientInfo, VAL_SET_U4, FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, JAVA_INT), KEY_CLIENT_REVISION, 0);
-            var idW = wstr(arena, deviceId);
-            int hr = call(device, DEV_OPEN, FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, ADDRESS), idW, clientInfo);
-            release(clientInfo);
-            checkHr(hr, "IPortableDevice::Open");
+            try {
+                // WPD generates the per-connection client context from these during Open; some device
+                // operations (notably object creation) misbehave when the version fields are absent.
+                call(clientInfo, VAL_SET_STRING, FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, ADDRESS),
+                    KEY_CLIENT_NAME, wstr(arena, "melt-jfs"));
+                call(clientInfo, VAL_SET_U4, FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, JAVA_INT), KEY_CLIENT_MAJOR_VERSION, 1);
+                call(clientInfo, VAL_SET_U4, FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, JAVA_INT), KEY_CLIENT_MINOR_VERSION, 0);
+                call(clientInfo, VAL_SET_U4, FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, JAVA_INT), KEY_CLIENT_REVISION, 0);
+                var idW = wstr(arena, deviceId);
+                checkHr(call(device, DEV_OPEN, FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, ADDRESS), idW, clientInfo),
+                    "IPortableDevice::Open");
+            } finally {
+                release(clientInfo);
+            }
 
             var contentOut = arena.allocate(ADDRESS);
             checkHr(call(device, DEV_CONTENT, FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS), contentOut),
                 "IPortableDevice::Content");
-            var content = contentOut.get(ADDRESS, 0);
+            content = contentOut.get(ADDRESS, 0);
 
             var propsOut = arena.allocate(ADDRESS);
             checkHr(call(content, CONTENT_PROPERTIES, FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS), propsOut),
                 "IPortableDeviceContent::Properties");
-            var props = propsOut.get(ADDRESS, 0);
+            props = propsOut.get(ADDRESS, 0);
 
             // WPD enumerates every portable device (PTP cameras, mass-storage, phones in other modes),
             // not just MTP ones. Skip anything that isn't MTP so callers only ever see usable devices.
             if (!isMtpDevice(props)) {
-                releaseDevice(new WpdDevice(device, content, props));
-                return null;
+                return null; // the finally below closes it
             }
 
             var friendly = deviceStringProp(manager, deviceId, MGR_FRIENDLY_NAME, arena);
@@ -376,11 +389,19 @@ class WpdBackend implements MtpBackend {
 
             var id = parseIdentifier(deviceId, deviceSerialNumber(props));
             var info = new MTPDeviceInfo(id, friendly, description, manufacturer, 0, 0);
-            return new OpenedDevice(id, info, new WpdDevice(device, content, props));
+            var opened = new OpenedDevice(id, info, new WpdDevice(device, content, props));
+            handedOff = true;
+            return opened;
         } catch (Throwable t) {
-            release(device);
             if (t instanceof IOException io) throw io;
             throw new IOException("Failed to open WPD device " + deviceId, t);
+        } finally {
+            // Unless the caller took ownership, close everything we got. Releasing only the device —
+            // as this used to — strands the content and properties interfaces, and each stranded
+            // interface pins the driver's session for this client for the life of the process.
+            if (!handedOff) {
+                closeInterfaces(device, content, props);
+            }
         }
     }
 
@@ -448,26 +469,64 @@ class WpdBackend implements MtpBackend {
     @Override
     public void releaseDevice(DeviceHandle handle) {
         var d = dev(handle);
+        closeInterfaces(d.device(), d.content(), d.properties());
+    }
+
+    /**
+     * Tears an open device down in the order WPD requires: every interface obtained <em>from</em> the
+     * device is released before {@code IPortableDevice::Close}.
+     *
+     * <p>{@code IPortableDeviceContent} and {@code IPortableDeviceProperties} hold references back
+     * into the driver's per-client session, so closing while they are still outstanding leaves that
+     * session pinned rather than torn down. Each such leak is permanent, and once enough of them
+     * accumulate the driver stops handing the device out at all — {@code IPortableDevice::Open} then
+     * blocks indefinitely, with no timeout, wedging every client of that device including Explorer.
+     * The libmtp backend has no equivalent exposure: {@code LIBMTP_Release_Device} closes a USB
+     * handle, with no reference graph and no driver-side session to strand.
+     *
+     * <p>Safe on NULL pointers, so it doubles as the failure-path cleanup for a partially opened device.
+     */
+    private static void closeInterfaces(MemorySegment device, MemorySegment content, MemorySegment properties) {
+        release(properties);
+        release(content);
+        if (device == null || MemorySegment.NULL.equals(device)) return;
         try {
-            call(d.device(), DEV_CLOSE, FunctionDescriptor.of(JAVA_INT, ADDRESS));
+            call(device, DEV_CLOSE, FunctionDescriptor.of(JAVA_INT, ADDRESS));
         } catch (RuntimeException ignored) {
-            // Closing is best-effort; still release the interface pointers below.
+            // Closing is best-effort; still release the interface pointer below.
         }
-        release(d.properties());
-        release(d.content());
-        release(d.device());
+        release(device);
     }
 
     // ---- storage ----
 
+    /**
+     * The device's storages, enumerated once per open device and then reused. Every path resolution
+     * asks for this, and on WPD each enumeration is a round trip to the device — one that can fail or
+     * come back short while the device is busy, which would make a storage briefly cease to exist and
+     * turn any path under it into a {@link java.nio.file.NoSuchFileException}. libmtp is not exposed to
+     * that: it serves the storage list from state captured when the device was opened. Caching here
+     * gives the same guarantee, and the bridge reopens devices when it rescans, so a storage that is
+     * genuinely added or removed is still picked up.
+     *
+     * <p>Only a complete enumeration is cached, so a partial result from a busy device cannot be
+     * frozen in for the life of the connection.
+     */
     @Override
     public List<StorageResult> listStorages(DeviceHandle handle) {
         var d = dev(handle);
+        var cached = d.storages().get();
+        if (cached != null) return cached;
+
         var results = new ArrayList<StorageResult>();
+        boolean complete = true;
         try {
             for (String childId : enumChildren(d.content(), WPD_DEVICE_OBJECT_ID)) {
                 var values = getValues(d.properties(), childId, KEY_FUNCTIONAL_CATEGORY, KEY_NAME);
-                if (MemorySegment.NULL.equals(values)) continue;
+                if (MemorySegment.NULL.equals(values)) {
+                    complete = false; // unreadable child: it may well have been a storage
+                    continue;
+                }
                 try (var arena = Arena.ofConfined()) {
                     var guidBuf = arena.allocate(GUID_SIZE);
                     if (getGuid(values, KEY_FUNCTIONAL_CATEGORY, guidBuf)
@@ -481,6 +540,9 @@ class WpdBackend implements MtpBackend {
             }
         } catch (IOException e) {
             throw new RuntimeException("Failed to list WPD storages", e);
+        }
+        if (complete && !results.isEmpty()) {
+            d.storages().set(List.copyOf(results));
         }
         return results;
     }
@@ -640,7 +702,7 @@ class WpdBackend implements MtpBackend {
                         wstr(arena, itemId), KEY_RESOURCE_DEFAULT, STGM_READ, optBuf, streamOut),
                     "IPortableDeviceResources::GetStream");
                 var stream = streamOut.get(ADDRESS, 0);
-                int bufSize = Math.max(optBuf.get(JAVA_INT, 0), 1 << 16);
+                int bufSize = transferBufferSize(optBuf.get(JAVA_INT, 0));
                 try (var out = Files.newOutputStream(Path.of(destPath))) {
                     copyStreamToFile(stream, out, bufSize);
                 } finally {
@@ -832,6 +894,16 @@ class WpdBackend implements MtpBackend {
      * and name, so this never trips the asynchronous-delete window that makes a delete + same-name
      * re-create fail on some devices. The edit session is always closed (EndEditObject) even when a phase
      * fails, so the device is never left mid-edit.
+     *
+     * <p><b>Grows are included.</b> An earlier version refused to grow an object in place, on the
+     * theory that the grow half-landed and left whole-object reads truncated. Measurement (the
+     * {@code growProbe} dev task) disproved that on every storage of both test devices: the edit
+     * always lands and the full new content reads back correctly through both {@code GetPartialObject}
+     * and a whole-object transfer. What is unreliable is only the device's reported
+     * {@code WPD_OBJECT_SIZE}, which stays at the old value on three of the four storages — a metadata
+     * problem the caller compensates for (see the size overlays in {@code MTPDeviceBridge}), not a
+     * reason to fall back. The fallback was worse than the problem: delete + re-create under the same
+     * name races the asynchronous-delete window on exactly the devices this path exists to protect.
      */
     @Override
     public void overwriteFile(DeviceHandle handle, String itemId, String localPath) throws IOException {
@@ -844,28 +916,12 @@ class WpdBackend implements MtpBackend {
             throw new IOException("in-place edit exceeds SendPartialObject's 32-bit length: " + size);
         }
 
-        // Only rewrite in place when the new content is provably no larger than the object's current
-        // size. These devices reliably overwrite existing bytes and shrink (SendPartialObject +
-        // TruncateObject), but growing an object beyond its original size is unreliable: it either fails
-        // outright or writes the bytes yet leaves the reported size stale (observed on the AK100_II and
-        // the FiiO M11 Plus FAT32 SD card, while the FiiO internal storage grows correctly). An unreadable
-        // current size is treated the same as a grow. Refusing up front — before any edit command —
-        // leaves the object untouched so the caller (MTPDeviceBridge.writeFile) can fall back to
-        // delete + send.
-        long currentSize = objectSize(d, itemId);
-        if (currentSize < 0) {
-            throw new IOException("cannot read the current size for an in-place edit: " + itemId);
-        }
-        if (size > currentSize) {
-            throw new IOException("in-place grow unsupported (" + currentSize + " -> " + size + "): " + itemId);
-        }
-
         checkMtpResponse(executeWithoutData(device, OP_BEGIN_EDIT_OBJECT, (int) objectHandle),
             "BeginEditObject");
         try {
             // Truncate to zero, then stream the whole file from offset 0 (matching the libmtp backend):
-            // SendPartialObject only extends when writing from the object's current end, so it must start
-            // from an emptied object; the old tail beyond the new (never-larger) length is dropped.
+            // SendPartialObject only extends when writing from the object's current end, so it must
+            // start from an emptied object; whatever the object held before is dropped.
             checkMtpResponse(executeWithoutData(device, OP_TRUNCATE_OBJECT, (int) objectHandle, 0, 0),
                 "TruncateObject");
             if (size > 0) {
@@ -875,17 +931,6 @@ class WpdBackend implements MtpBackend {
             }
         } finally {
             executeWithoutData(device, OP_END_EDIT_OBJECT, (int) objectHandle); // best-effort close
-        }
-    }
-
-    /** The device-reported size of {@code itemId}, or -1 when it cannot be read. */
-    private long objectSize(WpdDevice d, String itemId) {
-        var values = getValues(d.properties(), itemId, KEY_OBJECT_SIZE);
-        if (MemorySegment.NULL.equals(values)) return -1;
-        try {
-            return getU8(values, KEY_OBJECT_SIZE);
-        } finally {
-            release(values);
         }
     }
 
@@ -1165,8 +1210,9 @@ class WpdBackend implements MtpBackend {
         var d = dev(handle);
         String parent = parentId.equals(ROOT_PARENT) ? storageId : parentId;
         try (var arena = Arena.ofConfined()) {
-            var values = createInstance(CLSID_VALUES, IID_VALUES, "create object properties");
             MemorySegment stream;
+            int bufSize;
+            var values = createInstance(CLSID_VALUES, IID_VALUES, "create object properties");
             try {
                 setString(values, KEY_PARENT_ID, wstr(arena, parent));
                 setString(values, KEY_NAME, wstr(arena, filename));
@@ -1191,21 +1237,62 @@ class WpdBackend implements MtpBackend {
                         values, streamOut, optBuf, MemorySegment.NULL),
                     "CreateObjectWithPropertiesAndData");
                 stream = streamOut.get(ADDRESS, 0);
-                int bufSize = Math.max(optBuf.get(JAVA_INT, 0), 1 << 16);
-                try (var in = Files.newInputStream(Path.of(localPath))) {
-                    copyFileToStream(in, stream, bufSize);
-                }
+                bufSize = transferBufferSize(optBuf.get(JAVA_INT, 0));
             } finally {
                 release(values);
             }
+
+            // From here the device is mid-SendObject: the stream must be released on every path,
+            // and a stream abandoned mid-transfer wedges the MTP session for every later request
+            // (the same hazard documented for ranged reads in docs/windows-parity.md). The libmtp
+            // backend has no equivalent exposure — LIBMTP_Send_File_From_File owns the whole
+            // transaction and unwinds it itself.
+            boolean committed = false;
             try {
+                try (var in = Files.newInputStream(Path.of(localPath))) {
+                    copyFileToStream(in, stream, bufSize);
+                }
                 checkHr(call(stream, STREAM_COMMIT, FunctionDescriptor.of(JAVA_INT, ADDRESS, JAVA_INT), 0),
                     "IStream::Commit");
+                committed = true;
                 return readNewObjectId(stream);
             } finally {
+                // CreateObjectWithPropertiesAndData already sent SendObjectInfo, so a failed transfer
+                // can leave a partial object holding this filename. Read its id before releasing the
+                // stream, then delete it, so a caller's retry re-creates the name from scratch instead
+                // of colliding with the wreckage of the previous attempt.
+                //
+                // Every step here is best-effort and must not stop the release: this runs while the
+                // send is already failing, so asking a broken stream for its object id can itself
+                // fail, and letting that escape would both mask the real error and leak the stream —
+                // leaving the device mid-SendObject, the exact state this block exists to prevent.
+                String partialId = "";
+                if (!committed) {
+                    try {
+                        partialId = readNewObjectId(stream);
+                    } catch (RuntimeException unusableStream) {
+                        partialId = "";
+                    }
+                }
                 release(stream);
+                if (!partialId.isEmpty()) {
+                    try {
+                        deleteObject(handle, partialId);
+                    } catch (IOException | RuntimeException ignored) {
+                        // The send already failed; that error is the one worth reporting.
+                    }
+                }
             }
         }
+    }
+
+    /**
+     * The chunk size to use against a WPD object stream. WPD reports the driver's optimal transfer
+     * buffer size and expects writes of at most that much; only when it reports nothing do we pick a
+     * size ourselves.
+     */
+    private static int transferBufferSize(int driverOptimal) {
+        return driverOptimal > 0 ? driverOptimal : 1 << 16;
     }
 
     @Override
@@ -1264,10 +1351,15 @@ class WpdBackend implements MtpBackend {
                 var fetched = arena.allocate(JAVA_INT);
                 var arr = arena.allocate(ADDRESS.byteSize() * batch);
                 while (true) {
+                    fetched.set(JAVA_INT, 0, 0);
                     int hr = call(enumObj, ENUM_NEXT,
                         FunctionDescriptor.of(JAVA_INT, ADDRESS, JAVA_INT, ADDRESS, ADDRESS),
                         batch, arr, fetched);
-                    if (failed(hr)) break;
+                    // A failed Next must not be mistaken for the end of the list: reporting the
+                    // ids gathered so far would silently hand back a truncated listing, making
+                    // objects — or, when enumerating the device root, a whole storage — look as
+                    // though they had been deleted.
+                    checkHr(hr, "IEnumPortableDeviceObjectIDs::Next");
                     int n = fetched.get(JAVA_INT, 0);
                     for (int i = 0; i < n; i++) {
                         var ptr = arr.getAtIndex(ADDRESS, i);
@@ -1443,7 +1535,20 @@ class WpdBackend implements MtpBackend {
             int r;
             while ((r = in.read(heap)) > 0) {
                 MemorySegment.copy(heap, 0, buf, JAVA_BYTE, 0, r);
-                checkHr(call(stream, STREAM_WRITE, desc, buf, r, written), "IStream::Write");
+                // IStream::Write may consume less than it was offered; the object was created with a
+                // declared WPD_OBJECT_SIZE, so dropping the remainder would commit a short object.
+                int sent = 0;
+                while (sent < r) {
+                    written.set(JAVA_INT, 0, 0);
+                    checkHr(call(stream, STREAM_WRITE, desc, buf.asSlice(sent), r - sent, written),
+                        "IStream::Write");
+                    int n = written.get(JAVA_INT, 0);
+                    if (n <= 0) {
+                        throw new IOException("IStream::Write accepted no bytes with "
+                            + (r - sent) + " still to send");
+                    }
+                    sent += n;
+                }
             }
         }
     }
