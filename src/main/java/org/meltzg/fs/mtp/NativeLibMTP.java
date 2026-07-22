@@ -47,6 +47,13 @@ class NativeLibMTP implements MtpBackend {
     static final int LIBMTP_FILETYPE_M4A = 34;
     // Neutral "generic file" type; index of LIBMTP_FILETYPE_UNKNOWN in libmtp 1.1.x's enum.
     static final int LIBMTP_FILETYPE_UNKNOWN = 44;
+    // Index of LIBMTP_DEVICECAP_EditObjects in LIBMTP_devicecap_t (stable across libmtp 1.1.x):
+    // true when the device implements the Android edit extension (BeginEditObject / TruncateObject /
+    // SendPartialObject / EndEditObject).
+    static final int LIBMTP_DEVICECAP_EDIT_OBJECTS = 2;
+    // Bytes per SendPartialObject when rewriting an object in place; the size parameter is a
+    // uint32, and 1 MiB keeps each USB transaction comfortably bounded.
+    private static final int EDIT_CHUNK_BYTES = 1 << 20;
 
     // Uploads carry only a filename, so the audio object format is inferred from the extension.
     // Storing a track under a media filetype lets the device index it and expose its tags through
@@ -220,6 +227,11 @@ class NativeLibMTP implements MtpBackend {
     private final MethodHandle getFileToFile;
     private final MethodHandle getPartialObjectFn;
     private final MethodHandle sendFileFromFile;
+    private final MethodHandle checkCapability;
+    private final MethodHandle beginEditObject;
+    private final MethodHandle endEditObject;
+    private final MethodHandle truncateObject;
+    private final MethodHandle sendPartialObjectFn;
     private final MethodHandle destroyFile;
     private final MethodHandle createFolderFn;
     private final MethodHandle moveObjectFn;
@@ -272,6 +284,18 @@ class NativeLibMTP implements MtpBackend {
             FunctionDescriptor.of(JAVA_INT, ADDRESS, JAVA_INT, JAVA_LONG, JAVA_INT, ADDRESS, ADDRESS));
         sendFileFromFile = bind(linker, libmtp, "LIBMTP_Send_File_From_File",
             FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, ADDRESS, ADDRESS, ADDRESS));
+        checkCapability = bind(linker, libmtp, "LIBMTP_Check_Capability",
+            FunctionDescriptor.of(JAVA_INT, ADDRESS, JAVA_INT));
+        beginEditObject = bind(linker, libmtp, "LIBMTP_BeginEditObject",
+            FunctionDescriptor.of(JAVA_INT, ADDRESS, JAVA_INT));
+        endEditObject = bind(linker, libmtp, "LIBMTP_EndEditObject",
+            FunctionDescriptor.of(JAVA_INT, ADDRESS, JAVA_INT));
+        // int LIBMTP_TruncateObject(device, uint32 id, uint64 offset)
+        truncateObject = bind(linker, libmtp, "LIBMTP_TruncateObject",
+            FunctionDescriptor.of(JAVA_INT, ADDRESS, JAVA_INT, JAVA_LONG));
+        // int LIBMTP_SendPartialObject(device, uint32 id, uint64 offset, unsigned char *data, unsigned int size)
+        sendPartialObjectFn = bind(linker, libmtp, "LIBMTP_SendPartialObject",
+            FunctionDescriptor.of(JAVA_INT, ADDRESS, JAVA_INT, JAVA_LONG, ADDRESS, JAVA_INT));
         destroyFile = bind(linker, libmtp, "LIBMTP_destroy_file_t",
             FunctionDescriptor.ofVoid(ADDRESS));
         createFolderFn = bind(linker, libmtp, "LIBMTP_Create_Folder",
@@ -671,6 +695,83 @@ class NativeLibMTP implements MtpBackend {
                 throw new IOException("LIBMTP_Send_File_From_File failed with code " + ret + " for: " + filename);
             }
             return idStr((int) FILE_ITEM_ID.get(fileData));
+        }
+    }
+
+    @Override
+    public boolean supportsObjectEditing(DeviceHandle handle) {
+        try {
+            return (int) checkCapability.invokeExact(dev(handle), LIBMTP_DEVICECAP_EDIT_OBJECTS) != 0;
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    /**
+     * Rewrites {@code itemId} in place via the Android edit extension: BeginEditObject, truncate to
+     * zero, stream the new bytes with SendPartialObject, then EndEditObject (which commits the
+     * device's size/date bookkeeping). The object's id and name never change, so no delete or
+     * SendObjectInfo is involved.
+     */
+    @Override
+    public void overwriteFile(DeviceHandle handle, String itemId, String localPath) throws IOException {
+        int id = toHandle(itemId);
+        var device = dev(handle);
+        int ret;
+        try {
+            ret = (int) beginEditObject.invokeExact(device, id);
+        } catch (Throwable t) {
+            throw new IOException("Failed to begin editing object: " + itemId, t);
+        }
+        if (ret != 0) throw new IOException("LIBMTP_BeginEditObject failed for id: " + itemId);
+        try {
+            try {
+                ret = (int) truncateObject.invokeExact(device, id, 0L);
+            } catch (Throwable t) {
+                throw new IOException("Failed to truncate object: " + itemId, t);
+            }
+            if (ret != 0) throw new IOException("LIBMTP_TruncateObject failed for id: " + itemId);
+
+            try (var channel = java.nio.channels.FileChannel.open(java.nio.file.Path.of(localPath));
+                 var arena = Arena.ofConfined()) {
+                var chunk = arena.allocate(EDIT_CHUNK_BYTES);
+                var buffer = chunk.asByteBuffer();
+                long offset = 0;
+                int read;
+                while ((read = channel.read(buffer.clear())) > 0) {
+                    try {
+                        ret = (int) sendPartialObjectFn.invokeExact(device, id, offset, chunk, read);
+                    } catch (Throwable t) {
+                        throw new IOException("Failed partial send for id: " + itemId, t);
+                    }
+                    if (ret != 0) {
+                        throw new IOException("LIBMTP_SendPartialObject failed at offset " + offset
+                            + " for id: " + itemId);
+                    }
+                    offset += read;
+                }
+            }
+        } catch (IOException e) {
+            endEdit(device, id, e); // release the edit; the failed write is reported, not the end
+            throw e;
+        }
+        endEdit(device, id, null);
+    }
+
+    /** Ends an in-place edit; failures are suppressed into {@code pending} when it is non-null. */
+    private void endEdit(MemorySegment device, int id, IOException pending) throws IOException {
+        int ret;
+        try {
+            ret = (int) endEditObject.invokeExact(device, id);
+        } catch (Throwable t) {
+            if (pending != null) {
+                pending.addSuppressed(t);
+                return;
+            }
+            throw new IOException("Failed to end editing object: " + idStr(id), t);
+        }
+        if (ret != 0 && pending == null) {
+            throw new IOException("LIBMTP_EndEditObject failed for id: " + idStr(id));
         }
     }
 

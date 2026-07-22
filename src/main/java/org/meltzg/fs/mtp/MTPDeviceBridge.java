@@ -46,6 +46,43 @@ public enum MTPDeviceBridge implements Closeable {
 
     private record ChildListing(MTPItemInfo[] items, long fetchedNanos) {}
 
+    // Objects this bridge has deleted or moved away that the device may keep reporting where they
+    // no longer are: some devices (observed on an Android-based player's SD-card storage) update
+    // their MTP database asynchronously, so listings fetched right after a successful DeleteObject
+    // or MoveObject can still contain the stale entry. Acting on such a ghost fails (deleting a
+    // dead handle errors) or lies (the path still "exists"), so tombstoned ids are filtered out of
+    // listings until the folder the object left lists without them — i.e. the device has caught
+    // up. A deleted id is dead device-wide and filtered from every listing; a moved id still
+    // exists at its new location and is filtered only from the listing it left. Keyed per device;
+    // cleared when connections are torn down.
+    private final Map<ItemKey, Tombstone> tombstones = new ConcurrentHashMap<>();
+
+    private record ItemKey(MTPDeviceIdentifier deviceId, String itemId) {}
+
+    private record Tombstone(ListingKey leftFrom, boolean everywhere) {}
+
+    // Renames the device may not have applied to its listings yet: the same asynchronous-database
+    // devices that ghost deletes also keep reporting a renamed object under its old filename for a
+    // while after a successful SetObjectName. The overlay rewrites the item's filename by id in
+    // every listing until the device itself reports the new name, at which point it is dropped.
+    // Keyed per device; cleared when connections are torn down.
+    private final Map<ItemKey, String> renameOverlays = new ConcurrentHashMap<>();
+
+    // Sizes the device has not caught up with after an in-place rewrite. Editing an object's bytes
+    // in place (BeginEditObject / TruncateObject / SendPartialObject / EndEditObject) reliably lands
+    // the new content — it reads back correctly through both a ranged read and a whole-object
+    // transfer — but several storages keep reporting the object's *previous* length afterwards
+    // (measured on three of the four storages across both test devices; see docs/windows-parity.md).
+    // A stale length is not cosmetic: it is what the attribute views and the read channel bound
+    // reads by, so an un-corrected short value truncates every subsequent read of a file that grew.
+    // The overlay reports the length actually written until the device agrees, then drops itself.
+    // Keyed per device; cleared when connections are torn down.
+    private final Map<ItemKey, Long> sizeOverlays = new ConcurrentHashMap<>();
+
+    // Backoff schedule for re-sending a file whose same-named predecessor was just deleted; devices
+    // with an asynchronous MTP database can reject the send until the delete propagates.
+    private static final long[] SEND_RETRY_DELAYS_MILLIS = {250, 500, 1000, 2000};
+
     // Signatures of the devices seen at the last scan, used to detect hot-plug/unplug/reconnect
     // without reopening still-present devices.
     private Set<String> lastSignature = Set.of();
@@ -227,6 +264,12 @@ public enum MTPDeviceBridge implements Closeable {
                     var item = resolveItemUnsafe(conn, parts);
                     if (item == null) throw new NoSuchFileException(path);
                     backend().deleteObject(conn.handle(), item.itemId());
+                    if (parts.length >= 2) {
+                        // The containing listing was keyed with ROOT_PARENT for storage-root
+                        // children (the device-reported parent_id is unreliable there).
+                        var parentId = parts.length == 2 ? MtpBackend.ROOT_PARENT : item.parentId();
+                        tombstoneUnsafe(conn, item.itemId(), item.storageId(), parentId);
+                    }
                 } finally {
                     invalidateListings();
                 }
@@ -269,11 +312,29 @@ public enum MTPDeviceBridge implements Closeable {
                         if (!existing.isFile()) {
                             throw new IOException("Target exists and is a directory: " + path);
                         }
+                        // Rewrite the existing object in place when the device supports it: the id
+                        // and name never change, so this cannot trip the asynchronous-delete window
+                        // that makes a delete + same-name send fail (see the tombstones field).
+                        if (backend.supportsObjectEditing(conn.handle())) {
+                            try {
+                                backend.overwriteFile(conn.handle(), existing.itemId(), localFile.toString());
+                                // Several devices keep reporting the object's previous length after an
+                                // in-place rewrite even though the new bytes are there; carry the length
+                                // we actually wrote until the device agrees, so reads of a file that grew
+                                // are not bounded by the old, shorter value.
+                                sizeOverlays.put(new ItemKey(conn.deviceId(), existing.itemId()),
+                                    java.nio.file.Files.size(localFile));
+                                return existing.itemId();
+                            } catch (IOException editFailed) {
+                                // Fall through: delete the (possibly half-written) object and resend.
+                            }
+                        }
                         backend.deleteObject(conn.handle(), existing.itemId());
+                        tombstoneUnsafe(conn, existing.itemId(), storage.storageId(), parentId);
                     }
                     long size = java.nio.file.Files.size(localFile);
-                    return backend.sendFile(conn.handle(), localFile.toString(),
-                        name, parentId, storage.storageId(), size);
+                    return sendFileUnsafe(backend, conn, localFile, name, parentId,
+                        storage.storageId(), size);
                 } finally {
                     invalidateListings();
                 }
@@ -327,6 +388,15 @@ public enum MTPDeviceBridge implements Closeable {
                     if (!existingTgt.isFile() && hasChildrenUnsafe(conn, existingTgt)) {
                         throw new DirectoryNotEmptyException(targetPath);
                     }
+                    if (existingTgt.isFile()) {
+                        // Deleting the target and then moving/renaming onto its name trips the same
+                        // asynchronous-delete window as a replacing send (the device can keep the
+                        // name "taken" for the rest of the session). Have the caller emulate with a
+                        // replacing copy — which rewrites the target in place when the device
+                        // supports object editing — followed by a delete of the source.
+                        throw new MTPOperationUnsupportedException(
+                            "Replacing a file target is emulated: " + sourcePath + " -> " + targetPath, null);
+                    }
                 }
 
                 // libmtp reports an inconsistent parent_id for storage-root items, so detect a pure
@@ -338,12 +408,19 @@ public enum MTPDeviceBridge implements Closeable {
                 try {
                     if (existingTgt != null) {
                         backend.deleteObject(conn.handle(), existingTgt.itemId());
+                        tombstoneUnsafe(conn, existingTgt.itemId(), tgtStorage.storageId(), tgtParentId);
                     }
                     if (!sameDirectory) {
                         backend.moveObject(conn.handle(), source.itemId(), tgtStorage.storageId(), tgtParentId);
+                        // A stale listing of the folder the object left may keep showing it there.
+                        var srcParentId = srcParts.length == 2 ? MtpBackend.ROOT_PARENT : source.parentId();
+                        tombstoneMovedUnsafe(conn, source.itemId(), source.storageId(), srcParentId);
                     }
                     if (!source.filename().equals(tgtName)) {
                         backend.setFileName(conn.handle(), source.itemId(), tgtName);
+                        // Stale listings may keep reporting the old filename until the device's
+                        // database catches up; overlay the new name by id until it does.
+                        renameOverlays.put(new ItemKey(conn.deviceId(), source.itemId()), tgtName);
                     }
                 } catch (IOException nativeError) {
                     // Many devices do not implement MoveObject/SetObjectName; let the caller emulate.
@@ -485,6 +562,9 @@ public enum MTPDeviceBridge implements Closeable {
         deviceInfo.clear();
         deviceConns.clear();
         invalidateListings();
+        tombstones.clear();
+        renameOverlays.clear();
+        sizeOverlays.clear();
         lastSignature = Set.of();
         devicesDetected = false;
     }
@@ -569,9 +649,124 @@ public enum MTPDeviceBridge implements Closeable {
         if (cached != null && System.nanoTime() - cached.fetchedNanos() < LISTING_TTL_NANOS) {
             return cached.items();
         }
-        var items = backend().getChildItems(conn.handle(), storageId, parentId);
+        var items = reconcileSizes(key, reconcileRenames(key,
+            reconcileTombstones(key, backend().getChildItems(conn.handle(), storageId, parentId))));
         listingCache.put(key, new ChildListing(items, System.nanoTime()));
         return items;
+    }
+
+    /**
+     * Records that {@code itemId} was deleted out of the listing {@code (storageId, parentId)}, so
+     * ghost entries the device keeps reporting for it are suppressed until that listing comes back
+     * without it. Callers must hold the read lock and the connection monitor.
+     */
+    private void tombstoneUnsafe(MTPDeviceConnection conn, String itemId, String storageId, String parentId) {
+        var key = new ItemKey(conn.deviceId(), itemId);
+        tombstones.put(key, new Tombstone(new ListingKey(conn.deviceId(), storageId, parentId), true));
+        renameOverlays.remove(key); // a deleted id has no name left to overlay
+        sizeOverlays.remove(key);   // nor a size
+    }
+
+    /**
+     * Records that {@code itemId} was moved out of the listing {@code (storageId, parentId)}: the
+     * object is alive at its new location, so it is suppressed only from the listing it left, until
+     * that listing comes back without it. Callers must hold the read lock and the connection monitor.
+     */
+    private void tombstoneMovedUnsafe(MTPDeviceConnection conn, String itemId, String storageId, String parentId) {
+        tombstones.put(new ItemKey(conn.deviceId(), itemId),
+            new Tombstone(new ListingKey(conn.deviceId(), storageId, parentId), false));
+    }
+
+    /**
+     * Drops tombstones whose origin listing {@code key} no longer reports them (the device's
+     * database has caught up), then filters the still-tombstoned ids out of {@code items}. Ids are
+     * unique per device, so a deleted handle is suppressed from every listing — its ghost can also
+     * linger in a stale listing of a folder the object had previously been moved out of — while a
+     * moved id is suppressed only from the listing it left.
+     */
+    private MTPItemInfo[] reconcileTombstones(ListingKey key, MTPItemInfo[] items) {
+        if (tombstones.isEmpty()) return items;
+        tombstones.entrySet().removeIf(e -> e.getValue().leftFrom().equals(key)
+            && Arrays.stream(items).noneMatch(i -> i.itemId().equals(e.getKey().itemId())));
+        if (tombstones.isEmpty()) return items;
+        return Arrays.stream(items)
+            .filter(i -> {
+                var tombstone = tombstones.get(new ItemKey(key.deviceId(), i.itemId()));
+                return tombstone == null || !(tombstone.everywhere() || tombstone.leftFrom().equals(key));
+            })
+            .toArray(MTPItemInfo[]::new);
+    }
+
+    /**
+     * Drops rename overlays the device has caught up with (this listing already reports the item
+     * under its new name), then rewrites the filename of any still-overlaid item. Ids are unique
+     * per device, so the overlay applies wherever the item is listed — including a listing it was
+     * simultaneously moved into, when a move combined relocation with a rename.
+     */
+    /**
+     * Drops size overlays the device has caught up with (this listing already reports the item at
+     * the overlaid length), then rewrites the size of any still-overlaid item. Ids are unique per
+     * device, so the overlay applies wherever the item is listed.
+     */
+    private MTPItemInfo[] reconcileSizes(ListingKey key, MTPItemInfo[] items) {
+        if (sizeOverlays.isEmpty()) return items;
+        sizeOverlays.entrySet().removeIf(e -> e.getKey().deviceId().equals(key.deviceId())
+            && Arrays.stream(items).anyMatch(i -> i.itemId().equals(e.getKey().itemId())
+                && i.filesize() == e.getValue()));
+        if (sizeOverlays.isEmpty()) return items;
+        return Arrays.stream(items)
+            .map(i -> {
+                var size = sizeOverlays.get(new ItemKey(key.deviceId(), i.itemId()));
+                return size == null ? i
+                    : new MTPItemInfo(i.parentId(), i.itemId(), i.storageId(), i.isFile(),
+                        size, i.modificationDate(), i.filename());
+            })
+            .toArray(MTPItemInfo[]::new);
+    }
+
+    private MTPItemInfo[] reconcileRenames(ListingKey key, MTPItemInfo[] items) {
+        if (renameOverlays.isEmpty()) return items;
+        renameOverlays.entrySet().removeIf(e -> e.getKey().deviceId().equals(key.deviceId())
+            && Arrays.stream(items).anyMatch(i -> i.itemId().equals(e.getKey().itemId())
+                && i.filename().equals(e.getValue())));
+        if (renameOverlays.isEmpty()) return items;
+        return Arrays.stream(items)
+            .map(i -> {
+                var newName = renameOverlays.get(new ItemKey(key.deviceId(), i.itemId()));
+                return newName == null ? i
+                    : new MTPItemInfo(i.parentId(), i.itemId(), i.storageId(), i.isFile(),
+                        i.filesize(), i.modificationDate(), newName);
+            })
+            .toArray(MTPItemInfo[]::new);
+    }
+
+    /**
+     * Uploads {@code localFile}, retrying briefly on failure.
+     *
+     * <p>This used to retry only when the write replaced an existing file, on the reasoning that the
+     * one transient failure worth waiting out was a device rejecting a send that reused a
+     * just-deleted filename. That was too narrow: a device whose media database is still rebuilding
+     * — after a reboot, say — rejects sends of names it has never seen either. Retrying regardless
+     * costs a doomed create the backoff schedule and nothing else, since a failed send cleans up the
+     * partial object it may have left behind, so every attempt starts from a clean slate.
+     */
+    private String sendFileUnsafe(MtpBackend backend, MTPDeviceConnection conn, java.nio.file.Path localFile,
+                                  String name, String parentId, String storageId, long size) throws IOException {
+        int attempt = 0;
+        while (true) {
+            try {
+                return backend.sendFile(conn.handle(), localFile.toString(), name, parentId, storageId, size);
+            } catch (IOException e) {
+                if (attempt >= SEND_RETRY_DELAYS_MILLIS.length) throw e;
+                try {
+                    Thread.sleep(SEND_RETRY_DELAYS_MILLIS[attempt++]);
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    e.addSuppressed(interrupted);
+                    throw e;
+                }
+            }
+        }
     }
 
     /** Drops every cached listing. Called after any mutation and when connections are torn down. */

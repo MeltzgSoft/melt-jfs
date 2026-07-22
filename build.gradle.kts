@@ -67,6 +67,14 @@ tasks.register<JavaExec>("browse") {
     // pass an optional depth limit: ./gradlew browse --args="2"
 }
 
+tasks.register<JavaExec>("growProbe") {
+    description = "Probe what a device reports after an in-place grow (see MTPGrowProbe)."
+    classpath = dev.runtimeClasspath
+    mainClass = "org.meltzg.fs.mtp.MTPGrowProbe"
+    jvmArgs("--enable-native-access=ALL-UNNAMED")
+    // optionally target one device/storage: ./gradlew growProbe --args="FiiO M11 Plus|M11 Plus Micro SD"
+}
+
 tasks.test {
     // Required for FFM restricted operations (MemorySegment.reinterpret, libraryLookup)
     jvmArgs("--enable-native-access=ALL-UNNAMED")

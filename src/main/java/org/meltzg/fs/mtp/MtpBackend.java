@@ -116,6 +116,26 @@ public interface MtpBackend {
     String sendFile(DeviceHandle device, String localPath, String filename,
                     String parentId, String storageId, long filesize) throws IOException;
 
+    /**
+     * Whether {@code device} can rewrite an existing object's bytes in place (MTP's Android edit
+     * extension: BeginEditObject / TruncateObject / SendPartialObject / EndEditObject). In-place
+     * editing keeps the object's id, so replacing a file's content avoids a delete + re-create —
+     * which matters on devices that apply deletes to their MTP database asynchronously and reject
+     * a send that reuses a just-deleted name. The default reports no support.
+     */
+    default boolean supportsObjectEditing(DeviceHandle device) {
+        return false;
+    }
+
+    /**
+     * Replaces the content of the existing object {@code itemId} with the bytes of {@code localPath},
+     * in place: the object keeps its id and name. Only usable when {@link #supportsObjectEditing}
+     * reports true for the device.
+     */
+    default void overwriteFile(DeviceHandle device, String itemId, String localPath) throws IOException {
+        throw new UnsupportedOperationException("In-place object editing is not supported by this backend");
+    }
+
     /** Relocates an object to a new {@code parentId} on {@code storageId}, keeping its id. */
     void moveObject(DeviceHandle device, String itemId, String storageId, String parentId) throws IOException;
 
