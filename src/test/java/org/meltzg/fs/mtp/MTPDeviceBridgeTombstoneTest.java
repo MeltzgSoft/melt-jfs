@@ -32,16 +32,24 @@ public class MTPDeviceBridgeTombstoneTest {
     private GhostingBackend backend;
     private MTPDeviceIdentifier id;
 
+    private long defaultListingTtl;
+
     @Before
     public void setUp() throws IOException {
         backend = new GhostingBackend();
         id = backend.id;
         MTPDeviceBridge.setBackend(backend);
         MTPDeviceBridge.INSTANCE.close();
+        // These tests verify how *fetched* listings are reconciled against the device's stale
+        // database; a zero TTL makes every read a fresh fetch so the reconciliation path is always
+        // the one under test (mutations otherwise serve patched cached listings).
+        defaultListingTtl = MTPDeviceBridge.listingTtlNanos;
+        MTPDeviceBridge.listingTtlNanos = 0;
     }
 
     @After
     public void tearDown() throws IOException {
+        MTPDeviceBridge.listingTtlNanos = defaultListingTtl;
         MTPDeviceBridge.INSTANCE.close();
         MTPDeviceBridge.setBackend(null);
     }

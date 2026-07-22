@@ -9,6 +9,7 @@ import org.meltzg.fs.mtp.types.MTPItemInfo;
 
 import java.io.IOException;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -63,16 +64,94 @@ public class MTPDeviceBridgeListingCacheTest {
         assertEquals("subsequent resolves hit the cache", afterFirst, backend.getChildItemsCalls.get());
     }
 
-    /** A mutation drops the cache so later listings reflect the new device state. */
+    /**
+     * A delete patches the cached listing rather than dropping it: the entry disappears without a
+     * device round-trip.
+     */
     @Test
-    public void mutationInvalidatesCache() throws IOException {
+    public void deletePatchesCachedListingWithoutRefetch() throws IOException {
         var bridge = MTPDeviceBridge.getInstance();
         bridge.listChildren(id, "/Store/a");
         int afterFirst = backend.getChildItemsCalls.get();
 
         bridge.delete(id, "/Store/a/f1");
+        var names = Arrays.stream(bridge.listChildren(id, "/Store/a"))
+            .map(MTPItemInfo::filename).toList();
+        assertFalse("deleted file must leave the cached listing", names.contains("f1"));
+        assertEquals("served from the patched cache, not refetched",
+            afterFirst, backend.getChildItemsCalls.get());
+    }
+
+    /** A created directory appears in the cached parent listing without a device round-trip. */
+    @Test
+    public void createDirectoryAppearsInCachedListingWithoutRefetch() throws IOException {
+        var bridge = MTPDeviceBridge.getInstance();
         bridge.listChildren(id, "/Store/a");
-        assertTrue("listing re-fetched after mutation", backend.getChildItemsCalls.get() > afterFirst);
+        int afterFirst = backend.getChildItemsCalls.get();
+
+        bridge.createDirectory(id, "/Store/a/newdir");
+        var names = Arrays.stream(bridge.listChildren(id, "/Store/a"))
+            .map(MTPItemInfo::filename).toList();
+        assertTrue("created directory must appear in the cached listing", names.contains("newdir"));
+        assertEquals("served from the patched cache, not refetched",
+            afterFirst, backend.getChildItemsCalls.get());
+    }
+
+    /** A written file appears in the cached parent listing without a device round-trip. */
+    @Test
+    public void writeFileAppearsInCachedListingWithoutRefetch() throws IOException {
+        var bridge = MTPDeviceBridge.getInstance();
+        bridge.listChildren(id, "/Store/a");
+        int afterFirst = backend.getChildItemsCalls.get();
+
+        var local = java.nio.file.Files.createTempFile("melt-jfs-cache", ".bin");
+        try {
+            java.nio.file.Files.write(local, new byte[]{1, 2, 3});
+            bridge.writeFile(id, "/Store/a/upload.bin", local);
+        } finally {
+            java.nio.file.Files.deleteIfExists(local);
+        }
+        var uploaded = Arrays.stream(bridge.listChildren(id, "/Store/a"))
+            .filter(i -> i.filename().equals("upload.bin")).findFirst().orElse(null);
+        assertNotNull("written file must appear in the cached listing", uploaded);
+        assertEquals("cached entry must carry the written size", 3, uploaded.filesize());
+        assertEquals("served from the patched cache, not refetched",
+            afterFirst, backend.getChildItemsCalls.get());
+    }
+
+    /** A move updates both the cached source and destination listings without a round-trip. */
+    @Test
+    public void movePatchesSourceAndDestinationListingsWithoutRefetch() throws IOException {
+        var bridge = MTPDeviceBridge.getInstance();
+        bridge.listChildren(id, "/Store/a");
+        bridge.listChildren(id, "/Store/a/b");
+        int afterFirst = backend.getChildItemsCalls.get();
+
+        bridge.move(id, "/Store/a/f1", "/Store/a/b/f1", false);
+        var srcNames = Arrays.stream(bridge.listChildren(id, "/Store/a"))
+            .map(MTPItemInfo::filename).toList();
+        var dstNames = Arrays.stream(bridge.listChildren(id, "/Store/a/b"))
+            .map(MTPItemInfo::filename).toList();
+        assertFalse("moved file must leave the cached source listing", srcNames.contains("f1"));
+        assertTrue("moved file must join the cached destination listing", dstNames.contains("f1"));
+        assertEquals("served from the patched caches, not refetched",
+            afterFirst, backend.getChildItemsCalls.get());
+    }
+
+    /** A same-directory rename patches the cached entry's filename without a round-trip. */
+    @Test
+    public void renamePatchesCachedListingWithoutRefetch() throws IOException {
+        var bridge = MTPDeviceBridge.getInstance();
+        bridge.listChildren(id, "/Store/a");
+        int afterFirst = backend.getChildItemsCalls.get();
+
+        bridge.move(id, "/Store/a/f1", "/Store/a/f1-renamed", false);
+        var names = Arrays.stream(bridge.listChildren(id, "/Store/a"))
+            .map(MTPItemInfo::filename).toList();
+        assertTrue("renamed file must list under its new name", names.contains("f1-renamed"));
+        assertFalse("old name must leave the cached listing", names.contains("f1"));
+        assertEquals("served from the patched cache, not refetched",
+            afterFirst, backend.getChildItemsCalls.get());
     }
 
     /** Walks the tree the way NIO does: list a directory, then resolve each child's attributes. */
