@@ -76,7 +76,7 @@ public class MTPFileSystem extends FileSystem {
         // "mtp"   — track metadata (title/artist/album/genre/trackNumber/durationMillis) read from the
         //           device's MTP object properties.
         // "audio" — the same fields, but parsed from the file's own embedded tags (a header read); see
-        //           MTPFileSystemProvider and org.meltzg.fs.mtp.audio.
+        //           MTPFileSystemProvider and org.meltzg.audio.
         return Set.of("basic", "mtp", "audio");
     }
 

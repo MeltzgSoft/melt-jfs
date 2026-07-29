@@ -1,4 +1,4 @@
-package org.meltzg.fs.mtp.audio;
+package org.meltzg.audio;
 
 import org.jaudiotagger.audio.AudioFileIO;
 import org.jaudiotagger.tag.FieldKey;

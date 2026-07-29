@@ -5,8 +5,8 @@ import org.jaudiotagger.tag.FieldKey;
 import org.junit.*;
 import org.junit.runner.RunWith;
 import org.junit.runners.Parameterized;
-import org.meltzg.fs.mtp.audio.FlacMetadataReader;
-import org.meltzg.fs.mtp.audio.RangedByteSource;
+import org.meltzg.audio.FlacMetadataReader;
+import org.meltzg.audio.RangedByteSource;
 import org.meltzg.fs.mtp.types.MTPDeviceIdentifier;
 
 import java.io.IOException;

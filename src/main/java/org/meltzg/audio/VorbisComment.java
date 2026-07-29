@@ -1,4 +1,4 @@
-package org.meltzg.fs.mtp.audio;
+package org.meltzg.audio;
 
 import java.nio.BufferUnderflowException;
 import java.nio.ByteBuffer;

@@ -1,8 +1,8 @@
 package org.meltzg.fs.mtp;
 
-import org.meltzg.fs.mtp.audio.AudioTagReaders;
-import org.meltzg.fs.mtp.audio.AudioTags;
-import org.meltzg.fs.mtp.audio.RangedByteSource;
+import org.meltzg.audio.AudioTagReaders;
+import org.meltzg.audio.AudioTags;
+import org.meltzg.audio.RangedByteSource;
 import org.meltzg.fs.mtp.types.MTPDeviceIdentifier;
 import org.meltzg.fs.mtp.types.MTPItemInfo;
 
@@ -523,7 +523,7 @@ public class MTPFileSystemProvider extends FileSystemProvider {
 
     /**
      * The "audio" attribute view: tags parsed from the file's own embedded metadata (e.g. a FLAC
-     * VORBIS_COMMENT block) via {@link org.meltzg.fs.mtp.audio.AudioTagReaders}, e.g.
+     * VORBIS_COMMENT block) via {@link org.meltzg.audio.AudioTagReaders}, e.g.
      * {@code Files.readAttributes(path, "audio:title,artist,album")}. Unlike the "mtp" view — which
      * queries the device's index — this reads a small slice of the file's header over ranged reads,
      * so it recovers the real embedded title even on devices that report the filename as the title.

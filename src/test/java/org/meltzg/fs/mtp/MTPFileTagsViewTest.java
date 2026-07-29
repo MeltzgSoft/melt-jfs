@@ -3,7 +3,7 @@ package org.meltzg.fs.mtp;
 import org.junit.AfterClass;
 import org.junit.BeforeClass;
 import org.junit.Test;
-import org.meltzg.fs.mtp.audio.SyntheticFlac;
+import org.meltzg.audio.SyntheticFlac;
 import org.meltzg.fs.mtp.types.MTPDeviceIdentifier;
 import org.meltzg.fs.mtp.types.MTPItemInfo;
 
@@ -17,7 +17,7 @@ import static org.junit.Assert.*;
 
 /**
  * Unit tests for the "audio" attribute view — embedded tags parsed from the file's own bytes through
- * {@link org.meltzg.fs.mtp.audio.AudioTagReaders} and surfaced via {@code Files.readAttributes(path,
+ * {@link org.meltzg.audio.AudioTagReaders} and surfaced via {@code Files.readAttributes(path,
  * "audio:...")}. The fake device is seeded with a synthetic FLAC, a plain file and a folder.
  */
 public class MTPFileTagsViewTest {
