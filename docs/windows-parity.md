@@ -33,22 +33,29 @@ match **`NativeLibMTP`** (libmtp, Linux/macOS). **Keep this file updated wheneve
 | `audio` view (embedded tags) | ✅ | ✅ (lit up by `readPartial`) | none |
 | Audio tag readers (FLAC/MP3/MP4/Ogg/Opus/WAV) | ✅ (neutral) | ✅ (neutral) | none — pure Java, backend-agnostic |
 | In-place object editing (`supportsObjectEditing` / `overwriteFile`) | ✅ (Android edit extension, gated by `LIBMTP_Check_Capability`) | ✅ (same extension via `SendCommand`), grows included | none — stale post-edit sizes are corrected by the bridge's size overlays |
+| `createDirectory` name-collision check (`FileAlreadyExistsException`) | ✅ | ⚠️ unverified | none expected — the check is above the SPI; needs a Windows run (see below) |
 
-Legend: ✅ done · ⚠️ works via fallback · ❌ missing.
+Legend: ✅ done · ⚠️ works via fallback or unverified · ❌ missing.
 
 Functional parity: verified end-to-end on a real Windows host against **two** devices — an
 Astell&Kern AK100_II and a FiiO M11 Plus — across all four of their storages. The full integration
-suite is green over WPD (208 tests: 206 passed, 2 legitimate skips, 0 failures), including
+suite was green over WPD (208 tests: 206 passed, 2 legitimate skips, 0 failures), including
 `partialReadPullsAudioHeaderWithoutTransferringWholeObject` and the `audioViewReadsUploaded*Tags` /
 `uploadedId3v23Mp3TagsAreReadBackViaAudioView` suites, and it is green on Linux/libmtp with the same
 devices.
 
+> **That WPD figure predates PR #25 and no longer describes the current suite.** The suite is now 220
+> tests (three new `createDirectory*` cases × four storages), and PR #25 also changed how the suite
+> drives the device session — see [Pending Windows work](#pending-windows-work-pr-25). Linux/libmtp is
+> green at 220 (217 passed, 3 skips, 0 failures); Windows has not been re-run.
+
 No caveats remain on the FiiO. The intermittent failures previously recorded here — the growing
 replace on its SD card, storages transiently disappearing, sessions wedging mid-run — were all
 symptoms of WPD-side defects in this backend, not of the device; they are described under "Growing a
-file", "Device lifetime" and "Resource ownership". Two consecutive full runs now pass with the
-suite's per-test device open/close churn intact, which is the load that used to wedge the driver
-within a single run.
+file", "Device lifetime" and "Resource ownership". Two consecutive full runs passed with the suite's
+per-test device open/close churn intact, which is the load that used to wedge the driver within a
+single run. **PR #25 has since removed that churn** — so this result stands as evidence the leaks were
+fixed, but a green suite no longer re-proves it; see [Pending Windows work](#pending-windows-work-pr-25).
 
 ### In-place object editing on WPD
 
@@ -112,6 +119,64 @@ path exists to protect. That fallback was the direct cause of the intermittent
 retry loop hammered the device with repeated `SendObjectInfo` for a name the device still held.
 `overwriteFile` now falls back only for objects larger than `SendPartialObject`'s 32-bit length.
 
+## Pending Windows work (PR #25)
+
+PR #25 introduces no new `MtpBackend` primitive, so there is most likely **nothing to implement** —
+but it changes two things that only Windows can settle, and it weakens a WPD-specific safety net.
+Everything below is for a Windows host with both devices attached.
+
+### 1. Verify — the `createDirectory` collision check
+
+`MTPDeviceBridge.createDirectory` now refuses a taken name with `FileAlreadyExistsException`, decided
+above the SPI from the cached listing, before any native call. This matters more on WPD than on
+libmtp: libmtp merely failed with a generic `IOException`, whereas WPD **could silently succeed and
+create a duplicate-named object**, which is the worse outcome the check is meant to prevent.
+
+- [ ] Run `createDirectoryFailsWhenDirectoryExists` and `createDirectoryFailsWhenFileExistsWithSameName`
+      on all four storages. Both pass on libmtp everywhere.
+- [ ] Confirm no duplicate-named object is left behind on the device afterwards.
+- [ ] **Consider implementing** a backstop for the TTL-window race (caveat 2 on PR #25): if something
+      outside the session creates the name while a cached listing is still fresh, the check misses it
+      and the create falls through to the driver. On libmtp that surfaces as a generic `IOException`;
+      on WPD it can create the duplicate. Mapping WPD's native already-exists HRESULT from
+      `CreateObjectWithPropertiesOnly` into `FileAlreadyExistsException` would close it on the side
+      where the consequence is worst.
+
+### 2. Verify — does the deleted-name reservation apply to *folder* creation on WPD?
+
+See [`deleted-name-reservation.md`](deleted-name-reservation.md) for the full measurements. On
+libmtp, the FiiO SD card refuses a `CreateFolder` for a name deleted earlier in the same session, and
+a session reopen is the only reliable clear (4/4, ~500ms); retry/backoff and rename-into-the-name both
+fail. The send-side version of this reservation is **already known to reproduce over WPD** (see
+"In-place object editing on WPD"), so the folder-side probably does too — but it has not been measured,
+and `CreateObjectWithPropertiesOnly` is a different opcode path than `SendObjectInfo`.
+
+- [ ] Run `createDirectorySucceedsAfterDeletingSameName`. It self-skips where the device refuses, so
+      **watch the skip log** — a silent skip is exactly what the failure mode looks like. Record which
+      storages skip on WPD versus libmtp (libmtp: only FiiO / Micro SD).
+- [ ] If it does reproduce, check whether a WPD session reopen clears it as it does on libmtp. That
+      determines whether the planned gated session-recycle mitigation is one implementation or two.
+
+### 3. Regression risk — the suite no longer churns device open/close
+
+PR #25 makes `MTPFileSystemIntegrationTest` reuse **one** MTP session across all ~204 rows instead of
+tearing the bridge down and reopening per test. On Linux that was pure overhead and the suite went
+from 7m25s to 49s. On Windows it is not pure overhead: per "Device lifetime" below, that churn — 50+
+open/close cycles per storage — is what exposed the driver-session leaks, and this file explicitly
+advises *fixing what the churn exposes rather than reducing it*. The change removes that detector as a
+side effect of a Linux optimisation.
+
+Nothing regressed on Windows by construction — reusing a session exercises the driver *less*, not
+differently — but the guard is gone.
+
+- [ ] Run the suite over WPD once as-is, to confirm session reuse works on the driver at all (a reused
+      WPD session held across ~204 rows is a load pattern never tested; the driver has previously
+      wedged mid-run under the *opposite* pattern).
+- [ ] Decide how to keep the leak detector. Cheapest option: a system property (say
+      `-Dmeltjfs.test.churnSessions=true`) that restores the per-test teardown, run on Windows either
+      always or as a second CI job, leaving Linux fast by default. Whatever is chosen, record it here —
+      the churn's diagnostic value is a Windows-only concern and will otherwise be quietly lost.
+
 ## How `readPartial` works on WPD
 
 `WpdBackend.readPartial` issues the MTP **GetPartialObject** operation as a raw MTP command through
@@ -148,10 +213,17 @@ do not release only the device pointer on an open failure.
 This is the sharpest libmtp/WPD asymmetry in the codebase. `LIBMTP_Release_Device` closes a USB
 handle: no reference graph to get wrong, no driver-side session to strand. So the integration
 suite's per-test `MTPDeviceBridge.close()` + reopen — 50+ full device open/close cycles per storage —
-does libmtp no harm while it was steadily poisoning the WPD driver. (It does cost libmtp wall-clock
-time — each reopen re-claims the USB interface and re-enumerates storages, the largest fixed cost of
-the Linux suite — but that is the price of the churn's diagnostic value.) That churn is a useful leak
+does libmtp no harm while it was steadily poisoning the WPD driver. That churn is a useful leak
 detector; prefer fixing what it exposes over reducing it.
+
+**As of PR #25 that churn is gone from `MTPFileSystemIntegrationTest`**, which now holds one session
+for the whole class. The reopen cost this file described as "the price of the churn's diagnostic
+value" turned out to be most of the Linux runtime — 7m25s to 49s once removed — so the trade was taken
+for Linux, and the WPD leak detector went with it. `MTPDeviceBridgeIntegrationTest` still opens and
+closes per test, but that is 4 tests, not 200, so it is a far weaker probe. If a driver-session leak
+is ever suspected again, restore the churn deliberately (see
+[Pending Windows work](#pending-windows-work-pr-25), item 3) rather than assuming a green suite still
+proves the absence of leaks — it no longer applies the load that used to expose them.
 
 ## Resource ownership
 
@@ -183,7 +255,9 @@ Two more places where a COM object must survive an error path, both previously w
   applies deletes asynchronously, a name deleted by one test cannot be re-created for the rest of the
   session, so reusing fixed names across tests (or across runs on one connection) poisons them and
   cascades write failures — the suite would pass on a freshly plugged-in device and then fail on every
-  later run until it was re-plugged. Do not reintroduce shared constant artifact names.
+  later run until it was re-plugged. Do not reintroduce shared constant artifact names. This matters
+  more since PR #25: the suite now holds one session across the whole class, so a reused name is no
+  longer laundered by the next test's reconnect. See [`deleted-name-reservation.md`](deleted-name-reservation.md).
 - The audio tag readers require **no** per-platform work — they operate on `RangedByteSource`, which any
   backend satisfies through `readPartial`. All formats wired into `AudioTagReaders` (FLAC, MP3, MP4/M4A,
   Ogg Vorbis, Opus, WAV) — and any added later — get Windows support for free.
