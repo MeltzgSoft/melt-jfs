@@ -117,6 +117,12 @@ connected, and skip automatically when no device is accessible. They are not par
 A second dev tool, `./gradlew growProbe`, probes what a connected device reports after growing an
 object in place (see `MTPGrowProbe` and the "Growing a file" section of `docs/windows-parity.md`).
 
+## Docs
+
+- `docs/windows-parity.md` — what `WpdBackend` (Windows) still needs to match `NativeLibMTP`.
+- `docs/deleted-name-reservation.md` — devices that keep a deleted name reserved for the rest of the
+  MTP session, what was measured on hardware, and the planned mitigation (not yet implemented).
+
 ## Project structure
 
 ```
@@ -133,11 +139,12 @@ src/
     NativeLibMTP.java            # FFM bindings for libmtp (implements MtpBackend; Linux/macOS)
     WpdBackend.java              # WPD COM backend via FFM (implements MtpBackend; Windows)
     WpdCom.java                  # Low-level COM/FFM plumbing used by WpdBackend
-    audio/                       # Embedded audio-tag readers behind the "audio" attribute view
-      AudioTagReaders.java       #   dispatcher (by extension) over a RangedByteSource
-      {Flac,Mp3,Mp4,Ogg,Wav}MetadataReader.java  #   per-format tag + duration readers
-      VorbisComment.java         #   shared Vorbis-comment parser (FLAC + Ogg/Opus)
     types/                       # Value records
+  main/java/org/meltzg/audio/    # Embedded audio-tag readers behind the "audio" attribute view
+    AudioTagReaders.java         #   dispatcher (by extension) over a RangedByteSource
+    {Flac,Mp3,Mp4,Ogg,Wav}MetadataReader.java  #   per-format tag + duration readers
+    VorbisComment.java           #   shared Vorbis-comment parser (FLAC + Ogg/Opus)
+    RangedByteSource.java        #   the (offset, length) -> byte[] seam; no MTP dependency
   dev/java/org/meltzg/fs/mtp/
     MTPBrowser.java              # CLI tree walker (not included in the published JAR)
     MTPGrowProbe.java            # Diagnostic: what a device reports after an in-place grow
