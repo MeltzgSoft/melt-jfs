@@ -139,24 +139,42 @@ src/
     NativeLibMTP.java            # FFM bindings for libmtp (implements MtpBackend; Linux/macOS)
     WpdBackend.java              # WPD COM backend via FFM (implements MtpBackend; Windows)
     WpdCom.java                  # Low-level COM/FFM plumbing used by WpdBackend
+    MTPOperationUnsupportedException.java  # Signals "device lacks this op"; drives copy+delete emulation
     types/                       # Value records
   main/java/org/meltzg/audio/    # Embedded audio-tag readers behind the "audio" attribute view
     AudioTagReaders.java         #   dispatcher (by extension) over a RangedByteSource
+    AudioTags.java               #   the tag record the readers return
     {Flac,Mp3,Mp4,Ogg,Wav}MetadataReader.java  #   per-format tag + duration readers
     VorbisComment.java           #   shared Vorbis-comment parser (FLAC + Ogg/Opus)
     RangedByteSource.java        #   the (offset, length) -> byte[] seam; no MTP dependency
   dev/java/org/meltzg/fs/mtp/
     MTPBrowser.java              # CLI tree walker (not included in the published JAR)
     MTPGrowProbe.java            # Diagnostic: what a device reports after an in-place grow
-  test/java/org/meltzg/fs/mtp/
-    FakeLibMTP.java              # In-memory MtpBackend test double (no native libs)
-    MTPDeviceBridgeTest.java     # Unit tests using FakeLibMTP
-    MTPDeviceBridgeFreshnessTest.java    # Hot-plug/unplug detection (FakeLibMTP)
-    MTPFileStoreTest.java        # Unit tests using FakeLibMTP
+  test/java/org/meltzg/fs/mtp/   # Unit tests — FakeLibMTP backed, no native libs and no device
+    FakeLibMTP.java              # In-memory MtpBackend test double
+    MTPDeviceBridgeTest.java
+    MTPDeviceBridgeFreshnessTest.java     # Hot-plug/unplug/reconnect detection
+    MTPDeviceBridgeListingCacheTest.java  # Listing cache + per-mutation patching
+    MTPDeviceBridgeTombstoneTest.java     # Async-database tombstones and rename/size overlays
+    MTPFileStoreTest.java
     MTPFileSystemProviderTest.java
+    MTPTrackMetadataTest.java             # the "mtp" (device-index) view
+    MTPFileTagsViewTest.java              # the "audio" (embedded-tag) view
+    MTPLazyReadChannelTest.java           # Lazy ranged-read channel
+    MTPPartialReadTest.java               # readPartial plumbing
+    NativeLibMTPTest.java                 # Pure helpers (no libmtp load)
+    NativeLibMTPLoadTest.java             # Library lookup; self-skips without libmtp
+    types/                                # Value-record tests
+  test/java/org/meltzg/audio/    # Audio tag reader tests (pure Java, no device)
+    {AudioTagReaders,FlacMetadataReader,Mp3MetadataReader,Mp4MetadataReader}Test.java
+    RealFixtureTagsTest.java     #   asserts the known tags of the checked-in fixtures
+    Synthetic{Flac,Mp4}.java     #   builders for hand-constructed test inputs
+  test/resources/fixtures/       # Small real audio files, one per format (see its README)
   integrationTest/java/org/meltzg/fs/mtp/  # Real-device tests (own JVM; skipped when no device)
-    MTPDeviceBridgeIntegrationTest.java
-    MTPFileSystemIntegrationTest.java
+    MTPDeviceBridgeIntegrationTest.java    # Detection and device info, per attached device
+    MTPFileSystemIntegrationTest.java      # Full NIO surface, per (device, storage)
+  integrationTest/resources/fixtures/      # The same fixtures, uploaded to the device and read back
+docs/                            # See the Docs section above
 ```
 
 ## URI schema
@@ -350,7 +368,12 @@ The FFM API requires the following flag, which the Gradle build sets automatical
 
 ### Backend selection & injection
 
-`MTPDeviceBridge` routes all device calls through a static `backend()` accessor. Tests inject a `FakeLibMTP` via `MTPDeviceBridge.setBackend(...)` in `@BeforeClass` and reset it to `null` in `@AfterClass`. When the override is `null`, the bridge falls through to `MtpBackend.defaultBackend()`, which picks the native backend for the current OS on first use.
+`MTPDeviceBridge` routes all device calls through a static `backend()` accessor. Tests inject a fake via
+`MTPDeviceBridge.setBackend(...)` and must reset it to `null` when done — per class
+(`@BeforeClass`/`@AfterClass`) where one fake serves every test, or per test (`@Before`/`@After`) where a
+test needs its own fixture, as the listing-cache and tombstone tests do. The bridge is a singleton, so
+leaving an override installed leaks it into later classes. When the override is `null`, the bridge falls
+through to `MtpBackend.defaultBackend()`, which picks the native backend for the current OS on first use.
 
 ```
 MTPDeviceBridge.backend()
