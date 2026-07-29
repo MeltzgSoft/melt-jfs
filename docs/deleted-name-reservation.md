@@ -132,6 +132,11 @@ recycle for the same name.
 test: it currently self-skips on the affected storage, and a working mitigation should make it **pass**
 there instead of skipping. Watch the skip log — a silent skip is what the failure mode looks like.
 
-Anything landed here also needs a WPD check: all measurements above are libmtp on Linux, and whether
-WPD's `IPortableDeviceContent.CreateObjectWithPropertiesOnly` hits the same reservation on the same
-device is unknown.
+Anything landed here also needs a WPD check: all measurements above are libmtp on Linux. The
+**send-side** version of this reservation is already known to reproduce over WPD — `docs/windows-parity.md`
+records that the driver does not mask it, which is why `WpdBackend` implements in-place editing — so the
+folder-side very likely does too. It has not been measured, though, and
+`IPortableDeviceContent::CreateObjectWithPropertiesOnly` is a different opcode path than
+`SendObjectInfo`. Whether a WPD session reopen clears the reservation the way a libmtp one does is also
+unmeasured, and decides whether the mitigation is one implementation or two. Tracked under "Pending
+Windows work" in `docs/windows-parity.md`.
