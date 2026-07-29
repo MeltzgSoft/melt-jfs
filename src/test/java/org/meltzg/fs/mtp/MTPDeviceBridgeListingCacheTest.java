@@ -8,6 +8,7 @@ import org.meltzg.fs.mtp.types.MTPDeviceInfo;
 import org.meltzg.fs.mtp.types.MTPItemInfo;
 
 import java.io.IOException;
+import java.nio.file.FileAlreadyExistsException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
@@ -94,6 +95,19 @@ public class MTPDeviceBridgeListingCacheTest {
             .map(MTPItemInfo::filename).toList();
         assertTrue("created directory must appear in the cached listing", names.contains("newdir"));
         assertEquals("served from the patched cache, not refetched",
+            afterFirst, backend.getChildItemsCalls.get());
+    }
+
+    /** Creating a directory over a taken name fails from the cached listing, without a device call. */
+    @Test
+    public void createDirectoryOntoExistingNameThrows() throws IOException {
+        var bridge = MTPDeviceBridge.getInstance();
+        bridge.listChildren(id, "/Store/a");
+        int afterFirst = backend.getChildItemsCalls.get();
+
+        assertThrows(FileAlreadyExistsException.class, () -> bridge.createDirectory(id, "/Store/a/b"));
+        assertThrows(FileAlreadyExistsException.class, () -> bridge.createDirectory(id, "/Store/a/f1"));
+        assertEquals("existence detected from the cached listing, not refetched",
             afterFirst, backend.getChildItemsCalls.get());
     }
 

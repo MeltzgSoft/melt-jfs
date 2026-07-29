@@ -231,6 +231,10 @@ public enum MTPDeviceBridge implements Closeable {
         }
     }
 
+    /**
+     * Creates a directory at {@code path}. The path must be at least {@code /Storage/dir}. Throws
+     * {@link FileAlreadyExistsException} when an object with that name already exists.
+     */
     public void createDirectory(MTPDeviceIdentifier deviceId, String path) throws IOException {
         connectionLock.readLock().lock();
         try {
@@ -250,6 +254,9 @@ public enum MTPDeviceBridge implements Closeable {
                     parentId = parentItem.itemId();
                 }
                 var name = parts[parts.length - 1];
+                if (findChildUnsafe(conn, storage.storageId(), parentId, name) != null) {
+                    throw new FileAlreadyExistsException(path);
+                }
                 String folderId;
                 try {
                     folderId = backend.createFolder(conn.handle(), name, parentId, storage.storageId());
