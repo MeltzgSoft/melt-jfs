@@ -104,6 +104,28 @@ public class MTPFileSystemIntegrationTest {
     public final org.junit.rules.TestWatcher skipReasonLogger =
         MTPDeviceBridgeIntegrationTest.skipReasonLogger();
 
+    /**
+     * Whether the next test must open a virgin MTP session. The session is otherwise reused across
+     * every test in this class: tearing it down per test costs a full bus rescan and device reopen
+     * (~200 rows), while {@link MTPDeviceBridge#getInstance()} already re-scans on a throttle and
+     * keeps live connections when the device set is unchanged — a freshness check without a teardown.
+     *
+     * <p>A virgin session is forced after a failure, because a wedged or ghost-poisoned session must
+     * not cascade into the tests that follow, and set initially so the first test starts clean. What
+     * makes the reuse safe is that every artifact name is unique per test (see {@link #uniq}), so no
+     * test can poison a name another test reuses within the shared session.
+     */
+    private static volatile boolean forceReopen = true;
+
+    /** Drops the shared session after a failure so the next test reopens from scratch. */
+    @Rule
+    public final org.junit.rules.TestWatcher sessionResetOnFailure = new org.junit.rules.TestWatcher() {
+        @Override
+        protected void failed(Throwable e, org.junit.runner.Description description) {
+            forceReopen = true;
+        }
+    };
+
     private final MTPDeviceIdentifier deviceId;
     private final String deviceName;
     private final String storageName;
@@ -122,8 +144,20 @@ public class MTPFileSystemIntegrationTest {
         assumeTrue("native MTP backend not available", isBackendAvailable());
         assumeTrue("no MTP device connected", deviceId != null);
         assumeTrue("device exposes no storages: " + deviceName, storageName != null);
-        MTPDeviceBridge.INSTANCE.close();
+
+        // Reuse the open session unless a virgin one was requested; getInstance() still performs the
+        // throttled rescan, so hot-plug and unplug are picked up either way.
+        if (forceReopen) {
+            MTPDeviceBridge.INSTANCE.close();
+            forceReopen = false;
+        }
         var bridge = MTPDeviceBridge.getInstance();
+        if (!bridge.getDeviceConns().containsKey(deviceId)) {
+            // The device is missing from the reused view. It may simply have been reconnected since
+            // the session opened, so pay for one full teardown/reopen before declaring it gone.
+            MTPDeviceBridge.INSTANCE.close();
+            bridge = MTPDeviceBridge.getInstance();
+        }
         assumeTrue("device no longer connected: " + deviceName,
             bridge.getDeviceConns().containsKey(deviceId));
 
@@ -162,9 +196,18 @@ public class MTPFileSystemIntegrationTest {
     public void tearDown() throws IOException {
         if (fs != null && fs.isOpen()) {
             cleanUpTestArtifacts();
-            fs.close();
+            fs.close(); // unregisters from the provider only; the MTP session stays open for reuse
         }
+    }
+
+    /**
+     * Releases the shared session once the whole parameterized suite is done, so it is not left open
+     * for the classes that follow (which enumerate devices from a clean slate).
+     */
+    @AfterClass
+    public static void releaseSharedSession() throws IOException {
         MTPDeviceBridge.INSTANCE.close();
+        forceReopen = true;
     }
 
     private void cleanUpTestArtifacts() {
