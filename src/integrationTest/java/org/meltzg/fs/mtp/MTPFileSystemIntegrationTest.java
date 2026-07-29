@@ -22,6 +22,7 @@ import java.util.Set;
 import java.util.stream.Collectors;
 
 import static org.junit.Assert.*;
+import static org.junit.Assume.assumeNoException;
 import static org.junit.Assume.assumeTrue;
 
 /**
@@ -306,6 +307,64 @@ public class MTPFileSystemIntegrationTest {
     public void deleteNonExistentThrows() throws IOException {
         var storage = requireStorage();
         Files.delete(storage.resolve(TEST_DIR_NAME));
+    }
+
+    // Per the NIO contract createDirectory must refuse a name that is already taken, whether by a
+    // directory or by a file. On-device coverage matters here beyond the in-memory tests: the check
+    // reads through the listing cache, so a device whose object database lags (see the tombstone
+    // handling) is exactly where a spurious throw — or a missed collision — would show up.
+
+    @Test(expected = FileAlreadyExistsException.class)
+    public void createDirectoryFailsWhenDirectoryExists() throws IOException {
+        var storage = requireStorage();
+        var testDir = storage.resolve(TEST_DIR_NAME);
+        Files.createDirectory(testDir);
+        try {
+            Files.createDirectory(testDir);
+        } finally {
+            deleteTreeQuietly(testDir);
+        }
+    }
+
+    @Test(expected = FileAlreadyExistsException.class)
+    public void createDirectoryFailsWhenFileExistsWithSameName() throws IOException {
+        var storage = requireStorage();
+        // A file, not a directory, occupies the name the create will ask for.
+        var taken = storage.resolve(TEST_FILE_NAME);
+        Files.write(taken, new byte[]{1, 2, 3});
+        try {
+            Files.createDirectory(taken);
+        } finally {
+            Files.deleteIfExists(taken);
+        }
+    }
+
+    /**
+     * A create over a name freed by a delete must succeed — where the device permits it at all. Some
+     * devices apply deletes to their object database asynchronously and keep the freed name reserved
+     * for the rest of the MTP session: measured on the FiiO M11 Plus SD-card storage, where
+     * {@code LIBMTP_Create_Folder} keeps refusing the name and a retry/backoff does not help, because
+     * the reservation outlives the session rather than being a propagation delay one can wait out.
+     * Probe the device and skip where recreation is impossible. The suite as a whole sidesteps this by
+     * giving every artifact a name unique to the test, so no other test depends on name reuse.
+     */
+    @Test
+    public void createDirectorySucceedsAfterDeletingSameName() throws IOException {
+        var storage = requireStorage();
+        var testDir = storage.resolve(TEST_DIR_NAME);
+
+        Files.createDirectory(testDir);
+        Files.delete(testDir);
+        try {
+            Files.createDirectory(testDir);
+        } catch (IOException refused) {
+            assumeNoException("device reserves a deleted name for the rest of the session", refused);
+        }
+        try {
+            assertTrue("Recreated directory should exist", Files.isDirectory(testDir));
+        } finally {
+            deleteTreeQuietly(testDir);
+        }
     }
 
     // --- walk ---
