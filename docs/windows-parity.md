@@ -11,7 +11,7 @@ match **`NativeLibMTP`** (libmtp, Linux/macOS). **Keep this file updated wheneve
 - Everything **above** the SPI is platform-neutral and needs no per-backend work:
   - the provider's attribute views (`basic`, `mtp`, `audio`),
   - the lazy read channel (`MTPLazyReadChannel`) and eager `newInputStream`,
-  - the audio tag readers (`org.meltzg.fs.mtp.audio.*` — `FlacMetadataReader`, `Mp3MetadataReader`,
+  - the audio tag readers (`org.meltzg.audio.*` — `FlacMetadataReader`, `Mp3MetadataReader`,
     `Mp4MetadataReader`, `OggMetadataReader`, `WavMetadataReader`), which are pure Java over
     `RangedByteSource`.
 - These light up on Windows automatically **as soon as the backend implements the primitive they call.**

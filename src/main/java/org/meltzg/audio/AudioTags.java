@@ -1,4 +1,4 @@
-package org.meltzg.fs.mtp.audio;
+package org.meltzg.audio;
 
 /**
  * Tags parsed from an audio file's own embedded metadata (e.g. a FLAC VORBIS_COMMENT block), as

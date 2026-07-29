@@ -1,4 +1,4 @@
-package org.meltzg.fs.mtp.audio;
+package org.meltzg.audio;
 
 import java.io.IOException;
 import java.util.Arrays;

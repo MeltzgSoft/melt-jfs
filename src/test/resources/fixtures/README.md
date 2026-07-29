@@ -1,6 +1,6 @@
 # Audio test fixtures
 
-Small audio files used by the `org.meltzg.fs.mtp.audio` reader tests. Kept tiny (~50 KB, 4 seconds) so
+Small audio files used by the `org.meltzg.audio` reader tests. Kept tiny (~50 KB, 4 seconds) so
 they are cheap to check in. Additional formats add their own fixture as the corresponding reader lands.
 
 ## `fixture.flac`
