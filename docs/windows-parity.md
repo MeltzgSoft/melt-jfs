@@ -151,11 +151,15 @@ fail. The send-side version of this reservation is **already known to reproduce 
 "In-place object editing on WPD"), so the folder-side probably does too — but it has not been measured,
 and `CreateObjectWithPropertiesOnly` is a different opcode path than `SendObjectInfo`.
 
-- [ ] Run `createDirectorySucceedsAfterDeletingSameName`. It self-skips where the device refuses, so
-      **watch the skip log** — a silent skip is exactly what the failure mode looks like. Record which
-      storages skip on WPD versus libmtp (libmtp: only FiiO / Micro SD).
-- [ ] If it does reproduce, check whether a WPD session reopen clears it as it does on libmtp. That
-      determines whether the planned gated session-recycle mitigation is one implementation or two.
+- [x] Run `createDirectorySucceedsAfterDeletingSameName`. **It reproduces on WPD**, skipping on
+      FiiO / Micro SD and only there — the same single storage as libmtp, with
+      `CreateObjectWithPropertiesOnly failed (HRESULT 0x80004005)`.
+- [x] Check whether a WPD session reopen clears it as it does on libmtp. **It does not.** A full
+      `closeInterfaces` + `IPortableDevice::Close` + fresh `Open` left the reservation intact and the
+      retry was refused identically. The gated session-recycle mitigation is therefore **libmtp-only**,
+      gated off on WPD by `MtpBackend.reopenClearsNameReservations()`. A Windows fix needs a lever that
+      resets the session *on the device*, which the pooled driver session appears to prevent — see
+      [`deleted-name-reservation.md`](deleted-name-reservation.md).
 
 ### 3. Regression risk — the suite no longer churns device open/close
 

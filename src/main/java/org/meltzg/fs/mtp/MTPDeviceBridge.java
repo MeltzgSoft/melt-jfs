@@ -4,6 +4,7 @@ import java.io.Closeable;
 import java.io.IOException;
 import java.nio.file.DirectoryNotEmptyException;
 import java.nio.file.FileAlreadyExistsException;
+import java.nio.file.FileSystemException;
 import java.nio.file.NoSuchFileException;
 import java.nio.file.NotDirectoryException;
 import java.util.*;
@@ -84,6 +85,23 @@ public enum MTPDeviceBridge implements Closeable {
     // The overlay reports the length actually written until the device agrees, then drops itself.
     // Keyed per device; cleared when connections are torn down.
     private final Map<ItemKey, Long> sizeOverlays = new ConcurrentHashMap<>();
+
+    // Paths whose name this bridge freed with a DeleteObject in the current session and which
+    // nothing has reoccupied. Some devices keep a deleted name reserved for the rest of the MTP
+    // session, refusing to create an object under it again (measured on an Android-based player's
+    // SD-card storage; see docs/deleted-name-reservation.md). Unlike the lag the tombstones and
+    // overlays paper over, this does not heal with time — waiting is measurably useless — and only
+    // a fresh session clears it. This set is the gate on that recovery: it authorises
+    // createDirectory to recycle the connections and retry exactly once, and only for a name we
+    // know we freed ourselves. Without the gate every createFolder failure (a full storage, a
+    // read-only volume, an invalid name) would trigger a device-wide reconnect and mask the real
+    // error. Entries are consumed when they authorise a retry, and cleared when connections are
+    // torn down — after a recycle the reservation is gone, so the entry must not authorise a
+    // second one. Keyed by path rather than by object id: the id is exactly what a delete
+    // destroys, and the path is what a later create names.
+    private final Set<FreedName> freedNames = ConcurrentHashMap.newKeySet();
+
+    private record FreedName(MTPDeviceIdentifier deviceId, String path) {}
 
     // Backoff schedule for re-sending a file whose same-named predecessor was just deleted; devices
     // with an asynchronous MTP database can reject the send until the delete propagates.
@@ -234,8 +252,43 @@ public enum MTPDeviceBridge implements Closeable {
     /**
      * Creates a directory at {@code path}. The path must be at least {@code /Storage/dir}. Throws
      * {@link FileAlreadyExistsException} when an object with that name already exists.
+     *
+     * <p>When the device refuses a name this bridge freed earlier in the session — some keep a
+     * deleted name reserved until the session ends (see {@link #freedNames}) — the connections are
+     * recycled and the create is retried once. Doubly gated: on having freed the name ourselves, so
+     * an ordinary failure still surfaces unchanged, and on
+     * {@link MtpBackend#reopenClearsNameReservations()}, since on WPD a reopen does not clear the
+     * reservation and the reconnect would be pure cost. Either way an unrecoverable failure costs
+     * no reconnect.
      */
     public void createDirectory(MTPDeviceIdentifier deviceId, String path) throws IOException {
+        try {
+            createDirectoryOnce(deviceId, path);
+        } catch (FileSystemException definitive) {
+            // FileAlreadyExists / NoSuchFile / NotDirectory are answers about the filesystem, not
+            // symptoms of a reserved name; a fresh session would return the same answer.
+            throw definitive;
+        } catch (IOException refused) {
+            if (!backend().reopenClearsNameReservations()) {
+                throw refused; // a reconnect would not clear the reservation on this backend
+            }
+            if (!freedNames.remove(new FreedName(deviceId, canonicalPath(path)))) {
+                throw refused; // a name we never freed: this is a real error, not the reservation
+            }
+            // The device is holding a name we deleted in this session. Only a new session clears
+            // that, and the recycle takes the write lock, so it cannot run inside createDirectoryOnce's
+            // read-locked region (ReentrantReadWriteLock does not permit read -> write upgrade).
+            recycleConnections();
+            try {
+                createDirectoryOnce(deviceId, path);
+            } catch (IOException stillRefused) {
+                stillRefused.addSuppressed(refused); // keep the pre-recycle failure for diagnosis
+                throw stillRefused;
+            }
+        }
+    }
+
+    private void createDirectoryOnce(MTPDeviceIdentifier deviceId, String path) throws IOException {
         connectionLock.readLock().lock();
         try {
             var parts = pathParts(path);
@@ -292,6 +345,9 @@ public enum MTPDeviceBridge implements Closeable {
                     var parentId = parts.length == 2 ? MtpBackend.ROOT_PARENT : item.parentId();
                     tombstoneUnsafe(conn, item.itemId(), item.storageId(), parentId);
                 }
+                // Nothing reoccupies this name, so a device that reserves it stays poisoned for
+                // the name until the session is recycled.
+                recordFreedName(deviceId, path);
                 listingRemoveUnsafe(conn, item.itemId());
             }
         } finally {
@@ -330,6 +386,7 @@ public enum MTPDeviceBridge implements Closeable {
                 if (existing != null && !existing.isFile()) {
                     throw new IOException("Target exists and is a directory: " + path);
                 }
+                boolean freedName = false;
                 try {
                     long size = java.nio.file.Files.size(localFile);
                     if (existing != null) {
@@ -353,6 +410,7 @@ public enum MTPDeviceBridge implements Closeable {
                             }
                         }
                         backend.deleteObject(conn.handle(), existing.itemId());
+                        freedName = true;
                         tombstoneUnsafe(conn, existing.itemId(), storage.storageId(), parentId);
                         listingRemoveUnsafe(conn, existing.itemId());
                     }
@@ -362,6 +420,9 @@ public enum MTPDeviceBridge implements Closeable {
                         true, size, nowEpochSeconds(), name));
                     return newId;
                 } catch (IOException | RuntimeException e) {
+                    // A completed send reoccupies the name, so it is only left free when the send
+                    // is what failed.
+                    if (freedName) recordFreedName(deviceId, path);
                     invalidateListings(); // the device's state is unknown after a failed mutation
                     throw e;
                 }
@@ -432,9 +493,11 @@ public enum MTPDeviceBridge implements Closeable {
                 var tgtParentParts = Arrays.copyOf(tgtParts, tgtParts.length - 1);
                 boolean sameDirectory = Arrays.equals(srcParentParts, tgtParentParts);
 
+                boolean freedTargetName = false;
                 try {
                     if (existingTgt != null) {
                         backend.deleteObject(conn.handle(), existingTgt.itemId());
+                        freedTargetName = true;
                         tombstoneUnsafe(conn, existingTgt.itemId(), tgtStorage.storageId(), tgtParentId);
                         listingRemoveUnsafe(conn, existingTgt.itemId());
                     }
@@ -458,6 +521,9 @@ public enum MTPDeviceBridge implements Closeable {
                                 i.isFile(), i.filesize(), i.modificationDate(), tgtName));
                     }
                 } catch (IOException nativeError) {
+                    // The move/rename that would have reoccupied the deleted target's name did not
+                    // complete, so that name is left free — and reserved on devices that do so.
+                    if (freedTargetName) recordFreedName(deviceId, targetPath);
                     invalidateListings(); // a partially applied native move: refetch rather than guess
                     // Many devices do not implement MoveObject/SetObjectName; let the caller emulate.
                     throw new MTPOperationUnsupportedException(
@@ -571,6 +637,52 @@ public enum MTPDeviceBridge implements Closeable {
         }
     }
 
+    /**
+     * Tears down every connection and reopens from scratch, <em>unconditionally</em> — unlike
+     * {@link #refresh()}, which reconciles against the last scan and deliberately keeps live
+     * connections when the attached-device set is unchanged. That short-circuit makes refresh
+     * useless here: the device is still attached, so its signature still matches and the MTP
+     * session (which is what holds the reserved name) would survive. Takes the write lock, so the
+     * caller must hold no read lock.
+     *
+     * <p>The blast radius is process-wide: this releases every open device, not just the one whose
+     * name is reserved, and drops the listing cache, tombstones and overlays along with it. Object
+     * ids are not stable across it either, since devices are reopened uncached. That is why it is
+     * reached only through {@code createDirectory}'s gated retry and never speculatively.
+     */
+    private void recycleConnections() throws IOException {
+        connectionLock.writeLock().lock();
+        try {
+            closeUnsafe();
+            var scan = backend().scan();
+            boolean keepScan = false;
+            try {
+                openDevicesUnsafe(scan);
+                currentScan = scan;
+                keepScan = true;
+                lastSignature = new HashSet<>(scan.signatures());
+                lastDetectNanos = System.nanoTime();
+                devicesDetected = true;
+            } finally {
+                if (!keepScan) {
+                    scan.close();
+                }
+            }
+        } finally {
+            connectionLock.writeLock().unlock();
+        }
+    }
+
+    /** Records that {@code path}'s name was freed by a DeleteObject and nothing has taken it back. */
+    private void recordFreedName(MTPDeviceIdentifier deviceId, String path) {
+        freedNames.add(new FreedName(deviceId, canonicalPath(path)));
+    }
+
+    /** Normalizes a path for {@link #freedNames} keying, so "/S/d" and "//S//d/" match. */
+    private static String canonicalPath(String path) {
+        return String.join("/", pathParts(path));
+    }
+
     private void openDevicesUnsafe(MtpBackend.Scan scan) throws IOException {
         var signatures = scan.signatures();
         for (int i = 0; i < signatures.size(); i++) {
@@ -599,6 +711,7 @@ public enum MTPDeviceBridge implements Closeable {
         tombstones.clear();
         renameOverlays.clear();
         sizeOverlays.clear();
+        freedNames.clear(); // a new session releases every reserved name, so none may authorise a retry
         lastSignature = Set.of();
         devicesDetected = false;
     }

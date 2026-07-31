@@ -136,6 +136,29 @@ public interface MtpBackend {
         throw new UnsupportedOperationException("In-place object editing is not supported by this backend");
     }
 
+    /**
+     * Whether releasing a device and opening it again starts a genuinely new MTP session on the wire.
+     * That is the only known way to clear a <em>deleted-name reservation</em>: some devices refuse to
+     * create an object under a name deleted earlier in the same session, and no amount of waiting
+     * clears it (see {@code docs/deleted-name-reservation.md}).
+     *
+     * <p>Measured, not assumed — and the two backends differ:
+     * <ul>
+     *   <li><b>libmtp: true.</b> It owns the USB handle, so {@code LIBMTP_Release_Device} really does
+     *       end the MTP session. A reopen cleared the reservation 4/4 on the affected storage.</li>
+     *   <li><b>WPD: false.</b> A full {@code IPortableDevice::Close} + reopen leaves the reservation
+     *       in place — the driver multiplexes a pooled session to the device, so closing a client
+     *       handle does not end the MTP session the device sees. Verified against a FiiO M11 Plus SD
+     *       card: the create was refused again, identically, after the reconnect.</li>
+     * </ul>
+     *
+     * <p>The default is false, so a backend only opts in once a reopen is measured to work; a
+     * needless reconnect is expensive and process-wide.
+     */
+    default boolean reopenClearsNameReservations() {
+        return false;
+    }
+
     /** Relocates an object to a new {@code parentId} on {@code storageId}, keeping its id. */
     void moveObject(DeviceHandle device, String itemId, String storageId, String parentId) throws IOException;
 

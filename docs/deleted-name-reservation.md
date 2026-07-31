@@ -2,8 +2,9 @@
 
 Some devices refuse to reuse the name of an object deleted earlier in the same MTP session. This file
 records what was measured on real hardware, why the obvious workarounds do not work, and the design of
-the mitigation we intend to add. **Nothing here is implemented yet** — the current code sidesteps the
-problem rather than fixing it (see [Current behaviour](#current-behaviour)).
+the mitigation. The gated session recycle described below **is implemented** in
+`MTPDeviceBridge.createDirectory`; it has unit coverage but has not yet been confirmed against the
+affected hardware (see [Status](#status)).
 
 ## Symptom
 
@@ -50,9 +51,22 @@ Three conclusions follow:
 > `Create_Folder failed` against the target and masks whether `SetObjectName` was the operation actually
 > refused.
 
-## Current behaviour
+## Status
 
-Nothing recovers from this today. Two things keep it from mattering much:
+Implemented and unit-tested. **libmtp-only: the recycle does not work over WPD**, and is gated off
+there by `MtpBackend.reopenClearsNameReservations()` (see [WPD](#wpd)).
+
+- [x] Run over WPD — **negative result**, measured. The recycle fired correctly and the device
+      refused the retry identically; Windows now skips the recovery rather than paying a futile
+      process-wide reconnect. Suite back to baseline: 220 tests, 217 passed, 3 skipped, 0 failed.
+- [ ] Run the integration suite on Linux/libmtp, where a reopen *was* measured to clear the
+      reservation. This is the half expected to work and it has **not been run yet** — the
+      acceptance test `createDirectorySucceedsAfterDeletingSameName` should flip from skip to pass
+      on FiiO / Micro SD. Watch the skip log: a silent skip is what the failure mode looks like.
+
+## Behaviour before this mitigation
+
+Nothing recovered from this. Two things kept it from mattering much:
 
 - **The integration suite gives every artifact a name unique to the test** (see `uniq` in
   `MTPFileSystemIntegrationTest`), so no test depends on reusing a freed name.
@@ -63,10 +77,10 @@ Nothing recovers from this today. Two things keep it from mattering much:
   reservation is never triggered. There is no equivalent for folders — you cannot rewrite a directory —
   which is why folder creation is the exposed case.
 
-So the gap is felt by **consumers**, not by our tests: a sync tool that deletes a folder and recreates
-it under the same name gets an opaque `IOException` on this storage.
+So the gap was felt by **consumers**, not by our tests: a sync tool that deletes a folder and recreates
+it under the same name got an opaque `IOException` on this storage.
 
-## Proposed mitigation: gated session recycle
+## The mitigation: gated session recycle
 
 Retry the create once against a fresh session, but only when we have positive evidence the name was
 freed by us in this session.
@@ -75,11 +89,29 @@ freed by us in this session.
 createDirectory(deviceId, path):
     try:
         createDirectoryOnce(deviceId, path)          # acquires the read lock internally
+    catch FileSystemException e: throw e             # a definitive answer, not the reservation
     catch IOException e:
-        if not freedThisSession(deviceId, storageId, parentId, name): throw e
-        refresh()                                    # write lock, OUTSIDE the read lock
-        createDirectoryOnce(deviceId, path)          # one retry; propagate whatever it throws
+        if not freedNames.remove(deviceId, path): throw e   # consumes the gate
+        recycleConnections()                         # write lock, OUTSIDE the read lock
+        createDirectoryOnce(deviceId, path)          # one retry; suppressed-chains e on failure
 ```
+
+### `refresh()` does **not** work here
+
+An earlier draft of this design called `refresh()` to get the fresh session. It does not:
+`reconcileDevicesUnsafe` short-circuits when the attached-device set is unchanged —
+
+```java
+if (signature.equals(lastSignature) && !deviceConns.isEmpty()) {
+    return; // nothing changed; keep the live connections
+}
+```
+
+— and the device *is* still attached, so its signature still matches and the MTP session that holds
+the reservation survives untouched. (`ensureFresh()` is additionally throttled by
+`DETECT_INTERVAL_NANOS`, a second way to no-op.) The recovery therefore needs
+`recycleConnections()`, which closes and reopens unconditionally. Substituting `refresh()` back in
+fails four of the six tests in `MTPDeviceBridgeSessionRecycleTest`.
 
 ### Gating
 
@@ -87,18 +119,31 @@ Gate on *"this exact name was deleted through this bridge in this session"*. Wit
 `createFolder` failure — a full storage, a read-only volume, an invalid name — would trigger a full
 device reconnect and mask the real error.
 
-The bridge already tombstones deleted ids, but tombstones are keyed by *id*; this needs a *name*-keyed
-record: `(deviceId, storageId, parentId, filename)` for every name freed by `delete` and by the
-replacing paths in `writeFile`/`move`. Cleared in `closeUnsafe()` alongside the tombstones — after a
-recycle the reservation is gone, so the entry has served its purpose and must not authorise a second
-recycle for the same name.
+The bridge already tombstones deleted ids, but tombstones are keyed by *id* — which is exactly what a
+delete destroys — so this needs a separate `freedNames` set keyed by `(deviceId, canonical path)`, the
+path being what a later create names. Recorded for every name freed by a `DeleteObject` that nothing
+reoccupies:
+
+| Site | Recorded when |
+|---|---|
+| `delete` | always — nothing takes the name back |
+| `writeFile` (replacing) | only if the follow-up send fails; a completed send reoccupies the name |
+| `move` (replacing target) | only if the move/rename that would occupy the name fails |
+
+Entries are consumed by `Set.remove` when they authorise a retry — which also makes the gate
+thread-safe, since only one caller can win it — and cleared in `closeUnsafe()` alongside the
+tombstones: after a recycle the reservation is gone, so the entry must not authorise a second one.
+
+`FileAlreadyExistsException`, `NoSuchFileException` and `NotDirectoryException` are excluded from the
+retry as a group (they share the `FileSystemException` supertype): each is an answer about the
+filesystem that a fresh session would repeat.
 
 ### Constraints that shape the design
 
-1. **It cannot be done inline.** `createDirectory` holds `connectionLock.readLock()` while `close()`
-   and `refresh()` take `connectionLock.writeLock()`. `ReentrantReadWriteLock` does not permit
+1. **It cannot be done inline.** `createDirectory` holds `connectionLock.readLock()` while
+   `recycleConnections()` takes `connectionLock.writeLock()`. `ReentrantReadWriteLock` does not permit
    upgrading read → write, so recycling inside the locked region deadlocks. The retry must sit above
-   the lock, which is why the sketch above splits out a `createDirectoryOnce`.
+   the lock, which is why the code splits out a `createDirectoryOnce`.
 2. **The blast radius is process-wide.** `closeUnsafe()` releases **every** open device, not just the
    one being fixed, and clears the listing cache, tombstones, rename overlays and size overlays. A
    single folder create would therefore disturb unrelated in-flight work on other devices. Any
@@ -121,22 +166,43 @@ recycle for the same name.
   one affected device and is the natural refinement, but `closeUnsafe()` is currently all-or-nothing
   and `currentScan` owns native resources shared by every device opened from it. Untangling that is a
   larger change than the mitigation itself; worth revisiting if the coarse recycle proves disruptive.
-- **Capability flag and surface a typed exception** — cheapest option: detect the condition and throw
-  something more descriptive than a bare `IOException` so callers can choose their own recovery, with
-  no reconnect. Worth doing regardless of whether the recycle lands, since it turns an opaque failure
-  into an actionable one.
+- **Capability flag and surface a typed exception** — detect the condition and throw something more
+  descriptive than a bare `IOException` so callers can choose their own recovery, with no reconnect.
+  Still worth doing alongside the recycle: it turns the *unrecoverable* case — the retry after the
+  recycle also failing — from an opaque `IOException` into an actionable one.
 
-## Verifying a fix
+## Unit coverage
 
-`createDirectorySucceedsAfterDeletingSameName` in `MTPFileSystemIntegrationTest` is the acceptance
-test: it currently self-skips on the affected storage, and a working mitigation should make it **pass**
-there instead of skipping. Watch the skip log — a silent skip is what the failure mode looks like.
+`MTPDeviceBridgeSessionRecycleTest` drives a fake backend that reserves deleted names until the
+device is released and reopened. It pins the recovery (a reserved name recreates after exactly one
+recycle), both halves of the gate (no recycle for a name the bridge did not free; none for
+`FileAlreadyExistsException`), that the gate is spent after one use, and that `writeFile` records a
+freed name only when its send actually failed.
 
-Anything landed here also needs a WPD check: all measurements above are libmtp on Linux. The
-**send-side** version of this reservation is already known to reproduce over WPD — `docs/windows-parity.md`
-records that the driver does not mask it, which is why `WpdBackend` implements in-place editing — so the
-folder-side very likely does too. It has not been measured, though, and
-`IPortableDeviceContent::CreateObjectWithPropertiesOnly` is a different opcode path than
-`SendObjectInfo`. Whether a WPD session reopen clears the reservation the way a libmtp one does is also
-unmeasured, and decides whether the mitigation is one implementation or two. Tracked under "Pending
-Windows work" in `docs/windows-parity.md`.
+## WPD
+
+The reservation **reproduces over WPD** — an integration run on Windows skipped
+`createDirectorySucceedsAfterDeletingSameName` on FiiO / Micro SD, and only there, exactly matching
+libmtp, with `IOException: CreateObjectWithPropertiesOnly failed (HRESULT 0x80004005)` from
+`WpdBackend.createFolder`. So it is not an opcode-path difference between
+`CreateObjectWithPropertiesOnly` and `SendObjectInfo`, and the driver does not mask it.
+
+**But a WPD reopen does not clear it**, so the mitigation is libmtp-only. Measured by running the
+mitigation itself: the gate fired, `recycleConnections()` ran a full teardown (release properties and
+content, `IPortableDevice::Close`, fresh scan, fresh `Open`), and the retry was refused with the
+identical HRESULT — visible in the test report as the post-recycle failure carrying the pre-recycle
+one as a suppressed exception.
+
+The likely reason is that what has to be reset is the *device's* MTP session, not the host's handle
+to it. libmtp owns the USB handle, so releasing it genuinely ends the session and the device rebuilds
+its object index on the next one. The WpdMtpDr driver pools a session across clients, so closing an
+`IPortableDevice` does not end the session the device sees, and nothing on the device gets rebuilt.
+
+Consequences:
+
+- `MtpBackend.reopenClearsNameReservations()` gates the recovery. WPD returns false and takes the
+  plain failure; do not flip it without re-measuring.
+- **A Windows fix needs a different lever** — something that makes the *device* start a new MTP
+  session while the driver keeps its pool. Unexplored: whether WPD exposes a session reset at all,
+  or whether only a physical replug does it. If nothing does, the typed-exception alternative below
+  is the realistic ceiling on Windows.

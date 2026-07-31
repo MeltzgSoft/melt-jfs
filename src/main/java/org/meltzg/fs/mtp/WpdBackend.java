@@ -745,6 +745,18 @@ class WpdBackend implements MtpBackend {
     }
 
     @Override
+    public boolean reopenClearsNameReservations() {
+        // Measured false, unlike libmtp: a full closeInterfaces (release properties/content, then
+        // IPortableDevice::Close) followed by a fresh scan and Open leaves a deleted-name
+        // reservation intact — the FiiO M11 Plus SD card refused the same createFolder again, with
+        // the identical HRESULT, after the reconnect. The driver pools an MTP session to the device
+        // across clients, so closing a client handle does not end the session the device sees.
+        // Do not flip this to true without re-measuring; the reconnect it authorises is
+        // process-wide and, here, futile.
+        return false;
+    }
+
+    @Override
     public boolean supportsPartialReads() {
         // Implemented through MTP GetPartialObject, sent as a raw command via IPortableDevice::SendCommand.
         // Device-level support (which GetPartialObject variant, if any) is probed on first use.
