@@ -33,7 +33,8 @@ match **`NativeLibMTP`** (libmtp, Linux/macOS). **Keep this file updated wheneve
 | `audio` view (embedded tags) | ✅ | ✅ (lit up by `readPartial`) | none |
 | Audio tag readers (FLAC/MP3/MP4/Ogg/Opus/WAV) | ✅ (neutral) | ✅ (neutral) | none — pure Java, backend-agnostic |
 | In-place object editing (`supportsObjectEditing` / `overwriteFile`) | ✅ (Android edit extension, gated by `LIBMTP_Check_Capability`) | ✅ (same extension via `SendCommand`), grows included | none — stale post-edit sizes are corrected by the bridge's size overlays |
-| `createDirectory` name-collision check (`FileAlreadyExistsException`) | ✅ | ⚠️ unverified | none expected — the check is above the SPI; needs a Windows run (see below) |
+| `createDirectory` name-collision check (`FileAlreadyExistsException`) | ✅ | ✅ | none — verified on all four storages in the 2026-07-31 WPD run |
+| Deleted-name recovery (`reopenClearsNameReservations` / session recycle) | ✅ `true` | ❌ `false` | **real gap** — a WPD reopen does not clear the reservation, so the recovery is gated off there and the create fails as before (see [2](#2-verify--does-the-deleted-name-reservation-apply-to-folder-creation-on-wpd)) |
 
 Legend: ✅ done · ⚠️ works via fallback or unverified · ❌ missing.
 
@@ -46,11 +47,19 @@ devices.
 
 > **That WPD figure predates PR #25 and no longer describes the current suite.** The suite is now 220
 > tests (three new `createDirectory*` cases × four storages), and PR #25 also changed how the suite
-> drives the device session — see [Pending Windows work](#pending-windows-work-pr-25). Linux/libmtp is
-> green at 220 (218 passed, 2 skips, 0 failures) as of the 2026-07-31 run; Windows has not been
-> re-run. The 2 skips are both `moveNonEmptyDirectoryThrowsWhenNotNativelySupported` on the FiiO's
-> two storages (it natively supports directory move); the deleted-name-reservation skip on FiiO /
-> Micro SD is gone — see [`deleted-name-reservation.md`](deleted-name-reservation.md#status).
+> drives the device session — see [Pending Windows work](#pending-windows-work-pr-25). Both platforms
+> have now been re-run on 2026-07-31, and they differ by exactly one test:
+>
+> | | Tests | Passed | Skipped | Failed |
+> |---|---|---|---|---|
+> | Linux / libmtp | 220 | 218 | 2 | 0 |
+> | Windows / WPD | 220 | 217 | 3 | 0 |
+>
+> Two skips are common to both: `moveNonEmptyDirectoryThrowsWhenNotNativelySupported` on the FiiO's
+> two storages, which natively supports directory move. The third, Windows-only, is
+> `createDirectorySucceedsAfterDeletingSameName` on FiiO / Micro SD — the deleted-name reservation,
+> which the session recycle clears on libmtp but not over WPD. That single test is the whole of the
+> current parity gap; see [`deleted-name-reservation.md`](deleted-name-reservation.md#status).
 
 No caveats remain on the FiiO. The intermittent failures previously recorded here — the growing
 replace on its SD card, storages transiently disappearing, sessions wedging mid-run — were all
@@ -124,9 +133,14 @@ retry loop hammered the device with repeated `SendObjectInfo` for a name the dev
 
 ## Pending Windows work (PR #25)
 
-PR #25 introduces no new `MtpBackend` primitive, so there is most likely **nothing to implement** —
-but it changes two things that only Windows can settle, and it weakens a WPD-specific safety net.
-Everything below is for a Windows host with both devices attached.
+All three verification items below have since been **run on a Windows host with both devices
+attached** (2026-07-31). Items 1 and 3 came back clean; item 2 came back negative and produced the
+one real parity gap in the Status table. Two open items remain, both marked below: the TTL-window
+HRESULT backstop (item 1) and the leak-detector decision (item 3).
+
+Note the original framing — "PR #25 introduces no new `MtpBackend` primitive, so there is most likely
+nothing to implement" — did not survive item 2: `reopenClearsNameReservations()` was added to the SPI
+precisely because the two backends diverge here.
 
 ### 1. Verify — the `createDirectory` collision check
 
@@ -135,9 +149,13 @@ above the SPI from the cached listing, before any native call. This matters more
 libmtp: libmtp merely failed with a generic `IOException`, whereas WPD **could silently succeed and
 create a duplicate-named object**, which is the worse outcome the check is meant to prevent.
 
-- [ ] Run `createDirectoryFailsWhenDirectoryExists` and `createDirectoryFailsWhenFileExistsWithSameName`
-      on all four storages. Both pass on libmtp everywhere.
-- [ ] Confirm no duplicate-named object is left behind on the device afterwards.
+- [x] Run `createDirectoryFailsWhenDirectoryExists` and `createDirectoryFailsWhenFileExistsWithSameName`
+      on all four storages. **Both pass on WPD everywhere**, as on libmtp (2026-07-31 run).
+- [x] Confirm no duplicate-named object is left behind on the device afterwards. Settled by
+      construction rather than by direct inspection: `FileAlreadyExistsException` is raised only by
+      the pre-SPI cached-listing check in `MTPDeviceBridge.createDirectory`, before any native call,
+      so a passing test means `CreateObjectWithPropertiesOnly` was never issued and no duplicate
+      could have been created. The tests assert the exception, not the device's post-state.
 - [ ] **Consider implementing** a backstop for the TTL-window race (caveat 2 on PR #25): if something
       outside the session creates the name while a cached listing is still fresh, the check misses it
       and the create falls through to the driver. On libmtp that surfaces as a generic `IOException`;
@@ -147,12 +165,13 @@ create a duplicate-named object**, which is the worse outcome the check is meant
 
 ### 2. Verify — does the deleted-name reservation apply to *folder* creation on WPD?
 
-See [`deleted-name-reservation.md`](deleted-name-reservation.md) for the full measurements. On
-libmtp, the FiiO SD card refuses a `CreateFolder` for a name deleted earlier in the same session, and
-a session reopen is the only reliable clear (4/4, ~500ms); retry/backoff and rename-into-the-name both
-fail. The send-side version of this reservation is **already known to reproduce over WPD** (see
-"In-place object editing on WPD"), so the folder-side probably does too — but it has not been measured,
-and `CreateObjectWithPropertiesOnly` is a different opcode path than `SendObjectInfo`.
+**Answered: yes, and the mitigation does not work here.** See
+[`deleted-name-reservation.md`](deleted-name-reservation.md) for the full measurements. On libmtp,
+the FiiO SD card refuses a `CreateFolder` for a name deleted earlier in the same session, and a
+session reopen is the only reliable clear (4/4, ~500ms); retry/backoff and rename-into-the-name both
+fail. The folder-side reservation reproduces identically over WPD — same device, same single storage
+— so `CreateObjectWithPropertiesOnly` being a different opcode path than `SendObjectInfo` turned out
+not to matter. What *does* differ is the escape: a WPD reopen leaves the reservation in place.
 
 - [x] Run `createDirectorySucceedsAfterDeletingSameName`. **It reproduces on WPD**, skipping on
       FiiO / Micro SD and only there — the same single storage as libmtp, with
@@ -176,9 +195,10 @@ side effect of a Linux optimisation.
 Nothing regressed on Windows by construction — reusing a session exercises the driver *less*, not
 differently — but the guard is gone.
 
-- [ ] Run the suite over WPD once as-is, to confirm session reuse works on the driver at all (a reused
-      WPD session held across ~204 rows is a load pattern never tested; the driver has previously
-      wedged mid-run under the *opposite* pattern).
+- [x] Run the suite over WPD once as-is, to confirm session reuse works on the driver at all.
+      **It does** — green across three full runs on 2026-07-31 (216 rows on one held session, ~45s
+      each), with no mid-run wedge. One of those runs additionally forced a mid-suite
+      `recycleConnections()` teardown and reopen, and the remaining rows were unaffected.
 - [ ] Decide how to keep the leak detector. Cheapest option: a system property (say
       `-Dmeltjfs.test.churnSessions=true`) that restores the per-test teardown, run on Windows either
       always or as a second CI job, leaving Linux fast by default. Whatever is chosen, record it here —
