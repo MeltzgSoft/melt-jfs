@@ -3,8 +3,8 @@
 Some devices refuse to reuse the name of an object deleted earlier in the same MTP session. This file
 records what was measured on real hardware, why the obvious workarounds do not work, and the design of
 the mitigation. The gated session recycle described below **is implemented** in
-`MTPDeviceBridge.createDirectory`; it has unit coverage but has not yet been confirmed against the
-affected hardware (see [Status](#status)).
+`MTPDeviceBridge.createDirectory`, has unit coverage, and **is now confirmed against the affected
+hardware** on Linux/libmtp (see [Status](#status)).
 
 ## Symptom
 
@@ -59,10 +59,13 @@ there by `MtpBackend.reopenClearsNameReservations()` (see [WPD](#wpd)).
 - [x] Run over WPD — **negative result**, measured. The recycle fired correctly and the device
       refused the retry identically; Windows now skips the recovery rather than paying a futile
       process-wide reconnect. Suite back to baseline: 220 tests, 217 passed, 3 skipped, 0 failed.
-- [ ] Run the integration suite on Linux/libmtp, where a reopen *was* measured to clear the
-      reservation. This is the half expected to work and it has **not been run yet** — the
-      acceptance test `createDirectorySucceedsAfterDeletingSameName` should flip from skip to pass
-      on FiiO / Micro SD. Watch the skip log: a silent skip is what the failure mode looks like.
+- [x] Run the integration suite on Linux/libmtp, where a reopen *was* measured to clear the
+      reservation. **Confirmed.** `createDirectorySucceedsAfterDeletingSameName` flipped from skip
+      to pass on FiiO / Micro SD (220 tests, 218 passed, 2 skipped, 0 failed): the run took 1.27s
+      against ~0.25–0.5s for the same test on every other storage, matching the recycle's ~500ms
+      cost, and no skip was logged. The other two skips in that run are the unrelated
+      `moveNonEmptyDirectoryThrowsWhenNotNativelySupported` assumption on the FiiO's two storages
+      (it natively supports directory move, so the emulation path isn't exercised there).
 
 ## Behaviour before this mitigation
 

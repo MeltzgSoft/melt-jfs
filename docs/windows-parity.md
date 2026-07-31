@@ -47,7 +47,10 @@ devices.
 > **That WPD figure predates PR #25 and no longer describes the current suite.** The suite is now 220
 > tests (three new `createDirectory*` cases × four storages), and PR #25 also changed how the suite
 > drives the device session — see [Pending Windows work](#pending-windows-work-pr-25). Linux/libmtp is
-> green at 220 (217 passed, 3 skips, 0 failures); Windows has not been re-run.
+> green at 220 (218 passed, 2 skips, 0 failures) as of the 2026-07-31 run; Windows has not been
+> re-run. The 2 skips are both `moveNonEmptyDirectoryThrowsWhenNotNativelySupported` on the FiiO's
+> two storages (it natively supports directory move); the deleted-name-reservation skip on FiiO /
+> Micro SD is gone — see [`deleted-name-reservation.md`](deleted-name-reservation.md#status).
 
 No caveats remain on the FiiO. The intermittent failures previously recorded here — the growing
 replace on its SD card, storages transiently disappearing, sessions wedging mid-run — were all
