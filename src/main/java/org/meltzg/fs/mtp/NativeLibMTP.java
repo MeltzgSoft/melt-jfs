@@ -638,6 +638,13 @@ class NativeLibMTP implements MtpBackend {
      * an empty array when the device reports zero bytes (offset at or past end-of-object).
      */
     @Override
+    public boolean reopenClearsNameReservations() {
+        // libmtp owns the USB handle, so releasing a device really ends the MTP session; a reopen
+        // cleared a deleted-name reservation 4/4 on the affected storage (~500ms).
+        return true;
+    }
+
+    @Override
     public boolean supportsPartialReads() {
         return true; // LIBMTP_GetPartialObject is bound; device op support is checked at call time
     }
