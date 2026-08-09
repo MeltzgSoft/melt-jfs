@@ -1,0 +1,101 @@
+# Integration tests against the real MTP device, on the shared self-hosted
+# runners in the MeltzgSoft org. ci.yml stays on GitHub-hosted runners and only
+# compiles the integration sources (integrationTestClasses); this is the half
+# that actually talks to hardware.
+#
+# ⚠ THIS REPOSITORY IS PUBLIC, which is why there is no pull_request trigger.
+# Anyone can fork a public repo, and pull_request would run their workflow file
+# on a runner that has a physical device attached and is shared with private
+# repositories. The only thing in the way would be a maintainer clicking
+# Approve. GitHub's guidance is to use self-hosted runners with private repos
+# only; post-merge is how a public repo gets the same property, because code
+# reaches the device after review rather than before.
+#
+# Do not copy the trigger list out of MeltzgSoft/usb-ci. That repo does use
+# pull_request, but only because it is private AND the org has fork PR
+# workflows disabled for private repositories. Neither holds here.
+#
+# Prerequisites, one-time:
+#   org  - repo in the `device-runners` runner group, and in the selected
+#          repositories for the LOCKSERVICE_URL organization variable
+#   repo - Settings > Environments > device-tests with:
+#            Required reviewers: at least one. Free for public repos; usb-ci
+#              cannot have this because required reviewers on a private repo
+#              need Enterprise.
+#            Deployment branches: Selected > master. Dispatch needs write
+#              access, but the dispatcher picks the ref, so without this a
+#              device job could run from a branch nobody reviewed.
+name: Device Tests
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [master]
+
+# One physical device. Note this does NOT serialize against usb-ci or dapr:
+# concurrency groups are per repository. The lock service is the cross-repo
+# mutex, and ci/devicelock.py handles its 202 "still queued" backpressure.
+#
+# cancel-in-progress is false deliberately. GitHub keeps at most one running
+# plus one pending run and cancels superseded PENDING runs, which die before
+# touching hardware. Cancelling in flight would kill a job holding a lease.
+concurrency:
+  group: device-tests
+  cancel-in-progress: false
+
+jobs:
+  linux:
+    runs-on: [self-hosted, linux]
+    environment: device-tests
+    env:
+      LOCKSERVICE_URL: ${{ vars.LOCKSERVICE_URL }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Acquire device lock
+        run: python3 ci/devicelock.py acquire --target linux
+
+      - name: Show what the runner can see
+        run: ./gradlew browse --args="1"
+
+      # -PrequireDevice turns an all-skipped run into a build failure
+      # (build.gradle.kts). Without it these tests self-skip when no device is
+      # present, and an all-skipped run is indistinguishable from a passing
+      # one -- a green build that tested nothing, which is the worst outcome
+      # for hardware CI.
+      - name: Integration tests
+        run: ./gradlew integrationTest -PrequireDevice
+
+      - name: Release device lock
+        if: always()
+        run: python3 ci/devicelock.py release
+
+  windows:
+    runs-on: [self-hosted, windows]
+    environment: device-tests
+    env:
+      LOCKSERVICE_URL: ${{ vars.LOCKSERVICE_URL }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Acquire device lock
+        run: python ci/devicelock.py acquire --target windows
+
+      # This step is the one to watch on the first run. Every successful WPD
+      # interaction so far has been in an interactive desktop session; the
+      # runner executes as a service in session 0, and MTP enumeration through
+      # WPD has a history of differing between the two. WpdCom uses
+      # COINIT_MULTITHREADED, which avoids the STA message-pump problems that
+      # usually break COM in services, so the odds are good -- but it is
+      # untested. If MTPBrowser prints "No MTP devices connected." here while
+      # the lock is held, the fix is to run this runner interactively
+      # (autologon plus a startup task) rather than as a service.
+      - name: WPD probe (session 0)
+        run: .\gradlew.bat browse --args="1"
+
+      - name: Integration tests
+        run: .\gradlew.bat integrationTest -PrequireDevice
+
+      - name: Release device lock
+        if: always()
+        run: python ci/devicelock.py release
