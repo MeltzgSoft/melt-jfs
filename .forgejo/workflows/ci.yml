@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  # Tier 1 (usb-ci FR-4.5): fake-backed unit tests plus integration-test
+  # compilation, no device. The macOS tier-1 leg is NOT here -- the forge has
+  # no macOS runner (Part 2 hardware does not exist), so it lives in
+  # .github/workflows/release.yml and proves the build at release time
+  # (FR-10.4): after FR-2.7 pruned GitHub-side CI to the release set, the
+  # release workflow is the only place left that can run macOS at all.
+  test-linux:
+    runs-on: linux
+    steps:
+      - uses: actions/checkout@v4
+
+      # Fully qualified: only a subset of actions is mirrored on
+      # data.forgejo.org, and job containers have public egress for this.
+      # setup-java's temurin path downloads from Adoptium, not the GitHub
+      # API, so it dodges the setup-actions trap (usb-ci docs/migration.md:
+      # actions that send the job's GITHUB_TOKEN to api.github.com get 401,
+      # because on the forge that token is a Forgejo token).
+      - name: Set up Java
+        uses: https://github.com/actions/setup-java@v4
+        with:
+          java-version: '25'
+          distribution: 'temurin'
+
+      # No gradle/actions/setup-gradle: it adds GitHub-backed caching and a
+      # Gradle download the wrapper already handles itself (from
+      # services.gradle.org, no GitHub involved). The Java 22 toolchain
+      # auto-provisions through the foojay resolver the same way.
+      #
+      # libmtp is required to build the binding on Linux;
+      # NativeLibMTPLoadTest fails if it cannot load.
+      - name: Install libmtp
+        run: apt-get update && apt-get install -y libmtp9
+
+      - name: Run unit tests and compile integration tests
+        run: ./gradlew test integrationTestClasses
+
+  # win-runner's plain `windows` label (FR-4.9): the general Windows builder,
+  # host mode, capacity 1 -- the tier-1 WPD coverage windows-latest used to
+  # give. Queues behind device jobs by design; WPD is part of Windows, so
+  # nothing to install.
+  test-windows:
+    runs-on: windows
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Java
+        uses: https://github.com/actions/setup-java@v4
+        with:
+          java-version: '25'
+          distribution: 'temurin'
+      - name: Run unit tests and compile integration tests
+        run: .\gradlew.bat test integrationTestClasses
