@@ -2,16 +2,91 @@ name: Release
 
 # Publishes io.github.meltzg:melt-jfs to Maven Central whenever a semantic-version tag (vMAJOR.MINOR.PATCH)
 # is pushed. The tag's version (minus the leading "v") becomes the published artifact version.
+#
+# Post-migration (usb-ci FR-2.7/FR-10.4), this repo is a read-only push mirror of the forge and this
+# workflow is the only CI left on GitHub. Tags arrive via the mirror, and two jobs gate the publish:
+#
+#   - hardware-gate: the forge runs the real-device integration tests and posts the outcome for each
+#     master SHA as the commit status `forge/device-tests` (FR-10.9). No status, or a failed one,
+#     blocks the release -- fail closed (FR-10.10), keyed to the exact commit being released
+#     (FR-10.11), never to recency.
+#   - test-macos: the tier-1 macOS leg (fake-backed tests + integration-test compilation). The forge
+#     has no macOS runner, so release time is where macOS proves the build (FR-10.4 rationale 1).
 on:
   push:
     tags:
       - 'v[0-9]+.[0-9]+.[0-9]+'
+  # The gate override (FR-10.12): with the lab down, dispatch this workflow from the tag's ref with
+  # override_hardware_gate=true and a reason. The dispatch inputs in the run log are the trace --
+  # bypassing must be deliberate and recorded, never "disable the check and forget".
+  workflow_dispatch:
+    inputs:
+      override_hardware_gate:
+        description: "Skip the forge/device-tests status gate (lab outage only)"
+        type: boolean
+        default: false
+      reason:
+        description: "Why the gate is being overridden (recorded in this run's log)"
+        required: false
+        default: ""
 
 jobs:
+  hardware-gate:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      statuses: read
+    steps:
+      - name: Require the forge/device-tests status on the released commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OVERRIDE: ${{ inputs.override_hardware_gate }}
+          REASON: ${{ inputs.reason }}
+        run: |
+          set -euo pipefail
+          if [ "${OVERRIDE:-false}" = "true" ]; then
+            echo "::warning::hardware gate OVERRIDDEN (FR-10.12). Reason: ${REASON:-none given}"
+            exit 0
+          fi
+          # Resolve the tag to its commit through the API rather than trusting GITHUB_SHA: for
+          # annotated tags GITHUB_SHA can be the tag object, and statuses live on commits.
+          sha=$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_REF_NAME" --jq .sha)
+          state=$(gh api "repos/$GITHUB_REPOSITORY/commits/$sha/status" \
+            --jq '[.statuses[] | select(.context == "forge/device-tests")][0].state // "missing"')
+          echo "forge/device-tests on $sha: $state"
+          if [ "$state" != "success" ]; then
+            echo "::error::the released commit has no passing hardware run ($state). The forge posts" \
+              "forge/device-tests for every master push; wait for it, fix it, or -- lab outage only --" \
+              "re-run via workflow_dispatch with override_hardware_gate=true and a reason." >&2
+            exit 1
+          fi
+
+  test-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '25'
+          distribution: 'temurin'
+      # libmtp is the native backend on macOS and NativeLibMTPLoadTest fails without it.
+      - name: Install libmtp
+        run: brew install libmtp
+      - name: Run unit tests and compile integration tests
+        run: ./gradlew test integrationTestClasses
+
   publish:
+    needs: [hardware-gate, test-macos]
     runs-on: ubuntu-latest
 
     steps:
+      # workflow_dispatch can be pointed at any ref; everything below assumes a v#.#.# tag, so anything
+      # else is an operator mistake worth stopping loudly.
+      - name: Require a semantic-version tag ref
+        run: |
+          [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+            || { echo "::error::run this from a v#.#.# tag ref, not '$GITHUB_REF_NAME'"; exit 1; }
+
       - uses: actions/checkout@v4
 
       - uses: actions/setup-java@v4
