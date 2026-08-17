@@ -61,19 +61,12 @@ jobs:
             exit 1
           fi
 
+  # The same workflow macos.yml runs on every push to master, so the release
+  # gate and the per-commit run cannot diverge. By tag time this has normally
+  # already passed on this very commit -- the gate is then confirmation rather
+  # than the first time macOS is exercised, which is the point.
   test-macos:
-    runs-on: macos-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
-        with:
-          java-version: '25'
-          distribution: 'temurin'
-      # libmtp is the native backend on macOS and NativeLibMTPLoadTest fails without it.
-      - name: Install libmtp
-        run: brew install libmtp
-      - name: Run unit tests and compile integration tests
-        run: ./gradlew test integrationTestClasses
+    uses: ./.github/workflows/test-macos.yml
 
   publish:
     needs: [hardware-gate, test-macos]

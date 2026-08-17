@@ -1,0 +1,24 @@
+name: macOS tests
+
+# The macOS leg, factored out so the release gate and the per-commit run share
+# ONE definition. The lab has no macOS runner and macOS has no self-hosted
+# substitute (usb-ci FR-10.17), so GitHub is the only place this can run --
+# which is exactly why it must not drift between its two callers.
+on:
+  workflow_call:
+
+jobs:
+  test-macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          java-version: '25'
+          distribution: 'temurin'
+      # libmtp is the native backend on macOS and NativeLibMTPLoadTest fails
+      # without it.
+      - name: Install libmtp
+        run: brew install libmtp
+      - name: Run unit tests and compile integration tests
+        run: ./gradlew test integrationTestClasses
