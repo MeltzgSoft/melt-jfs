@@ -54,27 +54,38 @@ jobs:
       - name: Verify the attached device
         run: python devicelock.py verify
 
+      # TEMPORARILY DISABLED (PR #25). With the FiiO M11 Plus attached the suite
+      # hangs on this runner rather than failing -- last seen passing
+      # uploadedId3v23Mp3TagsAreReadBackViaAudioView on FiiO / Internal shared
+      # storage and never reaching the next test. A hang burns the whole job
+      # timeout and leaves the probes below unreachable, and the probes are what
+      # this branch still needs. Restore this step (drop the if:) once the hang
+      # is understood -- do NOT merge with it disabled.
+      #
       # -PrequireDevice: the integration tests self-skip without a device,
       # and after a successful acquire + verify an all-skipped run is a
       # failure, not a pass.
       - name: Run integration tests
+        if: ${{ false }}
         run: .\gradlew.bat integrationTest -PrequireDevice
 
       # TEMPORARY (PR #25): measures what the driver does when a name is already
       # taken, to settle whether a FileAlreadyExistsException backstop can key off
-      # the HRESULT. Runs after the suite so a probe misstep cannot cost the run,
-      # and if: always() so a suite failure still yields the measurement. Remove
-      # once docs/windows-parity.md records the answer.
+      # the HRESULT. libmtp has now answered on all four storages (refused
+      # everywhere, no duplicate); this is the WPD half. Remove once
+      # docs/windows-parity.md records the answer.
       - name: Probe name collisions
         if: always()
         run: .\gradlew.bat collisionProbe
 
-      # TEMPORARY (PR #25): smoke test only. The attached AK100 II does not reserve
-      # deleted names, so this proves the harness runs and prints UNSCORED -- it is
-      # not evidence about any lever. Only the safe close/reopen control runs; the
-      # raw-MTP levers stay off, since they can wedge WpdMtpDr and the recorded
-      # recovery is a physical replug.
-      - name: Smoke-test the reservation lever probe
+      # TEMPORARY (PR #25): with the FiiO attached this is no longer a smoke test
+      # on Windows -- its Micro SD reserves deleted names, so the probe confirms
+      # the reservation and scores for real. Only the safe close/reopen control
+      # runs, which is expected to come back "still refused" on WPD and would
+      # reproduce the documented negative on this hardware. The raw-MTP levers
+      # stay off: they can wedge WpdMtpDr and the recorded recovery is a physical
+      # replug, which is not something to trigger unattended on a lab box.
+      - name: Run the reservation lever probe
         if: always()
         run: .\gradlew.bat reservationLeverProbe "--args=;recycle,force"
 
