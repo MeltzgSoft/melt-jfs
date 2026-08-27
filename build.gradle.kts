@@ -83,6 +83,16 @@ tasks.register<JavaExec>("collisionProbe") {
     // optionally target one device/storage: ./gradlew collisionProbe --args="FiiO M11 Plus|M11 Plus Micro SD"
 }
 
+tasks.register<JavaExec>("reservationLeverProbe") {
+    description = "Hunt for a lever that clears a deleted-name reservation (see MTPReservationLeverProbe)."
+    classpath = dev.runtimeClasspath
+    mainClass = "org.meltzg.fs.mtp.MTPReservationLeverProbe"
+    jvmArgs("--enable-native-access=ALL-UNNAMED")
+    // Needs hardware that actually reserves deleted names -- only the FiiO M11 Plus Micro SD does.
+    // The raw-MTP levers are opt-in and can wedge the WPD driver; read the class doc first.
+    //   ./gradlew reservationLeverProbe --args="FiiO M11 Plus|M11 Plus Micro SD;recycle,reset,session"
+}
+
 tasks.test {
     // Required for FFM restricted operations (MemorySegment.reinterpret, libraryLookup)
     jvmArgs("--enable-native-access=ALL-UNNAMED")

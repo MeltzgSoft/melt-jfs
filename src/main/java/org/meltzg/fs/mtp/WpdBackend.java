@@ -1045,6 +1045,21 @@ class WpdBackend implements MtpBackend {
     }
 
     /**
+     * Diagnostic seam for {@code MTPReservationLeverProbe} (same package, dev source set): issues one
+     * raw no-data-phase MTP command at the device, behind the driver's back.
+     *
+     * <p>Exists because the deleted-name reservation has no known cure on WPD and the untested
+     * hypothesis is that what must be reset is the <em>device's</em> MTP session rather than the host's
+     * handle to it — see {@code docs/deleted-name-reservation.md}. Nothing in the library calls this,
+     * and it is package-private precisely so nothing outside a probe can: sending session-level
+     * opcodes underneath a driver that believes it owns the session is not a supported operation, and
+     * a wedged WpdMtpDr takes every client of the device down with it.
+     */
+    int sendRawMtpCommand(DeviceHandle handle, int opcode, int... params) throws IOException {
+        return executeWithoutData(dev(handle).device(), opcode, params);
+    }
+
+    /**
      * Sends {@code size} bytes from {@code in} as one SendPartialObject transaction at offset 0:
      * initiate (WITH_DATA_TO_WRITE), stream the data phase in chunks (WRITE_DATA), then always close it
      * (END_DATA_TRANSFER), whose MTP response code must be OK.
