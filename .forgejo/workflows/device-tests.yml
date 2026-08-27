@@ -99,7 +99,12 @@ jobs:
       - name: Run the reservation lever probe
         if: always()
         timeout-minutes: 15
-        run: .\gradlew.bat reservationLeverProbe "--args=FiiO M11 Plus|M11 Plus Micro SD;recycle,session,reset"
+        # Inner quotes are required, not decoration: Gradle splits --args on
+        # whitespace, so an unquoted "FiiO M11 Plus|..." arrives as six separate
+        # arguments and only the first is read. That silently degraded run 1286
+        # to a device filter of "FiiO" with no storage and no levers -- the
+        # default control ran and session/reset never fired.
+        run: .\gradlew.bat reservationLeverProbe "--args='FiiO M11 Plus|M11 Plus Micro SD;recycle,session,reset'"
 
       - name: Release device lock
         if: always()
