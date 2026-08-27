@@ -37,8 +37,13 @@ import java.util.List;
  * Usage:
  *   ./gradlew reservationLeverProbe --args="FiiO M11 Plus|M11 Plus Micro SD"
  *   ./gradlew reservationLeverProbe --args="FiiO M11 Plus|M11 Plus Micro SD;recycle,reset,session"
+ *   ./gradlew reservationLeverProbe --args=";recycle,force"    # smoke test on any device
  *
  * Levers: recycle (safe control) · reset (MTP ResetDevice) · session (MTP CloseSession+OpenSession)
+ *
+ * <p>{@code force} is not a lever. It runs the lever path on hardware that does not reserve names, so
+ * the harness can be exercised before the affected device is available; every result it yields is
+ * printed UNSCORED, because with nothing reserved a recreate succeeds whatever the lever did.
  */
 public class MTPReservationLeverProbe {
 
@@ -60,12 +65,21 @@ public class MTPReservationLeverProbe {
                 for (var l : halves[1].split(",")) if (!l.isBlank()) levers.add(l.trim());
             }
         }
+        // "force" is a smoke-test switch, not a lever: it runs the lever path on hardware that does
+        // not reserve names, so the harness can be exercised end to end before the affected device is
+        // available. Every result it produces is labelled UNSCORED and none of it is evidence.
+        boolean force = levers.remove("force");
         if (levers.isEmpty()) levers.add("recycle"); // the safe control only
 
         var backend = MtpBackend.defaultBackend();
         System.out.println("backend: " + backend.getClass().getSimpleName());
         System.out.println("reopenClearsNameReservations: " + backend.reopenClearsNameReservations());
         System.out.println("levers: " + levers);
+        if (force) {
+            System.out.println("force: ON — levers will run without a confirmed reservation.");
+            System.out.println("       Results are UNSCORED: with nothing reserved, a recreate succeeds");
+            System.out.println("       whatever the lever did. This proves the probe runs, nothing more.");
+        }
         if (!(backend instanceof WpdBackend) && levers.stream().anyMatch(l -> !l.equals("recycle"))) {
             System.out.println("NOTE: the raw MTP levers are WPD-only; libmtp owns the USB handle and a");
             System.out.println("      plain reopen already clears the reservation there. Running control only.");
@@ -83,7 +97,7 @@ public class MTPReservationLeverProbe {
             for (var target : targets) {
                 System.out.println("=== " + target.deviceName() + " / " + target.storageName() + " ===");
                 try {
-                    probe(backend, bridge, target, levers);
+                    probe(backend, bridge, target, levers, force);
                 } catch (Exception e) {
                     System.out.println("  PROBE FAILED: " + e);
                     e.printStackTrace(System.out);
@@ -116,8 +130,8 @@ public class MTPReservationLeverProbe {
         return targets;
     }
 
-    private static void probe(MtpBackend backend, MTPDeviceBridge bridge, Target target, List<String> levers)
-            throws IOException {
+    private static void probe(MtpBackend backend, MTPDeviceBridge bridge, Target target,
+                              List<String> levers, boolean force) throws IOException {
         // Gate: no confirmed reservation on this storage means no lever result is worth anything.
         var confirm = reserve(backend, bridge, target);
         if (confirm == null) {
@@ -126,11 +140,15 @@ public class MTPReservationLeverProbe {
         }
         if (confirm.cleared()) {
             System.out.println("  reservation NOT reproduced on this storage — recreate after delete succeeded.");
-            System.out.println("  ABORT: nothing is reserved here, so a lever result would prove nothing.");
             System.out.println("  (only the FiiO M11 Plus Micro SD card is known to reproduce it)");
-            return;
+            if (!force) {
+                System.out.println("  ABORT: nothing is reserved here, so a lever result would prove nothing.");
+                return;
+            }
+            System.out.println("  force: continuing anyway; everything below is UNSCORED.");
+        } else {
+            System.out.println("  reservation confirmed: " + confirm.detail());
         }
-        System.out.println("  reservation confirmed: " + confirm.detail());
 
         for (var lever : levers) {
             System.out.println("  --- lever: " + lever + " ---");
@@ -139,9 +157,10 @@ public class MTPReservationLeverProbe {
                 System.out.println("      SKIP: could not establish a fresh reservation");
                 continue;
             }
-            if (fresh.cleared()) {
-                // The reservation is "overwhelmingly but not perfectly reproducible" (1 run in 5 recreated
-                // cleanly), so a stray success here is the device, not the lever. Do not score it.
+            // The reservation is "overwhelmingly but not perfectly reproducible" (1 run in 5 recreated
+            // cleanly), so a stray success here is the device, not the lever. Never score such a run.
+            boolean scored = !fresh.cleared();
+            if (!scored && !force) {
                 System.out.println("      INCONCLUSIVE: the control recreate succeeded before the lever ran");
                 continue;
             }
@@ -165,10 +184,13 @@ public class MTPReservationLeverProbe {
             }
             try {
                 backend.createFolder(handle, fresh.name(), MtpBackend.ROOT_PARENT, storage.storageId());
-                System.out.println("      CLEARED — recreate succeeded after the lever (" + leverMs + "ms)");
+                System.out.println(scored
+                    ? "      CLEARED — recreate succeeded after the lever (" + leverMs + "ms)"
+                    : "      UNSCORED — recreate succeeded, but nothing was reserved (" + leverMs + "ms)");
                 deleteNamed(backend, handle, storage.storageId(), fresh.name());
             } catch (IOException | RuntimeException e) {
-                System.out.println("      still refused after the lever (" + leverMs + "ms): " + e);
+                System.out.println((scored ? "      still refused" : "      UNSCORED — failed")
+                    + " after the lever (" + leverMs + "ms): " + e);
             }
         }
     }
