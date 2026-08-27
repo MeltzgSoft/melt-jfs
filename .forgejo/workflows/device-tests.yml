@@ -76,18 +76,30 @@ jobs:
       # docs/windows-parity.md records the answer.
       - name: Probe name collisions
         if: always()
+        timeout-minutes: 10
         run: .\gradlew.bat collisionProbe
 
-      # TEMPORARY (PR #25): with the FiiO attached this is no longer a smoke test
-      # on Windows -- its Micro SD reserves deleted names, so the probe confirms
-      # the reservation and scores for real. Only the safe close/reopen control
-      # runs, which is expected to come back "still refused" on WPD and would
-      # reproduce the documented negative on this hardware. The raw-MTP levers
-      # stay off: they can wedge WpdMtpDr and the recorded recovery is a physical
-      # replug, which is not something to trigger unattended on a lab box.
+      # TEMPORARY (PR #25): the real test of the WPD parity gap, not a smoke test.
+      # Targeted at FiiO / Micro SD alone, the only storage known to reserve a
+      # deleted name: no other storage can score a lever, so pointing the raw
+      # opcodes at them would add wedge risk for no data. No "force" either --
+      # with a genuine reservation available, an unscored result is not wanted.
+      #
+      # Lever order is deliberate: recycle (the known-negative control, proving
+      # the reservation is live), then session (CloseSession+OpenSession, the
+      # direct test of "reset the session the DEVICE sees"), then reset
+      # (ResetDevice, the bigger hammer, last because it is likeliest to end the
+      # run). Each lever re-establishes its own reservation, so a wedge degrades
+      # to a skipped lever rather than a bogus result.
+      #
+      # These go underneath a driver that thinks it owns the session and CAN
+      # wedge WpdMtpDr, whose recorded recovery is a physical replug. Run
+      # deliberately, with access to the machine. timeout-minutes bounds it
+      # because a wedged Open blocks forever with no timeout of its own.
       - name: Run the reservation lever probe
         if: always()
-        run: .\gradlew.bat reservationLeverProbe "--args=;recycle,force"
+        timeout-minutes: 15
+        run: .\gradlew.bat reservationLeverProbe "--args=FiiO M11 Plus|M11 Plus Micro SD;recycle,session,reset"
 
       - name: Release device lock
         if: always()
