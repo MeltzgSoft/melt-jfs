@@ -69,6 +69,15 @@ jobs:
         if: always()
         run: .\gradlew.bat collisionProbe
 
+      # TEMPORARY (PR #25): smoke test only. The attached AK100 II does not reserve
+      # deleted names, so this proves the harness runs and prints UNSCORED -- it is
+      # not evidence about any lever. Only the safe close/reopen control runs; the
+      # raw-MTP levers stay off, since they can wedge WpdMtpDr and the recorded
+      # recovery is a physical replug.
+      - name: Smoke-test the reservation lever probe
+        if: always()
+        run: .\gradlew.bat reservationLeverProbe "--args=;recycle,force"
+
       - name: Release device lock
         if: always()
         run: python devicelock.py release
@@ -107,6 +116,13 @@ jobs:
       - name: Probe name collisions
         if: always()
         run: ./gradlew collisionProbe
+
+      # TEMPORARY (PR #25): the libmtp half of the same smoke test. Equally UNSCORED
+      # here -- no attached storage reserves names -- but it exercises the harness on
+      # the backend where a reopen is the mitigation that already works.
+      - name: Smoke-test the reservation lever probe
+        if: always()
+        run: ./gradlew reservationLeverProbe "--args=;recycle,force"
 
       - name: Release device lock
         if: always()
