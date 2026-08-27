@@ -60,6 +60,15 @@ jobs:
       - name: Run integration tests
         run: .\gradlew.bat integrationTest -PrequireDevice
 
+      # TEMPORARY (PR #25): measures what the driver does when a name is already
+      # taken, to settle whether a FileAlreadyExistsException backstop can key off
+      # the HRESULT. Runs after the suite so a probe misstep cannot cost the run,
+      # and if: always() so a suite failure still yields the measurement. Remove
+      # once docs/windows-parity.md records the answer.
+      - name: Probe name collisions
+        if: always()
+        run: .\gradlew.bat collisionProbe
+
       - name: Release device lock
         if: always()
         run: python devicelock.py release
@@ -92,6 +101,12 @@ jobs:
       # must not apt-get inside the VM it shares with every other job.
       - name: Run integration tests
         run: ./gradlew integrationTest -PrequireDevice
+
+      # TEMPORARY (PR #25): the libmtp half of the same measurement — the doc's
+      # claim is that the two backends differ here, so the comparison needs both.
+      - name: Probe name collisions
+        if: always()
+        run: ./gradlew collisionProbe
 
       - name: Release device lock
         if: always()

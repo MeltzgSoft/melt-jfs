@@ -75,6 +75,14 @@ tasks.register<JavaExec>("growProbe") {
     // optionally target one device/storage: ./gradlew growProbe --args="FiiO M11 Plus|M11 Plus Micro SD"
 }
 
+tasks.register<JavaExec>("collisionProbe") {
+    description = "Probe what a device does when a name is already taken (see MTPCollisionProbe)."
+    classpath = dev.runtimeClasspath
+    mainClass = "org.meltzg.fs.mtp.MTPCollisionProbe"
+    jvmArgs("--enable-native-access=ALL-UNNAMED")
+    // optionally target one device/storage: ./gradlew collisionProbe --args="FiiO M11 Plus|M11 Plus Micro SD"
+}
+
 tasks.test {
     // Required for FFM restricted operations (MemorySegment.reinterpret, libraryLookup)
     jvmArgs("--enable-native-access=ALL-UNNAMED")
