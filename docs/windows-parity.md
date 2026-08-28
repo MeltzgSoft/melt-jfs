@@ -60,9 +60,11 @@ devices.
 > `createDirectorySucceedsAfterDeletingSameName` on FiiO / Micro SD — the deleted-name reservation,
 > which the session recycle clears on libmtp but not over WPD. The Windows failure is separate:
 > `isHiddenAlwaysFalse` on FiiO / Internal shared storage fails while writing its one-byte setup file,
-> after a roughly 133 second gap following `uploadedId3v23Mp3TagsAreReadBackViaAudioView`. That points
-> at a WPD upload/session-state issue, not at hidden-file semantics. Future Windows runs should use
-> full Gradle exception logging so the HRESULT and WPD call site are visible.
+> after a roughly 133 second gap following `uploadedId3v23Mp3TagsAreReadBackViaAudioView`. A later run
+> with full Gradle exception logging (`device-tests-windows-1309.log`) identified the failing call as
+> `IStream::Write` returning `0x802a0006` (`E_WPD_DEVICE_IS_HUNG`). That points at a WPD
+> upload/session-state issue, not at hidden-file semantics; after this state, repeated close/reopen
+> attempts spend about 91 seconds each failing to enumerate the FiiO storages.
 
 The earlier intermittent failures recorded here — the growing replace on the FiiO SD card, storages
 transiently disappearing, sessions wedging mid-run — were symptoms of WPD-side defects in this backend,
