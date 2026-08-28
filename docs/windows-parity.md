@@ -28,7 +28,7 @@ match **`NativeLibMTP`** (libmtp, Linux/macOS). **Keep this file updated wheneve
 | `mtp` view (device-index metadata) | ✅ | ✅ | none |
 | `sendFile` audio object-format inference | ✅ | ✅ | none — correct WPD audio GUIDs are used; forcing generic uploads with `-Dmelt-jfs.wpd.uploadAudioAsGeneric=true` did not prevent the FiiO/WPD hang |
 | `sendFile` retry after failed create-with-data | ✅ | ✅ | WPD uploads through a unique temporary object name and renames after commit, so a failed retry does not poison the requested final filename |
-| **Ranged read (`readPartial`)** | ✅ | ✅ (MTP GetPartialObject via `SendCommand`) | WPD currently reopens the client handle before the next mutation after a partial read, because FiiO/WPD otherwise hangs the next upload |
+| **Ranged read (`readPartial`)** | ✅ | ✅ (MTP GetPartialObject via `SendCommand`) | WPD currently reopens the client handle before the next upload after a partial read, because FiiO/WPD otherwise hangs that upload |
 | `supportsPartialReads()` | ✅ `true` | ✅ `true` | none |
 | Lazy read channel (`newByteChannel`) | ✅ lazy | ✅ lazy | none |
 | `audio` view (embedded tags) | ✅ | ✅ (lit up by `readPartial`) | none |
@@ -92,10 +92,10 @@ embedded-tag read, the next upload hung in `IStream::Write` until WPD returned
 `-Dmelt-jfs.wpd.uploadAudioAsGeneric=true` did **not** prevent the hang when the FiiO was present in
 run 44 attempt 2, so the audio content type / object-format path is not the trigger.
 
-The next run, with the FiiO online, showed that WPD `readPartial` dirties that client handle for writes:
-`MTPDeviceBridge` records devices that have used a ranged read, and before the next create/write/delete
-/move it reopens the WPD client handle once. This is deliberately gated by
-`MtpBackend.recycleBeforeMutationAfterPartialRead()` so libmtp keeps its normal path, and by
+The next run, with the FiiO online, showed that WPD `readPartial` dirties that client handle for uploads:
+`MTPDeviceBridge` records devices that have used a ranged read, and before the next write it reopens
+the WPD client handle once. This is deliberately gated by
+`MtpBackend.recycleBeforeUploadAfterPartialRead()` so libmtp keeps its normal path, and by
 `-Dmelt-jfs.wpd.recycleAfterPartialRead=true` on WPD so CI can falsify it directly. Run 46 proved the
 hook moved the failure: `isHiddenAlwaysFalse` passed and the FiiO no longer entered
 `E_WPD_DEVICE_IS_HUNG`, but two later fresh writes on the same storage failed with generic

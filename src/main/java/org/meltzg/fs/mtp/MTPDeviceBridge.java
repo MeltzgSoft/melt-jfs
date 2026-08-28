@@ -86,10 +86,10 @@ public enum MTPDeviceBridge implements Closeable {
     // Keyed per device; cleared when connections are torn down.
     private final Map<ItemKey, Long> sizeOverlays = new ConcurrentHashMap<>();
 
-    // Devices for which the backend's ranged-read path says the next mutating request should start
+    // Devices for which the backend's ranged-read path says the next upload request should start
     // from a fresh client handle. WPD needs this after raw GetPartialObject on at least one device:
     // the partial read succeeds, but the next IStream upload fails with E_WPD_DEVICE_IS_HUNG.
-    private final Set<MTPDeviceIdentifier> partialReadMutationRecycle = ConcurrentHashMap.newKeySet();
+    private final Set<MTPDeviceIdentifier> partialReadUploadRecycle = ConcurrentHashMap.newKeySet();
 
     // Paths whose name this bridge freed with a DeleteObject in the current session and which
     // nothing has reoccupied. Some devices keep a deleted name reserved for the rest of the MTP
@@ -267,7 +267,6 @@ public enum MTPDeviceBridge implements Closeable {
      * no reconnect.
      */
     public void createDirectory(MTPDeviceIdentifier deviceId, String path) throws IOException {
-        recycleBeforeMutationIfNeeded(deviceId);
         try {
             createDirectoryOnce(deviceId, path);
         } catch (FileSystemException definitive) {
@@ -332,7 +331,6 @@ public enum MTPDeviceBridge implements Closeable {
     }
 
     public void delete(MTPDeviceIdentifier deviceId, String path) throws IOException {
-        recycleBeforeMutationIfNeeded(deviceId);
         connectionLock.readLock().lock();
         try {
             var parts = pathParts(path);
@@ -368,7 +366,7 @@ public enum MTPDeviceBridge implements Closeable {
      * root or storage level). Returns the new item's id.
      */
     public String writeFile(MTPDeviceIdentifier deviceId, String path, java.nio.file.Path localFile) throws IOException {
-        recycleBeforeMutationIfNeeded(deviceId);
+        recycleBeforeUploadIfNeeded(deviceId);
         connectionLock.readLock().lock();
         try {
             var parts = pathParts(path);
@@ -447,7 +445,6 @@ public enum MTPDeviceBridge implements Closeable {
      * {@link FileAlreadyExistsException} is thrown.
      */
     public void move(MTPDeviceIdentifier deviceId, String sourcePath, String targetPath, boolean replace) throws IOException {
-        recycleBeforeMutationIfNeeded(deviceId);
         connectionLock.readLock().lock();
         try {
             var srcParts = pathParts(sourcePath);
@@ -584,8 +581,8 @@ public enum MTPDeviceBridge implements Closeable {
                 try {
                     return backend().readPartial(conn.handle(), item.itemId(), offset, maxBytes);
                 } finally {
-                    if (backend().recycleBeforeMutationAfterPartialRead()) {
-                        partialReadMutationRecycle.add(deviceId);
+                    if (backend().recycleBeforeUploadAfterPartialRead()) {
+                        partialReadUploadRecycle.add(deviceId);
                     }
                 }
             }
@@ -688,9 +685,9 @@ public enum MTPDeviceBridge implements Closeable {
         }
     }
 
-    private void recycleBeforeMutationIfNeeded(MTPDeviceIdentifier deviceId) throws IOException {
-        if (!backend().recycleBeforeMutationAfterPartialRead()) return;
-        if (!partialReadMutationRecycle.remove(deviceId)) return;
+    private void recycleBeforeUploadIfNeeded(MTPDeviceIdentifier deviceId) throws IOException {
+        if (!backend().recycleBeforeUploadAfterPartialRead()) return;
+        if (!partialReadUploadRecycle.remove(deviceId)) return;
         recycleConnections();
     }
 
@@ -732,7 +729,7 @@ public enum MTPDeviceBridge implements Closeable {
         tombstones.clear();
         renameOverlays.clear();
         sizeOverlays.clear();
-        partialReadMutationRecycle.clear();
+        partialReadUploadRecycle.clear();
         freedNames.clear(); // a new session releases every reserved name, so none may authorise a retry
         lastSignature = Set.of();
         devicesDetected = false;
