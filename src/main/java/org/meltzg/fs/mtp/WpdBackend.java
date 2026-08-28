@@ -18,28 +18,26 @@ import java.util.Arrays;
 import java.util.List;
 import java.util.Locale;
 import java.util.concurrent.atomic.AtomicReference;
-import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
-import static java.lang.foreign.ValueLayout.*;
+import static java.lang.foreign.ValueLayout.ADDRESS;
+import static java.lang.foreign.ValueLayout.JAVA_BYTE;
+import static java.lang.foreign.ValueLayout.JAVA_CHAR;
+import static java.lang.foreign.ValueLayout.JAVA_DOUBLE;
+import static java.lang.foreign.ValueLayout.JAVA_INT;
+import static java.lang.foreign.ValueLayout.JAVA_LONG;
+import static java.lang.foreign.ValueLayout.JAVA_SHORT;
 import static org.meltzg.fs.mtp.MtpBackend.emptyToNull;
 import static org.meltzg.fs.mtp.WpdCom.*;
 
 /**
- * MTP backend built on the Windows Portable Devices (WPD) COM API, driven entirely through the Java
- * FFM API (see {@link WpdCom}). This is the native way to access MTP devices on Windows without
- * replacing the device's driver.
+ * Windows-native MTP backend implemented on top of Windows Portable Devices (WPD).
  *
- * <p>WPD object identifiers are opaque strings and are surfaced verbatim through the
- * {@link MtpBackend} contract. {@link MtpBackend#ROOT_PARENT} maps to a storage's functional-object
- * id (which is also that storage's id).
- *
- * <p><b>Note:</b> this code can only run on Windows and is exercised there; it compiles on any
- * platform but is never class-loaded off Windows (see {@link MtpBackend#defaultBackend()}).
+ * <p>The provider sees WPD object ids as opaque strings. This backend only derives the underlying
+ * numeric MTP handle for raw pass-through commands such as GetPartialObject and BeginEditObject.
  */
 class WpdBackend implements MtpBackend {
 
-    // ---- COM class / interface ids ----
     private static final MemorySegment CLSID_DEVICE_MANAGER;
     private static final MemorySegment IID_DEVICE_MANAGER;
     private static final MemorySegment CLSID_DEVICE_FTM;
@@ -52,8 +50,6 @@ class WpdBackend implements MtpBackend {
     private static final MemorySegment CLSID_PROPVARIANT_COLLECTION;
     private static final MemorySegment IID_PROPVARIANT_COLLECTION;
 
-    // ---- PROPERTYKEYs ----
-    private static final MemorySegment KEY_OBJECT_ID;
     private static final MemorySegment KEY_PARENT_ID;
     private static final MemorySegment KEY_NAME;
     private static final MemorySegment KEY_ORIGINAL_FILE_NAME;
@@ -78,8 +74,6 @@ class WpdBackend implements MtpBackend {
     private static final MemorySegment KEY_DEVICE_PROTOCOL;
     private static final MemorySegment KEY_DEVICE_SERIAL_NUMBER;
 
-    // ---- SendCommand / MTP pass-through keys (readPartial) ----
-    // The MTP-extension command category; SendCommand routes to it and picks the command by pid.
     private static final MemorySegment MTP_EXT_CATEGORY;
     private static final MemorySegment KEY_COMMON_COMMAND_CATEGORY;
     private static final MemorySegment KEY_COMMON_COMMAND_ID;
@@ -92,57 +86,96 @@ class WpdBackend implements MtpBackend {
     private static final MemorySegment KEY_MTP_NUM_BYTES_TO_READ;
     private static final MemorySegment KEY_MTP_NUM_BYTES_TO_WRITE;
     private static final MemorySegment KEY_MTP_TRANSFER_DATA;
-    // The device's vendor-extended MTP opcodes (WPD_PROPERTY_MTP_EXT_VENDOR_OPERATION_CODES), returned
-    // by GET_SUPPORTED_VENDOR_OPCODES and used to gate in-place object editing (BeginEditObject is one).
     private static final MemorySegment KEY_MTP_OPERATION_CODES;
 
-    // ---- content-type / category GUID values ----
     private static final MemorySegment CONTENT_TYPE_FOLDER;
     private static final MemorySegment CONTENT_TYPE_FUNCTIONAL_OBJECT;
     private static final MemorySegment CONTENT_TYPE_GENERIC_FILE;
     private static final MemorySegment CONTENT_TYPE_AUDIO;
-    private static final MemorySegment FORMAT_UNSPECIFIED;
     private static final MemorySegment FORMAT_PROPERTIES_ONLY;
-    // Audio object formats, keyed by upload extension in audioFormatForFilename.
+    private static final MemorySegment FORMAT_UNSPECIFIED;
     private static final MemorySegment FORMAT_MP3;
     private static final MemorySegment FORMAT_WAV;
     private static final MemorySegment FORMAT_WMA;
     private static final MemorySegment FORMAT_OGG;
     private static final MemorySegment FORMAT_AAC;
     private static final MemorySegment FORMAT_FLAC;
+    private static final MemorySegment FORMAT_M4A;
+    private static final MemorySegment FORMAT_MP2;
     private static final MemorySegment FUNCTIONAL_CATEGORY_STORAGE;
 
-    // The well-known root from which a device's functional objects (storages) are enumerated.
     private static final String WPD_DEVICE_OBJECT_ID = "DEVICE";
 
-    // ---- vtable indices (after IUnknown's QueryInterface=0, AddRef=1, Release=2) ----
-    private static final int MGR_GET_DEVICES = 3, MGR_FRIENDLY_NAME = 5, MGR_DESCRIPTION = 6, MGR_MANUFACTURER = 7;
-    private static final int DEV_OPEN = 3, DEV_SEND_COMMAND = 4, DEV_CONTENT = 5, DEV_CLOSE = 8;
-    // IPortableDeviceContent vtable order (after IUnknown): EnumObjects(3), Properties(4), Transfer(5),
-    // CreateObjectWithPropertiesOnly(6), CreateObjectWithPropertiesAndData(7), Delete(8),
-    // GetObjectIDsFromPersistentUniqueIDs(9), Cancel(10), Move(11), Copy(12).
-    private static final int CONTENT_ENUM = 3, CONTENT_PROPERTIES = 4, CONTENT_TRANSFER = 5,
-        CONTENT_CREATE_PROPS = 6, CONTENT_CREATE_DATA = 7, CONTENT_DELETE = 8, CONTENT_MOVE = 11;
+    private static final int MGR_GET_DEVICES = 3;
+    private static final int MGR_FRIENDLY_NAME = 5;
+    private static final int MGR_DESCRIPTION = 6;
+    private static final int MGR_MANUFACTURER = 7;
+    private static final int DEV_OPEN = 3;
+    private static final int DEV_SEND_COMMAND = 4;
+    private static final int DEV_CONTENT = 5;
+    private static final int DEV_CLOSE = 8;
+    private static final int CONTENT_ENUM = 3;
+    private static final int CONTENT_PROPERTIES = 4;
+    private static final int CONTENT_TRANSFER = 5;
+    private static final int CONTENT_CREATE_PROPS = 6;
+    private static final int CONTENT_CREATE_DATA = 7;
+    private static final int CONTENT_DELETE = 8;
+    private static final int CONTENT_MOVE = 11;
     private static final int ENUM_NEXT = 3;
-    private static final int PROPS_GET_VALUES = 5, PROPS_SET_VALUES = 6;
+    private static final int PROPS_GET_VALUES = 5;
+    private static final int PROPS_SET_VALUES = 6;
     private static final int RES_GET_STREAM = 5;
-    private static final int VAL_GET_VALUE = 6, VAL_SET_STRING = 7, VAL_GET_STRING = 8, VAL_SET_U4 = 9,
-        VAL_GET_U4 = 10, VAL_SET_U8 = 13, VAL_GET_U8 = 14, VAL_GET_ERROR = 20, VAL_SET_GUID = 27,
-        VAL_GET_GUID = 28, VAL_SET_BUFFER = 29, VAL_GET_BUFFER = 30, VAL_SET_PVCOLL = 33, VAL_GET_PVCOLL = 34;
+    private static final int VAL_GET_VALUE = 6;
+    private static final int VAL_SET_STRING = 7;
+    private static final int VAL_GET_STRING = 8;
+    private static final int VAL_SET_U4 = 9;
+    private static final int VAL_GET_U4 = 10;
+    private static final int VAL_SET_U8 = 13;
+    private static final int VAL_GET_U8 = 14;
+    private static final int VAL_GET_ERROR = 20;
+    private static final int VAL_SET_GUID = 27;
+    private static final int VAL_GET_GUID = 28;
+    private static final int VAL_SET_BUFFER = 29;
+    private static final int VAL_GET_BUFFER = 30;
+    private static final int VAL_SET_PVCOLL = 33;
+    private static final int VAL_GET_PVCOLL = 34;
     private static final int KEYCOLL_ADD = 5;
-    private static final int PVCOLL_GET_COUNT = 3, PVCOLL_GET_AT = 4, PVCOLL_ADD = 5;
-    private static final int STREAM_READ = 3, STREAM_WRITE = 4, STREAM_COMMIT = 8;
+    private static final int PVCOLL_GET_COUNT = 3;
+    private static final int PVCOLL_GET_AT = 4;
+    private static final int PVCOLL_ADD = 5;
+    private static final int STREAM_READ = 3;
+    private static final int STREAM_WRITE = 4;
+    private static final int STREAM_COMMIT = 8;
     private static final int DATASTREAM_GET_OBJECT_ID = 14;
 
     private static final int PORTABLE_DEVICE_DELETE_NO_RECURSION = 0;
-
-    // A busy device can fail the property reads that classify its functional objects, which would
-    // otherwise silently shorten the storage list. Retry the whole enumeration before giving up.
     private static final int STORAGE_ENUM_ATTEMPTS = 3;
     private static final long STORAGE_ENUM_RETRY_MILLIS = 250;
+    private static final int STREAM_FALLBACK_BUFFER = 1 << 16;
+    private static final int MTP_TRANSFER_CHUNK = 256 * 1024;
+
+    private static final int OP_GET_PARTIAL_OBJECT = 0x101B;
+    private static final int OP_GET_PARTIAL_OBJECT_64 = 0x95C1;
+    private static final int OP_SEND_PARTIAL_OBJECT = 0x95C2;
+    private static final int OP_TRUNCATE_OBJECT = 0x95C3;
+    private static final int OP_BEGIN_EDIT_OBJECT = 0x95C4;
+    private static final int OP_END_EDIT_OBJECT = 0x95C5;
+    private static final int MTP_RESPONSE_OK = 0x2001;
+    private static final int MTP_RESPONSE_OP_NOT_SUPPORTED = 0x2005;
+
+    private static final int PID_GET_SUPPORTED_VENDOR_OPCODES = 11;
+    private static final int PID_EXECUTE_WITHOUT_DATA_PHASE = 12;
+    private static final int PID_EXECUTE_WITH_DATA_TO_READ = 13;
+    private static final int PID_EXECUTE_WITH_DATA_TO_WRITE = 14;
+    private static final int PID_READ_DATA = 15;
+    private static final int PID_WRITE_DATA = 16;
+    private static final int PID_END_DATA_TRANSFER = 17;
 
     private static final Pattern VID = Pattern.compile("vid_([0-9a-fA-F]{4})");
     private static final Pattern PID = Pattern.compile("pid_([0-9a-fA-F]{4})");
+
+    private static final double OA_EPOCH_DAYS = 25569.0;
+    private static final double SECONDS_PER_DAY = 86400.0;
 
     static {
         var a = GLOBAL;
@@ -158,93 +191,72 @@ class WpdBackend implements MtpBackend {
         CLSID_PROPVARIANT_COLLECTION = guid(a, "08a99e2f-6d6d-4b80-af5a-baf2bcbe4cb9");
         IID_PROPVARIANT_COLLECTION = guid(a, "89b2e422-4f1b-4316-bcef-a44afea83eb3");
 
-        String objFmt = "ef6b490d-5cd8-437a-affc-da8b60ee4a3c";
-        KEY_OBJECT_ID = propertyKey(a, objFmt, 2);
-        KEY_PARENT_ID = propertyKey(a, objFmt, 3);
-        KEY_NAME = propertyKey(a, objFmt, 4);
-        KEY_OBJECT_FORMAT = propertyKey(a, objFmt, 6);
-        KEY_CONTENT_TYPE = propertyKey(a, objFmt, 7);
-        KEY_OBJECT_SIZE = propertyKey(a, objFmt, 11);
-        KEY_ORIGINAL_FILE_NAME = propertyKey(a, objFmt, 12);
-        KEY_DATE_MODIFIED = propertyKey(a, objFmt, 19);
+        String object = "ef6b490d-5cd8-437a-affc-da8b60ee4a3c";
+        KEY_PARENT_ID = propertyKey(a, object, 3);
+        KEY_NAME = propertyKey(a, object, 4);
+        KEY_OBJECT_FORMAT = propertyKey(a, object, 6);
+        KEY_CONTENT_TYPE = propertyKey(a, object, 7);
+        KEY_OBJECT_SIZE = propertyKey(a, object, 11);
+        KEY_ORIGINAL_FILE_NAME = propertyKey(a, object, 12);
+        KEY_DATE_MODIFIED = propertyKey(a, object, 19);
         KEY_FUNCTIONAL_CATEGORY = propertyKey(a, "8f052d93-abca-4fc5-a5ac-b01df4dbe598", 2);
         KEY_STORAGE_CAPACITY = propertyKey(a, "01a3057a-74d6-4e80-bea7-dc4c212ce50a", 4);
         KEY_STORAGE_FREE_SPACE = propertyKey(a, "01a3057a-74d6-4e80-bea7-dc4c212ce50a", 5);
         KEY_RESOURCE_DEFAULT = propertyKey(a, "e81e79be-34f0-41bf-b53f-f1a06ae87842", 0);
-        // WPD_MEDIA_* / WPD_MUSIC_* property keys (PortableDevice.h), read by getTrackMetadata.
-        String mediaFmt = "2ed8ba05-0ad3-42dc-b0d0-bc95ac396ac8";
-        KEY_MEDIA_TITLE = propertyKey(a, mediaFmt, 18);
-        KEY_MEDIA_DURATION = propertyKey(a, mediaFmt, 19);
-        KEY_MEDIA_ARTIST = propertyKey(a, mediaFmt, 24);
-        KEY_MEDIA_GENRE = propertyKey(a, mediaFmt, 32);
-        String musicFmt = "b324f56a-dc5d-46e5-b6df-d2ea414888c6";
-        KEY_MUSIC_ALBUM = propertyKey(a, musicFmt, 3);
-        KEY_MUSIC_TRACK = propertyKey(a, musicFmt, 4);
-        String clientFmt = "204d9f0c-2292-4080-9f42-40664e70f859";
-        KEY_CLIENT_NAME = propertyKey(a, clientFmt, 2);
-        KEY_CLIENT_MAJOR_VERSION = propertyKey(a, clientFmt, 3);
-        KEY_CLIENT_MINOR_VERSION = propertyKey(a, clientFmt, 4);
-        KEY_CLIENT_REVISION = propertyKey(a, clientFmt, 5);
-        // WPD_DEVICE_PROTOCOL (WPD_DEVICE_PROPERTIES_V1) — a string such as "MTP: 1.00", "PTP:",
-        // "MSC:", read by isMtpDevice to filter out the non-MTP devices WPD also enumerates.
-        KEY_DEVICE_PROTOCOL = propertyKey(a, "26d4979a-e643-4626-9e2b-736dc0c92fdc", 6);
-        // WPD_DEVICE_SERIAL_NUMBER (same fmtid, pid 9) — the device's MTP serial, used as the identity's
-        // serial so it matches the libmtp backend instead of a Windows-local PnP instance id.
-        KEY_DEVICE_SERIAL_NUMBER = propertyKey(a, "26d4979a-e643-4626-9e2b-736dc0c92fdc", 9);
 
-        // WPD_CATEGORY_COMMON keys used to address any SendCommand invocation (PortableDevice.h).
-        String commonFmt = "f0422a9c-5dc8-4440-b5bd-5df28835658a";
-        KEY_COMMON_COMMAND_CATEGORY = propertyKey(a, commonFmt, 1001);
-        KEY_COMMON_COMMAND_ID = propertyKey(a, commonFmt, 1002);
-        KEY_COMMON_HRESULT = propertyKey(a, commonFmt, 1003);
-        // WPD_CATEGORY_MTP_EXT_VENDOR_OPERATIONS command/property keys (WpdMtpExtensions.h). The
-        // category doubles as every MTP-ext command's fmtid; the command is selected by its pid.
-        String mtpExt = "4d545058-1a2e-4106-a357-771e0819fc56";
-        MTP_EXT_CATEGORY = guid(a, mtpExt);
-        KEY_MTP_OP_CODE = propertyKey(a, mtpExt, 1001);
-        KEY_MTP_OP_PARAMS = propertyKey(a, mtpExt, 1002);
-        KEY_MTP_RESPONSE_CODE = propertyKey(a, mtpExt, 1003);
-        KEY_MTP_TRANSFER_CONTEXT = propertyKey(a, mtpExt, 1006);
-        KEY_MTP_TRANSFER_TOTAL_SIZE = propertyKey(a, mtpExt, 1007);
-        KEY_MTP_NUM_BYTES_TO_READ = propertyKey(a, mtpExt, 1008);
-        KEY_MTP_NUM_BYTES_TO_WRITE = propertyKey(a, mtpExt, 1010);
-        KEY_MTP_TRANSFER_DATA = propertyKey(a, mtpExt, 1012);
-        KEY_MTP_OPERATION_CODES = propertyKey(a, mtpExt, 1005);
+        String media = "2ed8ba05-0ad3-42dc-b0d0-bc95ac396ac8";
+        KEY_MEDIA_TITLE = propertyKey(a, media, 18);
+        KEY_MEDIA_DURATION = propertyKey(a, media, 19);
+        KEY_MEDIA_ARTIST = propertyKey(a, media, 24);
+        KEY_MEDIA_GENRE = propertyKey(a, media, 32);
+        String music = "b324f56a-dc5d-46e5-b6df-d2ea414888c6";
+        KEY_MUSIC_ALBUM = propertyKey(a, music, 3);
+        KEY_MUSIC_TRACK = propertyKey(a, music, 4);
+
+        String client = "204d9f0c-2292-4080-9f42-40664e70f859";
+        KEY_CLIENT_NAME = propertyKey(a, client, 2);
+        KEY_CLIENT_MAJOR_VERSION = propertyKey(a, client, 3);
+        KEY_CLIENT_MINOR_VERSION = propertyKey(a, client, 4);
+        KEY_CLIENT_REVISION = propertyKey(a, client, 5);
+
+        String device = "26d4979a-e643-4626-9e2b-736dc0c92fdc";
+        KEY_DEVICE_PROTOCOL = propertyKey(a, device, 6);
+        KEY_DEVICE_SERIAL_NUMBER = propertyKey(a, device, 9);
+
+        String common = "f0422a9c-5dc8-4440-b5bd-5df28835658a";
+        KEY_COMMON_COMMAND_CATEGORY = propertyKey(a, common, 1001);
+        KEY_COMMON_COMMAND_ID = propertyKey(a, common, 1002);
+        KEY_COMMON_HRESULT = propertyKey(a, common, 1003);
+
+        String mtp = "4d545058-1a2e-4106-a357-771e0819fc56";
+        MTP_EXT_CATEGORY = guid(a, mtp);
+        KEY_MTP_OP_CODE = propertyKey(a, mtp, 1001);
+        KEY_MTP_OP_PARAMS = propertyKey(a, mtp, 1002);
+        KEY_MTP_RESPONSE_CODE = propertyKey(a, mtp, 1003);
+        KEY_MTP_OPERATION_CODES = propertyKey(a, mtp, 1005);
+        KEY_MTP_TRANSFER_CONTEXT = propertyKey(a, mtp, 1006);
+        KEY_MTP_TRANSFER_TOTAL_SIZE = propertyKey(a, mtp, 1007);
+        KEY_MTP_NUM_BYTES_TO_READ = propertyKey(a, mtp, 1008);
+        KEY_MTP_NUM_BYTES_TO_WRITE = propertyKey(a, mtp, 1010);
+        KEY_MTP_TRANSFER_DATA = propertyKey(a, mtp, 1012);
 
         CONTENT_TYPE_FOLDER = guid(a, "27e2e392-a111-48e0-ab0c-e17705a05f85");
         CONTENT_TYPE_FUNCTIONAL_OBJECT = guid(a, "99ed0160-17ff-4c44-9d98-1d7a6f941921");
         CONTENT_TYPE_GENERIC_FILE = guid(a, "0085e0a6-8d34-45d7-bc5c-447e59c73d48");
         CONTENT_TYPE_AUDIO = guid(a, "4ad2c85e-5e2d-45e5-8864-4f229e3c6cf0");
-        FORMAT_UNSPECIFIED = guid(a, "30000000-ae6c-4804-98ba-c57b46965fe7");
-        FORMAT_PROPERTIES_ONLY = guid(a, "30010000-ae6c-4804-98ba-c57b46965fe7");
-        // WPD object-format GUIDs are {0000<mtp-format-code>-ae6c-4804-98ba-c57b46965fe7}
-        // (PortableDevice.h). Codes: WAV 0x3008, MP3 0x3009, WMA 0xB901, OGG 0xB902,
-        // AAC 0xB903, FLAC 0xB906.
-        FORMAT_MP3  = guid(a, "00003009-ae6c-4804-98ba-c57b46965fe7");
-        FORMAT_WAV  = guid(a, "00003008-ae6c-4804-98ba-c57b46965fe7");
-        FORMAT_WMA  = guid(a, "0000b901-ae6c-4804-98ba-c57b46965fe7");
-        FORMAT_OGG  = guid(a, "0000b902-ae6c-4804-98ba-c57b46965fe7");
-        FORMAT_AAC  = guid(a, "0000b903-ae6c-4804-98ba-c57b46965fe7");
-        FORMAT_FLAC = guid(a, "0000b906-ae6c-4804-98ba-c57b46965fe7");
         FUNCTIONAL_CATEGORY_STORAGE = guid(a, "23f05bbc-15de-4c2a-a55b-a9af5ce412ef");
+
+        FORMAT_PROPERTIES_ONLY = guid(a, "30010000-ae6c-4804-98ba-c57b46965fe7");
+        FORMAT_UNSPECIFIED = guid(a, "30000000-ae6c-4804-98ba-c57b46965fe7");
+        FORMAT_WAV = guid(a, "30080000-ae6c-4804-98ba-c57b46965fe7");
+        FORMAT_MP3 = guid(a, "30090000-ae6c-4804-98ba-c57b46965fe7");
+        FORMAT_WMA = guid(a, "b9010000-ae6c-4804-98ba-c57b46965fe7");
+        FORMAT_OGG = guid(a, "b9020000-ae6c-4804-98ba-c57b46965fe7");
+        FORMAT_AAC = guid(a, "b9030000-ae6c-4804-98ba-c57b46965fe7");
+        FORMAT_FLAC = guid(a, "b9060000-ae6c-4804-98ba-c57b46965fe7");
+        FORMAT_MP2 = guid(a, "b9830000-ae6c-4804-98ba-c57b46965fe7");
+        FORMAT_M4A = guid(a, "30aba7ac-6ffd-4c23-a359-3e9b52f3f1c8");
     }
-
-    // Standard MTP GetPartialObject (0x101B, 32-bit offset) and the Android GetPartialObject64
-    // extension (0x95C1, 64-bit offset). A device advertises one or the other; readPartial probes
-    // 0x101B first, then 0x95C1, and caches whichever the device honoured. MTP response 0x2001 is OK,
-    // 0x2005 is Operation_Not_Supported.
-    private static final int OP_GET_PARTIAL_OBJECT = 0x101B, OP_GET_PARTIAL_OBJECT_64 = 0x95C1;
-    private static final int MTP_RESPONSE_OK = 0x2001, MTP_RESPONSE_OP_NOT_SUPPORTED = 0x2005;
-    // Chunk size for the READ_DATA / WRITE_DATA phases; well above a typical tagged file, so most
-    // transfers are a single round trip.
-    private static final int READ_DATA_CHUNK = 256 * 1024;
-
-    // The Android in-place object-edit extension (used by overwriteFile so replacing a file's bytes
-    // keeps the object id and name, avoiding a delete + same-name re-create that some devices reject
-    // for the rest of the session). A device advertises these in its supported-operations list;
-    // supportsObjectEditing gates on BeginEditObject being present.
-    private static final int OP_BEGIN_EDIT_OBJECT = 0x95C4, OP_SEND_PARTIAL_OBJECT = 0x95C2,
-        OP_TRUNCATE_OBJECT = 0x95C3, OP_END_EDIT_OBJECT = 0x95C5;
 
     private static final WpdBackend INSTANCE = new WpdBackend();
 
@@ -254,17 +266,8 @@ class WpdBackend implements MtpBackend {
 
     private WpdBackend() {}
 
-    // The GetPartialObject opcode this device honoured, cached after the first successful probe
-    // (0 until then). Written at most once per opcode; a stale read only costs one extra probe.
-    // (Self-correcting for multi-device: getPartialObject falls through to the other opcode on a
-    // cache miss. Object-editing support is not cached — see supportsObjectEditing — because a wrong
-    // cached "no" would silently disable the in-place path for a different device that does support it.)
-    private volatile int partialReadOpcode = 0;
+    private volatile int partialReadOpcode;
 
-    /**
-     * Live WPD handle: the device plus its content and properties interfaces, and the storage list
-     * enumerated on first use (see {@link #listStorages}).
-     */
     private record WpdDevice(MemorySegment device, MemorySegment content, MemorySegment properties,
                              AtomicReference<List<StorageResult>> storages) implements DeviceHandle {
         WpdDevice(MemorySegment device, MemorySegment content, MemorySegment properties) {
@@ -272,76 +275,79 @@ class WpdBackend implements MtpBackend {
         }
     }
 
-    private static WpdDevice dev(DeviceHandle handle) {
+    private static WpdDevice asDevice(DeviceHandle handle) {
         return (WpdDevice) handle;
     }
 
-    // ---- generic vtable call: every WPD method returns an HRESULT ----
-
-    private static int call(MemorySegment obj, int idx, FunctionDescriptor desc, Object... args) {
-        Object[] all = new Object[args.length + 1];
-        all[0] = obj;
-        System.arraycopy(args, 0, all, 1, args.length);
+    private static int call(MemorySegment obj, int methodIndex, FunctionDescriptor descriptor, Object... args) {
+        Object[] withThis = new Object[args.length + 1];
+        withThis[0] = obj;
+        System.arraycopy(args, 0, withThis, 1, args.length);
         try {
-            return ((Number) WpdCom.method(obj, idx, desc).invokeWithArguments(all)).intValue();
+            return ((Number) WpdCom.method(obj, methodIndex, descriptor)
+                .invokeWithArguments(withThis)).intValue();
         } catch (Throwable t) {
-            throw new RuntimeException("COM call (vtbl index " + idx + ") failed", t);
+            throw new RuntimeException("COM call failed at vtable index " + methodIndex, t);
         }
     }
-
-    // ---- scan / device lifecycle ----
 
     @Override
     public Scan scan() throws IOException {
         ensureInitialized();
         var manager = createInstance(CLSID_DEVICE_MANAGER, IID_DEVICE_MANAGER, "create PortableDeviceManager");
+        boolean keepManager = false;
+        try {
+            var ids = listDeviceIds(manager);
+            keepManager = true;
+            return new WpdScan(manager, ids);
+        } finally {
+            if (!keepManager) releaseQuietly(manager);
+        }
+    }
+
+    private List<String> listDeviceIds(MemorySegment manager) throws IOException {
         try (var arena = Arena.ofConfined()) {
             var countOut = arena.allocate(JAVA_INT);
             checkHr(call(manager, MGR_GET_DEVICES,
                     FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, ADDRESS),
                     MemorySegment.NULL, countOut),
-                "IPortableDeviceManager::GetDevices (count)");
+                "IPortableDeviceManager::GetDevices(count)");
             int count = countOut.get(JAVA_INT, 0);
+            if (count <= 0) return List.of();
+
             var ids = new ArrayList<String>(count);
-            if (count > 0) {
-                var arr = arena.allocate(ADDRESS.byteSize() * count);
-                checkHr(call(manager, MGR_GET_DEVICES,
-                        FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, ADDRESS),
-                        arr, countOut),
-                    "IPortableDeviceManager::GetDevices");
-                int n = countOut.get(JAVA_INT, 0);
-                for (int i = 0; i < n; i++) {
-                    var ptr = arr.getAtIndex(ADDRESS, i);
-                    ids.add(readWstr(ptr));
-                    coTaskMemFree(ptr);
-                }
+            var idArray = arena.allocate(ADDRESS.byteSize() * count);
+            checkHr(call(manager, MGR_GET_DEVICES,
+                    FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, ADDRESS),
+                    idArray, countOut),
+                "IPortableDeviceManager::GetDevices");
+            int actual = countOut.get(JAVA_INT, 0);
+            for (int i = 0; i < actual; i++) {
+                var ptr = idArray.getAtIndex(ADDRESS, i);
+                ids.add(readWstr(ptr));
+                coTaskMemFree(ptr);
             }
-            return new WpdScan(manager, ids);
-        } catch (Throwable t) {
-            release(manager);
-            if (t instanceof IOException io) throw io;
-            throw new IOException("Failed to enumerate WPD devices", t);
+            return List.copyOf(ids);
         }
     }
 
-    /** A WPD scan: the device manager plus the stable PnP device-id strings it returned. */
     private final class WpdScan implements Scan {
         private final MemorySegment manager;
-        private final List<String> ids;
+        private final List<String> deviceIds;
 
-        WpdScan(MemorySegment manager, List<String> ids) {
+        WpdScan(MemorySegment manager, List<String> deviceIds) {
             this.manager = manager;
-            this.ids = ids;
+            this.deviceIds = deviceIds;
         }
 
         @Override
         public List<String> signatures() {
-            return ids; // PnP device ids are stable while attached
+            return deviceIds;
         }
 
         @Override
         public OpenedDevice open(int index) throws IOException {
-            return openDevice(manager, ids.get(index));
+            return openDevice(manager, deviceIds.get(index));
         }
 
         @Override
@@ -351,118 +357,95 @@ class WpdBackend implements MtpBackend {
     }
 
     private OpenedDevice openDevice(MemorySegment manager, String deviceId) throws IOException {
-        var device = createInstance(CLSID_DEVICE_FTM, IID_DEVICE, "create PortableDevice");
+        var device = MemorySegment.NULL;
         var content = MemorySegment.NULL;
-        var props = MemorySegment.NULL;
+        var properties = MemorySegment.NULL;
         boolean handedOff = false;
+
         try (var arena = Arena.ofConfined()) {
-            var clientInfo = createInstance(CLSID_VALUES, IID_VALUES, "create client info");
-            try {
-                // WPD generates the per-connection client context from these during Open; some device
-                // operations (notably object creation) misbehave when the version fields are absent.
-                call(clientInfo, VAL_SET_STRING, FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, ADDRESS),
-                    KEY_CLIENT_NAME, wstr(arena, "melt-jfs"));
-                call(clientInfo, VAL_SET_U4, FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, JAVA_INT), KEY_CLIENT_MAJOR_VERSION, 1);
-                call(clientInfo, VAL_SET_U4, FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, JAVA_INT), KEY_CLIENT_MINOR_VERSION, 0);
-                call(clientInfo, VAL_SET_U4, FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, JAVA_INT), KEY_CLIENT_REVISION, 0);
-                var idW = wstr(arena, deviceId);
-                checkHr(call(device, DEV_OPEN, FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, ADDRESS), idW, clientInfo),
-                    "IPortableDevice::Open");
-            } finally {
-                release(clientInfo);
+            device = createInstance(CLSID_DEVICE_FTM, IID_DEVICE, "create PortableDevice");
+            openPortableDevice(device, deviceId, arena);
+            content = contentInterface(device, arena);
+            properties = propertiesInterface(content, arena);
+
+            if (!isMtpDevice(properties)) {
+                return null;
             }
 
-            var contentOut = arena.allocate(ADDRESS);
-            checkHr(call(device, DEV_CONTENT, FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS), contentOut),
-                "IPortableDevice::Content");
-            content = contentOut.get(ADDRESS, 0);
-
-            var propsOut = arena.allocate(ADDRESS);
-            checkHr(call(content, CONTENT_PROPERTIES, FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS), propsOut),
-                "IPortableDeviceContent::Properties");
-            props = propsOut.get(ADDRESS, 0);
-
-            // WPD enumerates every portable device (PTP cameras, mass-storage, phones in other modes),
-            // not just MTP ones. Skip anything that isn't MTP so callers only ever see usable devices.
-            if (!isMtpDevice(props)) {
-                return null; // the finally below closes it
-            }
-
-            var friendly = deviceStringProp(manager, deviceId, MGR_FRIENDLY_NAME, arena);
-            var description = deviceStringProp(manager, deviceId, MGR_DESCRIPTION, arena);
-            var manufacturer = deviceStringProp(manager, deviceId, MGR_MANUFACTURER, arena);
-
-            var id = parseIdentifier(deviceId, deviceSerialNumber(props));
-            var info = new MTPDeviceInfo(id, friendly, description, manufacturer, 0, 0);
-            var opened = new OpenedDevice(id, info, new WpdDevice(device, content, props));
+            var id = parseIdentifier(deviceId, deviceSerialNumber(properties));
+            var info = new MTPDeviceInfo(
+                id,
+                managerString(manager, deviceId, MGR_FRIENDLY_NAME, arena),
+                managerString(manager, deviceId, MGR_DESCRIPTION, arena),
+                managerString(manager, deviceId, MGR_MANUFACTURER, arena),
+                0,
+                0);
             handedOff = true;
-            return opened;
+            return new OpenedDevice(id, info, new WpdDevice(device, content, properties));
         } catch (Throwable t) {
             if (t instanceof IOException io) throw io;
             throw new IOException("Failed to open WPD device " + deviceId, t);
         } finally {
-            // Unless the caller took ownership, close everything we got. Releasing only the device —
-            // as this used to — strands the content and properties interfaces, and each stranded
-            // interface pins the driver's session for this client for the life of the process.
-            if (!handedOff) {
-                closeInterfaces(device, content, props);
-            }
+            if (!handedOff) closeInterfaces(device, content, properties);
         }
     }
 
-    private String deviceStringProp(MemorySegment manager, String deviceId, int methodIdx, Arena arena) {
-        var idW = wstr(arena, deviceId);
-        var cch = arena.allocate(JAVA_INT);
-        var desc = FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, ADDRESS, ADDRESS);
-        // First call with a NULL buffer asks for the required length (in characters).
-        call(manager, methodIdx, desc, idW, MemorySegment.NULL, cch);
-        int n = cch.get(JAVA_INT, 0);
-        if (n <= 0) return "";
-        var buf = arena.allocate(JAVA_CHAR, n);
-        int hr = call(manager, methodIdx, desc, idW, buf, cch);
-        return failed(hr) ? "" : readWstr(buf);
+    private void openPortableDevice(MemorySegment device, String deviceId, Arena arena) throws IOException {
+        var clientInfo = createInstance(CLSID_VALUES, IID_VALUES, "create WPD client info");
+        try {
+            setString(clientInfo, KEY_CLIENT_NAME, wstr(arena, "melt-jfs"));
+            setU4(clientInfo, KEY_CLIENT_MAJOR_VERSION, 1);
+            setU4(clientInfo, KEY_CLIENT_MINOR_VERSION, 0);
+            setU4(clientInfo, KEY_CLIENT_REVISION, 0);
+            checkHr(call(device, DEV_OPEN,
+                    FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, ADDRESS),
+                    wstr(arena, deviceId), clientInfo),
+                "IPortableDevice::Open");
+        } finally {
+            release(clientInfo);
+        }
     }
 
-    /**
-     * Whether the opened device speaks MTP, read from WPD_DEVICE_PROTOCOL on the device object. WPD
-     * reports a transport-protocol string ("MTP: 1.00", "PTP:", "MSC:", ...); only a value that
-     * clearly names a non-MTP protocol excludes the device. An absent or unreadable protocol keeps
-     * the device (fail-open), so a quirky-but-usable MTP device is never dropped.
-     */
-    private boolean isMtpDevice(MemorySegment props) {
-        var values = getValues(props, WPD_DEVICE_OBJECT_ID, KEY_DEVICE_PROTOCOL);
+    private MemorySegment contentInterface(MemorySegment device, Arena arena) throws IOException {
+        var out = arena.allocate(ADDRESS);
+        checkHr(call(device, DEV_CONTENT,
+                FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS), out),
+            "IPortableDevice::Content");
+        return out.get(ADDRESS, 0);
+    }
+
+    private MemorySegment propertiesInterface(MemorySegment content, Arena arena) throws IOException {
+        var out = arena.allocate(ADDRESS);
+        checkHr(call(content, CONTENT_PROPERTIES,
+                FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS), out),
+            "IPortableDeviceContent::Properties");
+        return out.get(ADDRESS, 0);
+    }
+
+    private String managerString(MemorySegment manager, String deviceId, int methodIndex, Arena arena) {
+        var required = arena.allocate(JAVA_INT);
+        var descriptor = FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, ADDRESS, ADDRESS);
+        int firstHr = call(manager, methodIndex, descriptor, wstr(arena, deviceId), MemorySegment.NULL, required);
+        if (failed(firstHr) || required.get(JAVA_INT, 0) <= 0) return "";
+
+        var buffer = arena.allocate(JAVA_CHAR, required.get(JAVA_INT, 0));
+        int secondHr = call(manager, methodIndex, descriptor, wstr(arena, deviceId), buffer, required);
+        return failed(secondHr) ? "" : readWstr(buffer);
+    }
+
+    private boolean isMtpDevice(MemorySegment properties) {
+        var values = getValues(properties, WPD_DEVICE_OBJECT_ID, KEY_DEVICE_PROTOCOL);
         if (MemorySegment.NULL.equals(values)) return true;
         try {
-            String protocol = getString(values, KEY_DEVICE_PROTOCOL);
-            return protocol.isEmpty() || protocol.regionMatches(true, 0, "MTP", 0, 3);
+            var protocol = getString(values, KEY_DEVICE_PROTOCOL);
+            return protocol.isBlank() || protocol.regionMatches(true, 0, "MTP", 0, 3);
         } finally {
             release(values);
         }
     }
 
-    private MTPDeviceIdentifier parseIdentifier(String deviceId, String wpdSerial) {
-        String lower = deviceId.toLowerCase();
-        int vendor = 0, product = 0;
-        Matcher mv = VID.matcher(lower);
-        if (mv.find()) vendor = Integer.parseInt(mv.group(1), 16);
-        Matcher mp = PID.matcher(lower);
-        if (mp.find()) product = Integer.parseInt(mp.group(1), 16);
-        // Prefer the device-reported MTP serial (WPD_DEVICE_SERIAL_NUMBER) so the identity matches the
-        // libmtp backend. Fall back to the Windows PnP instance id (3rd '#'-delimited segment) for a
-        // device that reports no serial — that id is bus-generated (e.g. "b&27c98feb&0&0000").
-        var segments = deviceId.split("#");
-        String raw = !wpdSerial.isEmpty() ? wpdSerial
-            : (segments.length >= 3 ? segments[2] : deviceId);
-        // MTPDeviceIdentifier's serial must be word characters (it flows into a mtp:// URI and matches
-        // \w+), so collapse any run of non-word characters to a single underscore.
-        String serial = raw.replaceAll("[^0-9A-Za-z_]+", "_").replaceAll("^_+|_+$", "");
-        if (serial.isEmpty()) serial = "unknown";
-        return new MTPDeviceIdentifier(vendor, product, serial);
-    }
-
-    /** Reads WPD_DEVICE_SERIAL_NUMBER from the device object, or "" when the device reports none. */
-    private String deviceSerialNumber(MemorySegment props) {
-        var values = getValues(props, WPD_DEVICE_OBJECT_ID, KEY_DEVICE_SERIAL_NUMBER);
+    private String deviceSerialNumber(MemorySegment properties) {
+        var values = getValues(properties, WPD_DEVICE_OBJECT_ID, KEY_DEVICE_SERIAL_NUMBER);
         if (MemorySegment.NULL.equals(values)) return "";
         try {
             return getString(values, KEY_DEVICE_SERIAL_NUMBER);
@@ -471,102 +454,95 @@ class WpdBackend implements MtpBackend {
         }
     }
 
+    private MTPDeviceIdentifier parseIdentifier(String deviceId, String deviceSerial) {
+        var lower = deviceId.toLowerCase(Locale.ROOT);
+        int vendor = parseHexGroup(VID, lower);
+        int product = parseHexGroup(PID, lower);
+        String rawSerial = deviceSerial;
+        if (rawSerial == null || rawSerial.isBlank()) {
+            var parts = deviceId.split("#");
+            rawSerial = parts.length >= 3 ? parts[2] : deviceId;
+        }
+        var serial = rawSerial.replaceAll("[^0-9A-Za-z_]+", "_").replaceAll("^_+|_+$", "");
+        return new MTPDeviceIdentifier(vendor, product, serial.isEmpty() ? "unknown" : serial);
+    }
+
+    private static int parseHexGroup(Pattern pattern, String text) {
+        var matcher = pattern.matcher(text);
+        return matcher.find() ? Integer.parseInt(matcher.group(1), 16) : 0;
+    }
+
     @Override
     public void releaseDevice(DeviceHandle handle) {
-        var d = dev(handle);
+        var d = asDevice(handle);
         closeInterfaces(d.device(), d.content(), d.properties());
     }
 
-    /**
-     * Tears an open device down in the order WPD requires: every interface obtained <em>from</em> the
-     * device is released before {@code IPortableDevice::Close}.
-     *
-     * <p>{@code IPortableDeviceContent} and {@code IPortableDeviceProperties} hold references back
-     * into the driver's per-client session, so closing while they are still outstanding leaves that
-     * session pinned rather than torn down. Each such leak is permanent, and once enough of them
-     * accumulate the driver stops handing the device out at all — {@code IPortableDevice::Open} then
-     * blocks indefinitely, with no timeout, wedging every client of that device including Explorer.
-     * The libmtp backend has no equivalent exposure: {@code LIBMTP_Release_Device} closes a USB
-     * handle, with no reference graph and no driver-side session to strand.
-     *
-     * <p>Safe on NULL pointers, so it doubles as the failure-path cleanup for a partially opened device.
-     */
     private static void closeInterfaces(MemorySegment device, MemorySegment content, MemorySegment properties) {
-        release(properties);
-        release(content);
-        if (device == null || MemorySegment.NULL.equals(device)) return;
-        try {
-            call(device, DEV_CLOSE, FunctionDescriptor.of(JAVA_INT, ADDRESS));
-        } catch (RuntimeException ignored) {
-            // Closing is best-effort; still release the interface pointer below.
+        releaseQuietly(properties);
+        releaseQuietly(content);
+        if (!isNull(device)) {
+            try {
+                call(device, DEV_CLOSE, FunctionDescriptor.of(JAVA_INT, ADDRESS));
+            } catch (RuntimeException ignored) {
+            }
+            releaseQuietly(device);
         }
-        release(device);
     }
 
-    // ---- storage ----
+    private static void releaseQuietly(MemorySegment obj) {
+        try {
+            release(obj);
+        } catch (RuntimeException ignored) {
+        }
+    }
 
-    /**
-     * The device's storages, enumerated once per open device and then reused. Every path resolution
-     * asks for this, and on WPD each enumeration is a round trip to the device — one that can fail or
-     * come back short while the device is busy, which would make a storage briefly cease to exist and
-     * turn any path under it into a {@link java.nio.file.NoSuchFileException}. libmtp is not exposed to
-     * that: it serves the storage list from state captured when the device was opened. Caching here
-     * gives the same guarantee, and the bridge reopens devices when it rescans, so a storage that is
-     * genuinely added or removed is still picked up.
-     *
-     * <p>Only a complete enumeration is cached, so a partial result from a busy device cannot be
-     * frozen in for the life of the connection.
-     */
+    private static boolean isNull(MemorySegment segment) {
+        return segment == null || MemorySegment.NULL.equals(segment);
+    }
+
     @Override
     public List<StorageResult> listStorages(DeviceHandle handle) {
-        var d = dev(handle);
+        var d = asDevice(handle);
         var cached = d.storages().get();
         if (cached != null) return cached;
 
-        IOException lastFailure = null;
+        IOException last = null;
         for (int attempt = 0; attempt < STORAGE_ENUM_ATTEMPTS; attempt++) {
             if (attempt > 0) sleepQuietly(STORAGE_ENUM_RETRY_MILLIS);
             try {
-                var results = enumerateStorages(d);
-                if (!results.isEmpty()) {
-                    d.storages().set(List.copyOf(results));
+                var storages = enumerateStorages(d);
+                if (!storages.isEmpty()) {
+                    d.storages().compareAndSet(null, List.copyOf(storages));
+                    return d.storages().get();
                 }
-                return results;
-            } catch (IOException incomplete) {
-                lastFailure = incomplete;
+                return storages;
+            } catch (IOException e) {
+                last = e;
             }
         }
-        throw new RuntimeException("Failed to list WPD storages", lastFailure);
+        throw new RuntimeException("Failed to list WPD storages", last);
     }
 
-    /**
-     * One complete pass over the device's functional objects, or an {@link IOException} if any of
-     * them could not be classified. Answering with the storages we *could* read would be worse than
-     * failing: the caller cannot tell a partial list from a real one, so a storage that momentarily
-     * failed a property read would simply cease to exist and every path under it would become a
-     * {@link java.nio.file.NoSuchFileException}. Observed on the FiiO M11 Plus while its Android
-     * media database was still rebuilding after a reboot.
-     */
     private List<StorageResult> enumerateStorages(WpdDevice d) throws IOException {
-        var results = new ArrayList<StorageResult>();
-        for (String childId : enumChildren(d.content(), WPD_DEVICE_OBJECT_ID)) {
+        var storages = new ArrayList<StorageResult>();
+        for (var childId : enumChildren(d.content(), WPD_DEVICE_OBJECT_ID)) {
             var values = getValues(d.properties(), childId, KEY_FUNCTIONAL_CATEGORY, KEY_NAME);
             if (MemorySegment.NULL.equals(values)) {
-                throw new IOException("cannot read the functional category of device object "
-                    + childId + "; the storage list would be incomplete");
+                throw new IOException("Failed to classify WPD functional object: " + childId);
             }
             try (var arena = Arena.ofConfined()) {
-                var guidBuf = arena.allocate(GUID_SIZE);
-                if (getGuid(values, KEY_FUNCTIONAL_CATEGORY, guidBuf)
-                    && guidEquals(guidBuf, FUNCTIONAL_CATEGORY_STORAGE)) {
+                var category = arena.allocate(GUID_SIZE);
+                if (getGuid(values, KEY_FUNCTIONAL_CATEGORY, category)
+                        && guidEquals(category, FUNCTIONAL_CATEGORY_STORAGE)) {
                     var name = getString(values, KEY_NAME);
-                    results.add(new StorageResult(name.isEmpty() ? childId : name, childId));
+                    storages.add(new StorageResult(name.isBlank() ? childId : name, childId));
                 }
             } finally {
                 release(values);
             }
         }
-        return results;
+        return storages;
     }
 
     private static void sleepQuietly(long millis) {
@@ -580,21 +556,22 @@ class WpdBackend implements MtpBackend {
     @Override
     public StorageResult findStorage(DeviceHandle handle, String storageName) {
         return listStorages(handle).stream()
-            .filter(s -> s.name().equals(storageName))
-            .findFirst().orElse(null);
+            .filter(storage -> storage.name().equals(storageName))
+            .findFirst()
+            .orElse(null);
     }
 
     @Override
     public long getCapacity(DeviceHandle handle, String storageId) {
-        return storageU8(dev(handle), storageId, KEY_STORAGE_CAPACITY);
+        return readStorageU8(asDevice(handle), storageId, KEY_STORAGE_CAPACITY);
     }
 
     @Override
     public long getFreeSpace(DeviceHandle handle, String storageId) {
-        return storageU8(dev(handle), storageId, KEY_STORAGE_FREE_SPACE);
+        return readStorageU8(asDevice(handle), storageId, KEY_STORAGE_FREE_SPACE);
     }
 
-    private long storageU8(WpdDevice d, String storageId, MemorySegment key) {
+    private long readStorageU8(WpdDevice d, String storageId, MemorySegment key) {
         var values = getValues(d.properties(), storageId, key);
         if (MemorySegment.NULL.equals(values)) return -1;
         try {
@@ -604,47 +581,37 @@ class WpdBackend implements MtpBackend {
         }
     }
 
-    // ---- items ----
-
     @Override
     public MTPItemInfo[] getChildItems(DeviceHandle handle, String storageId, String parentId) throws IOException {
-        var d = dev(handle);
-        String wpdParent = parentId.equals(ROOT_PARENT) ? storageId : parentId;
+        var d = asDevice(handle);
+        String parent = parentForWpd(parentId, storageId);
         var items = new ArrayList<MTPItemInfo>();
-        for (String childId : enumChildren(d.content(), wpdParent)) {
+        for (var childId : enumChildren(d.content(), parent)) {
             var values = getValues(d.properties(), childId,
                 KEY_CONTENT_TYPE, KEY_ORIGINAL_FILE_NAME, KEY_NAME, KEY_OBJECT_SIZE, KEY_DATE_MODIFIED);
             if (MemorySegment.NULL.equals(values)) continue;
             try (var arena = Arena.ofConfined()) {
-                var guidBuf = arena.allocate(GUID_SIZE);
                 boolean isFile = true;
-                if (getGuid(values, KEY_CONTENT_TYPE, guidBuf)) {
-                    isFile = !(guidEquals(guidBuf, CONTENT_TYPE_FOLDER)
-                        || guidEquals(guidBuf, CONTENT_TYPE_FUNCTIONAL_OBJECT));
+                var contentType = arena.allocate(GUID_SIZE);
+                if (getGuid(values, KEY_CONTENT_TYPE, contentType)) {
+                    isFile = !(guidEquals(contentType, CONTENT_TYPE_FOLDER)
+                        || guidEquals(contentType, CONTENT_TYPE_FUNCTIONAL_OBJECT));
                 }
-                var name = getString(values, KEY_ORIGINAL_FILE_NAME);
-                if (name.isEmpty()) name = getString(values, KEY_NAME);
-                if (name.isEmpty()) name = childId;
-                long size = getU8(values, KEY_OBJECT_SIZE);
+                String name = firstNonBlank(getString(values, KEY_ORIGINAL_FILE_NAME),
+                    getString(values, KEY_NAME), childId);
+                long size = Math.max(getU8(values, KEY_OBJECT_SIZE), 0);
                 long modified = getDateEpochSeconds(values, KEY_DATE_MODIFIED);
-                items.add(new MTPItemInfo(wpdParent, childId, storageId, isFile,
-                    size < 0 ? 0 : size, modified, name));
+                items.add(new MTPItemInfo(parent, childId, storageId, isFile, size, modified, name));
             } finally {
                 release(values);
             }
         }
-        return items.toArray(new MTPItemInfo[0]);
+        return items.toArray(MTPItemInfo[]::new);
     }
 
-    /**
-     * Backed by a single {@code IPortableDeviceProperties::GetValues} call requesting the
-     * WPD_MEDIA_* / WPD_MUSIC_* keys — a metadata-only exchange, never a data transfer. WPD has no
-     * "is a track" gate, so an object where every requested property is absent (a folder, a
-     * non-audio file, or an audio file the device has not indexed) reports null.
-     */
     @Override
     public MTPTrackMetadata getTrackMetadata(DeviceHandle handle, String itemId) throws IOException {
-        var d = dev(handle);
+        var d = asDevice(handle);
         var values = getValues(d.properties(), itemId,
             KEY_MEDIA_TITLE, KEY_MEDIA_ARTIST, KEY_MUSIC_ALBUM, KEY_MEDIA_GENRE,
             KEY_MUSIC_TRACK, KEY_MEDIA_DURATION, KEY_NAME);
@@ -656,17 +623,9 @@ class WpdBackend implements MtpBackend {
             String genre = emptyToNull(getString(values, KEY_MEDIA_GENRE));
             int trackNumber = (int) Math.max(getU4(values, KEY_MUSIC_TRACK), 0);
             long duration = Math.max(getU8(values, KEY_MEDIA_DURATION), 0);
-
-            // Devices commonly index a track's ID3 title (TIT2) onto WPD_OBJECT_NAME and leave
-            // WPD_MEDIA_TITLE empty. Fall back to the object name for the title — but only once
-            // another media property confirms the device recognised this object as a track, so a
-            // plain file's name can't masquerade as a title (WPD has no "is a track" gate).
-            boolean recognisedTrack = artist != null || album != null || genre != null
+            boolean recognized = artist != null || album != null || genre != null
                 || trackNumber > 0 || duration > 0;
-            if (title == null && recognisedTrack) {
-                title = emptyToNull(getString(values, KEY_NAME));
-            }
-
+            if (title == null && recognized) title = emptyToNull(getString(values, KEY_NAME));
             var meta = new MTPTrackMetadata(title, artist, album, genre, trackNumber, duration);
             return meta.isEmpty() ? null : meta;
         } finally {
@@ -675,26 +634,27 @@ class WpdBackend implements MtpBackend {
     }
 
     @Override
-    public String createFolder(DeviceHandle handle, String name, String parentId, String storageId) throws IOException {
-        var d = dev(handle);
-        String parent = parentId.equals(ROOT_PARENT) ? storageId : parentId;
+    public String createFolder(DeviceHandle handle, String name, String parentId, String storageId)
+            throws IOException {
+        var d = asDevice(handle);
         try (var arena = Arena.ofConfined()) {
-            var values = createInstance(CLSID_VALUES, IID_VALUES, "create object properties");
+            var values = createInstance(CLSID_VALUES, IID_VALUES, "create folder properties");
             try {
-                setString(values, KEY_PARENT_ID, wstr(arena, parent));
+                setString(values, KEY_PARENT_ID, wstr(arena, parentForWpd(parentId, storageId)));
                 setString(values, KEY_NAME, wstr(arena, name));
                 setString(values, KEY_ORIGINAL_FILE_NAME, wstr(arena, name));
                 setGuid(values, KEY_CONTENT_TYPE, CONTENT_TYPE_FOLDER);
-                // A folder is a properties-only object; WPD requires the matching format guid.
                 setGuid(values, KEY_OBJECT_FORMAT, FORMAT_PROPERTIES_ONLY);
                 var idOut = arena.allocate(ADDRESS);
                 checkHr(call(d.content(), CONTENT_CREATE_PROPS,
                         FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, ADDRESS), values, idOut),
                     "CreateObjectWithPropertiesOnly");
                 var ptr = idOut.get(ADDRESS, 0);
-                var id = readWstr(ptr);
-                coTaskMemFree(ptr);
-                return id;
+                try {
+                    return readWstr(ptr);
+                } finally {
+                    coTaskMemFree(ptr);
+                }
             } finally {
                 release(values);
             }
@@ -703,38 +663,37 @@ class WpdBackend implements MtpBackend {
 
     @Override
     public void deleteObject(DeviceHandle handle, String itemId) throws IOException {
-        var d = dev(handle);
-        var coll = objectIdCollection(itemId);
+        var d = asDevice(handle);
+        var ids = objectIdCollection(itemId);
         try {
             checkHr(call(d.content(), CONTENT_DELETE,
                     FunctionDescriptor.of(JAVA_INT, ADDRESS, JAVA_INT, ADDRESS, ADDRESS),
-                    PORTABLE_DEVICE_DELETE_NO_RECURSION, coll, MemorySegment.NULL),
+                    PORTABLE_DEVICE_DELETE_NO_RECURSION, ids, MemorySegment.NULL),
                 "IPortableDeviceContent::Delete");
         } finally {
-            release(coll);
+            release(ids);
         }
     }
 
     @Override
     public void getFile(DeviceHandle handle, String itemId, String destPath) throws IOException {
-        var d = dev(handle);
+        var d = asDevice(handle);
         try (var arena = Arena.ofConfined()) {
-            var resOut = arena.allocate(ADDRESS);
+            var resourcesOut = arena.allocate(ADDRESS);
             checkHr(call(d.content(), CONTENT_TRANSFER,
-                    FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS), resOut),
+                    FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS), resourcesOut),
                 "IPortableDeviceContent::Transfer");
-            var resources = resOut.get(ADDRESS, 0);
+            var resources = resourcesOut.get(ADDRESS, 0);
             try {
-                var optBuf = arena.allocate(JAVA_INT);
+                var optimal = arena.allocate(JAVA_INT);
                 var streamOut = arena.allocate(ADDRESS);
                 checkHr(call(resources, RES_GET_STREAM,
                         FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, ADDRESS, JAVA_INT, ADDRESS, ADDRESS),
-                        wstr(arena, itemId), KEY_RESOURCE_DEFAULT, STGM_READ, optBuf, streamOut),
+                        wstr(arena, itemId), KEY_RESOURCE_DEFAULT, STGM_READ, optimal, streamOut),
                     "IPortableDeviceResources::GetStream");
                 var stream = streamOut.get(ADDRESS, 0);
-                int bufSize = transferBufferSize(optBuf.get(JAVA_INT, 0));
                 try (var out = Files.newOutputStream(Path.of(destPath))) {
-                    copyStreamToFile(stream, out, bufSize);
+                    copyStreamToFile(stream, out, transferBufferSize(optimal.get(JAVA_INT, 0)));
                 } finally {
                     release(stream);
                 }
@@ -746,49 +705,29 @@ class WpdBackend implements MtpBackend {
 
     @Override
     public boolean reopenClearsNameReservations() {
-        // Measured false, unlike libmtp: a full closeInterfaces (release properties/content, then
-        // IPortableDevice::Close) followed by a fresh scan and Open leaves a deleted-name
-        // reservation intact — the FiiO M11 Plus SD card refused the same createFolder again, with
-        // the identical HRESULT, after the reconnect. The driver pools an MTP session to the device
-        // across clients, so closing a client handle does not end the session the device sees.
-        // Do not flip this to true without re-measuring; the reconnect it authorises is
-        // process-wide and, here, futile.
         return false;
     }
 
     @Override
     public boolean supportsPartialReads() {
-        // Implemented through MTP GetPartialObject, sent as a raw command via IPortableDevice::SendCommand.
-        // Device-level support (which GetPartialObject variant, if any) is probed on first use.
         return true;
     }
 
-    /**
-     * Ranged read via the MTP GetPartialObject operation, issued as a raw MTP command through
-     * {@code IPortableDevice::SendCommand} (the WPD MTP pass-through). Unlike the whole-object resource
-     * stream used by {@link #getFile}, this is a bounded request/data/response transaction, so it
-     * transfers only the requested bytes and never leaves the device mid-transfer.
-     */
     @Override
     public byte[] readPartial(DeviceHandle handle, String itemId, long offset, int maxBytes) throws IOException {
         if (offset < 0) throw new IllegalArgumentException("offset must be non-negative: " + offset);
         if (maxBytes < 0) throw new IllegalArgumentException("maxBytes must be non-negative: " + maxBytes);
         if (maxBytes == 0) return new byte[0];
-        long objectHandle = parseObjectHandle(itemId);
-        var d = dev(handle);
 
-        // Try the cached opcode first, then the other; a 32-bit-offset op is skipped when the offset
-        // needs more than 32 bits. getPartialObject returns null when the device reports the opcode
-        // unsupported (MTP 0x2005), so we fall through to the next candidate.
+        var d = asDevice(handle);
+        long objectHandle = parseObjectHandle(itemId);
         int cached = partialReadOpcode;
-        int[] order = cached == OP_GET_PARTIAL_OBJECT_64
-            ? new int[]{OP_GET_PARTIAL_OBJECT_64, OP_GET_PARTIAL_OBJECT}
-            : new int[]{OP_GET_PARTIAL_OBJECT, OP_GET_PARTIAL_OBJECT_64};
-        // An unsupported opcode can surface either as MTP 0x2005 (getPartialObject returns null) or as a
-        // driver-level error; in both cases fall through to the other variant before giving up.
-        IOException pending = null;
-        for (int opcode : order) {
-            if (opcode == OP_GET_PARTIAL_OBJECT && (offset >>> 32) != 0) continue; // needs 64-bit offset
+        int[] opcodes = cached == OP_GET_PARTIAL_OBJECT_64
+            ? new int[] {OP_GET_PARTIAL_OBJECT_64, OP_GET_PARTIAL_OBJECT}
+            : new int[] {OP_GET_PARTIAL_OBJECT, OP_GET_PARTIAL_OBJECT_64};
+        IOException last = null;
+        for (int opcode : opcodes) {
+            if (opcode == OP_GET_PARTIAL_OBJECT && (offset >>> 32) != 0) continue;
             try {
                 byte[] result = getPartialObject(d, objectHandle, offset, maxBytes, opcode);
                 if (result != null) {
@@ -796,174 +735,142 @@ class WpdBackend implements MtpBackend {
                     return result;
                 }
             } catch (IOException e) {
-                pending = e;
+                last = e;
             }
         }
-        if (pending != null) throw pending;
-        throw new IOException("device supports neither GetPartialObject (0x101B) nor "
-            + "GetPartialObject64 (0x95C1) for id: " + itemId);
+        if (last != null) throw last;
+        throw new IOException("device supports neither GetPartialObject nor GetPartialObject64 for id: " + itemId);
     }
 
-    /**
-     * Runs one GetPartialObject transaction with {@code opcode}: initiate (WITH_DATA_TO_READ), read the
-     * data phase in chunks (READ_DATA), then always close it (END_DATA_TRANSFER). Returns the bytes read
-     * (possibly empty near/at end-of-object), or {@code null} when the device reports the opcode
-     * unsupported so the caller can try the other variant.
-     */
     private byte[] getPartialObject(WpdDevice d, long objectHandle, long offset, int maxBytes, int opcode)
             throws IOException {
-        String context;
-        long total;
-        try (var arena = Arena.ofConfined()) {
-            var initParams = createCommand(MTP_EXT_CATEGORY, PID_EXECUTE_WITH_DATA_TO_READ);
-            try {
-                setU4(initParams, KEY_MTP_OP_CODE, opcode);
-                var params = createInstance(CLSID_PROPVARIANT_COLLECTION, IID_PROPVARIANT_COLLECTION,
-                    "create MTP operation params");
-                try {
-                    addU4(params, arena, (int) objectHandle);
-                    if (opcode == OP_GET_PARTIAL_OBJECT) {
-                        addU4(params, arena, (int) offset);
-                        addU4(params, arena, maxBytes);
-                    } else { // GetPartialObject64: object handle, offset low, offset high, max bytes
-                        addU4(params, arena, (int) offset);
-                        addU4(params, arena, (int) (offset >>> 32));
-                        addU4(params, arena, maxBytes);
-                    }
-                    call(initParams, VAL_SET_PVCOLL,
-                        FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, ADDRESS), KEY_MTP_OP_PARAMS, params);
-                } finally {
-                    release(params);
-                }
-                var initResults = sendCommand(d.device(), initParams, arena);
-                try {
-                    checkDriverHr(initResults, "initiate GetPartialObject");
-                    context = getString(initResults, KEY_MTP_TRANSFER_CONTEXT);
-                    total = Math.min(Math.max(getU4(initResults, KEY_MTP_TRANSFER_TOTAL_SIZE), 0), maxBytes);
-                } finally {
-                    release(initResults);
-                }
-            } finally {
-                release(initParams);
-            }
-        }
+        var start = beginDataToRead(d.device(), objectHandle, offset, maxBytes, opcode);
+        if (start.operationUnsupported()) return null;
 
-        // Once initiated, the transfer must be closed even if reading fails, so the device is not left
-        // mid-transaction. END_DATA_TRANSFER carries the MTP response code.
-        byte[] out = new byte[(int) total];
+        byte[] out = new byte[start.transferSize()];
         int read = 0;
-        int responseCode;
+        int response;
         try {
-            read = readDataPhase(d.device(), context, out);
+            read = readDataPhase(d.device(), start.context(), out);
         } finally {
-            responseCode = endDataTransfer(d.device(), context);
+            response = endDataTransfer(d.device(), start.context());
         }
-        if (responseCode == MTP_RESPONSE_OP_NOT_SUPPORTED) return null;
+        if (response == MTP_RESPONSE_OP_NOT_SUPPORTED) return null;
+        if (response >= 0) checkMtpResponse(response, "GetPartialObject");
         return read == out.length ? out : Arrays.copyOf(out, read);
     }
 
-    /** Reads the data phase into {@code out} in chunks, returning the number of bytes read. */
+    private record ReadTransfer(String context, int transferSize, boolean operationUnsupported) {
+        static ReadTransfer unsupportedTransfer() {
+            return new ReadTransfer("", 0, true);
+        }
+    }
+
+    private ReadTransfer beginDataToRead(MemorySegment device, long objectHandle, long offset,
+                                         int maxBytes, int opcode) throws IOException {
+        try (var arena = Arena.ofConfined()) {
+            var command = createCommand(PID_EXECUTE_WITH_DATA_TO_READ);
+            try {
+                setU4(command, KEY_MTP_OP_CODE, opcode);
+                setOpParams(command, arena, partialReadParams(objectHandle, offset, maxBytes, opcode));
+                var results = sendCommand(device, command, arena);
+                try {
+                    checkDriverHr(results, "initiate GetPartialObject");
+                    int response = getOptionalU4(results, KEY_MTP_RESPONSE_CODE);
+                    if (response == MTP_RESPONSE_OP_NOT_SUPPORTED) return ReadTransfer.unsupportedTransfer();
+                    if (response >= 0 && response != MTP_RESPONSE_OK) {
+                        throw new IOException("GetPartialObject failed (MTP response 0x"
+                            + Integer.toHexString(response) + ")");
+                    }
+                    String context = getString(results, KEY_MTP_TRANSFER_CONTEXT);
+                    if (context.isBlank()) throw new IOException("GetPartialObject returned no transfer context");
+                    long total = readUnsigned(results, KEY_MTP_TRANSFER_TOTAL_SIZE);
+                    if (total < 0) total = maxBytes;
+                    return new ReadTransfer(context, (int) Math.min(total, maxBytes), false);
+                } finally {
+                    release(results);
+                }
+            } finally {
+                release(command);
+            }
+        }
+    }
+
+    private static int[] partialReadParams(long objectHandle, long offset, int maxBytes, int opcode) {
+        if (opcode == OP_GET_PARTIAL_OBJECT) {
+            return new int[] {(int) objectHandle, (int) offset, maxBytes};
+        }
+        return new int[] {(int) objectHandle, (int) offset, (int) (offset >>> 32), maxBytes};
+    }
+
     private int readDataPhase(MemorySegment device, String context, byte[] out) throws IOException {
         int read = 0;
         while (read < out.length) {
-            int chunk = Math.min(out.length - read, READ_DATA_CHUNK);
+            int want = Math.min(out.length - read, MTP_TRANSFER_CHUNK);
             try (var arena = Arena.ofConfined()) {
-                var params = createCommand(MTP_EXT_CATEGORY, PID_READ_DATA);
+                var command = createCommand(PID_READ_DATA);
                 try {
-                    setString(params, KEY_MTP_TRANSFER_CONTEXT, wstr(arena, context));
-                    // WPD requires an input buffer of the requested size even though the data comes back
-                    // through the results (a WDF quirk noted in the WPD docs).
-                    call(params, VAL_SET_BUFFER,
-                        FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, ADDRESS, JAVA_INT),
-                        KEY_MTP_TRANSFER_DATA, arena.allocate(chunk), chunk);
-                    setU4(params, KEY_MTP_NUM_BYTES_TO_READ, chunk);
-                    var results = sendCommand(device, params, arena);
+                    setString(command, KEY_MTP_TRANSFER_CONTEXT, wstr(arena, context));
+                    setBuffer(command, KEY_MTP_TRANSFER_DATA, arena.allocate(want), want);
+                    setU4(command, KEY_MTP_NUM_BYTES_TO_READ, want);
+                    var results = sendCommand(device, command, arena);
                     try {
                         checkDriverHr(results, "READ_DATA");
                         int got = copyBufferValue(results, out, read);
-                        if (got <= 0) break; // device sent less than it promised; stop at what we have
+                        if (got <= 0) break;
                         read += got;
                     } finally {
                         release(results);
                     }
                 } finally {
-                    release(params);
+                    release(command);
                 }
             }
         }
         return read;
     }
 
-    /** Sends END_DATA_TRANSFER for {@code context}; returns the MTP response code (-1 if unavailable). */
     private int endDataTransfer(MemorySegment device, String context) {
         try (var arena = Arena.ofConfined()) {
-            var params = createCommand(MTP_EXT_CATEGORY, PID_END_DATA_TRANSFER);
+            var command = createCommand(PID_END_DATA_TRANSFER);
             try {
-                setString(params, KEY_MTP_TRANSFER_CONTEXT, wstr(arena, context));
-                var results = sendCommand(device, params, arena);
+                setString(command, KEY_MTP_TRANSFER_CONTEXT, wstr(arena, context));
+                var results = sendCommand(device, command, arena);
                 try {
-                    return (int) getU4(results, KEY_MTP_RESPONSE_CODE);
+                    checkDriverHr(results, "END_DATA_TRANSFER");
+                    return getOptionalU4(results, KEY_MTP_RESPONSE_CODE);
                 } finally {
                     release(results);
                 }
             } finally {
-                release(params);
+                release(command);
             }
         } catch (IOException | RuntimeException e) {
-            return -1; // best-effort close; the read result is already in hand
+            return -1;
         }
     }
 
     @Override
     public boolean supportsObjectEditing(DeviceHandle handle) {
-        // BeginEditObject is a vendor-extended opcode, so the device's supported-vendor-opcodes list
-        // is authoritative when the driver answers it. Some WpdMtp builds return E_NOTIMPL for that
-        // query, though; there we are optimistic — overwriteFile probes BeginEditObject and cleanly
-        // falls back if the device rejects it, so a hopeful "yes" costs at most one round trip. Not
-        // cached on the singleton: with several devices attached a wrong "no" from one would wrongly
-        // disable the in-place path for another.
         try {
-            return deviceSupportsOperation(dev(handle).device(), OP_BEGIN_EDIT_OBJECT);
+            return deviceSupportsOperation(asDevice(handle).device(), OP_BEGIN_EDIT_OBJECT);
         } catch (IOException queryUnsupported) {
             return true;
         }
     }
 
-    /**
-     * Replaces the bytes of {@code itemId} in place with the content of {@code localPath} using the
-     * Android object-edit extension (BeginEditObject → SendPartialObject → TruncateObject → EndEditObject)
-     * over the same {@code SendCommand} MTP pass-through as {@link #readPartial}. The object keeps its id
-     * and name, so this never trips the asynchronous-delete window that makes a delete + same-name
-     * re-create fail on some devices. The edit session is always closed (EndEditObject) even when a phase
-     * fails, so the device is never left mid-edit.
-     *
-     * <p><b>Grows are included.</b> An earlier version refused to grow an object in place, on the
-     * theory that the grow half-landed and left whole-object reads truncated. Measurement (the
-     * {@code growProbe} dev task) disproved that on every storage of both test devices: the edit
-     * always lands and the full new content reads back correctly through both {@code GetPartialObject}
-     * and a whole-object transfer. What is unreliable is only the device's reported
-     * {@code WPD_OBJECT_SIZE}, which stays at the old value on three of the four storages — a metadata
-     * problem the caller compensates for (see the size overlays in {@code MTPDeviceBridge}), not a
-     * reason to fall back. The fallback was worse than the problem: delete + re-create under the same
-     * name races the asynchronous-delete window on exactly the devices this path exists to protect.
-     */
     @Override
     public void overwriteFile(DeviceHandle handle, String itemId, String localPath) throws IOException {
+        var device = asDevice(handle).device();
         long objectHandle = parseObjectHandle(itemId);
-        var d = dev(handle);
-        var device = d.device();
         long size = Files.size(Path.of(localPath));
         if (size > 0xFFFFFFFFL) {
-            // SendPartialObject's length parameter is 32-bit; let the caller fall back for huge files.
             throw new IOException("in-place edit exceeds SendPartialObject's 32-bit length: " + size);
         }
 
         checkMtpResponse(executeWithoutData(device, OP_BEGIN_EDIT_OBJECT, (int) objectHandle),
             "BeginEditObject");
         try {
-            // Truncate to zero, then stream the whole file from offset 0 (matching the libmtp backend):
-            // SendPartialObject only extends when writing from the object's current end, so it must
-            // start from an emptied object; whatever the object held before is dropped.
             checkMtpResponse(executeWithoutData(device, OP_TRUNCATE_OBJECT, (int) objectHandle, 0, 0),
                 "TruncateObject");
             if (size > 0) {
@@ -972,406 +879,311 @@ class WpdBackend implements MtpBackend {
                 }
             }
         } finally {
-            executeWithoutData(device, OP_END_EDIT_OBJECT, (int) objectHandle); // best-effort close
+            try {
+                executeWithoutData(device, OP_END_EDIT_OBJECT, (int) objectHandle);
+            } catch (IOException ignored) {
+            }
         }
     }
 
-    /** Whether the device advertises {@code opcode} in its supported-operations list. */
     private boolean deviceSupportsOperation(MemorySegment device, int opcode) throws IOException {
         try (var arena = Arena.ofConfined()) {
-            var cmd = createCommand(MTP_EXT_CATEGORY, PID_GET_SUPPORTED_VENDOR_OPCODES);
+            var command = createCommand(PID_GET_SUPPORTED_VENDOR_OPCODES);
             try {
-                var results = sendCommand(device, cmd, arena);
+                var results = sendCommand(device, command, arena);
                 try {
                     checkDriverHr(results, "GET_SUPPORTED_VENDOR_OPCODES");
-                    var collOut = arena.allocate(ADDRESS);
+                    var out = arena.allocate(ADDRESS);
                     int hr = call(results, VAL_GET_PVCOLL,
                         FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, ADDRESS),
-                        KEY_MTP_OPERATION_CODES, collOut);
+                        KEY_MTP_OPERATION_CODES, out);
                     if (failed(hr)) return false;
-                    var coll = collOut.get(ADDRESS, 0);
+                    var operations = out.get(ADDRESS, 0);
                     try {
-                        return propVariantCollectionContainsU4(coll, opcode);
+                        return propVariantCollectionContainsU4(operations, opcode);
                     } finally {
-                        release(coll);
+                        release(operations);
                     }
                 } finally {
                     release(results);
                 }
             } finally {
-                release(cmd);
+                release(command);
             }
         }
     }
 
-    /** Whether an IPortableDevicePropVariantCollection of VT_UI4 values contains {@code value}. */
-    private boolean propVariantCollectionContainsU4(MemorySegment coll, int value) {
+    private boolean propVariantCollectionContainsU4(MemorySegment collection, int value) {
         try (var arena = Arena.ofConfined()) {
             var countOut = arena.allocate(JAVA_INT);
-            if (failed(call(coll, PVCOLL_GET_COUNT,
-                    FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS), countOut))) return false;
+            int countHr = call(collection, PVCOLL_GET_COUNT,
+                FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS), countOut);
+            if (failed(countHr)) return false;
             int count = countOut.get(JAVA_INT, 0);
-            var pv = arena.allocate(PROPVARIANT_SIZE);
+            var variant = arena.allocate(PROPVARIANT_SIZE);
             for (int i = 0; i < count; i++) {
-                if (failed(call(coll, PVCOLL_GET_AT,
-                        FunctionDescriptor.of(JAVA_INT, ADDRESS, JAVA_INT, ADDRESS), i, pv))) continue;
-                if (pv.get(JAVA_SHORT, 0) == VT_UI4 && pv.get(JAVA_INT, 8) == value) return true;
+                int hr = call(collection, PVCOLL_GET_AT,
+                    FunctionDescriptor.of(JAVA_INT, ADDRESS, JAVA_INT, ADDRESS), i, variant);
+                if (!failed(hr) && variant.get(JAVA_SHORT, 0) == VT_UI4
+                        && variant.get(JAVA_INT, 8) == value) {
+                    return true;
+                }
             }
             return false;
         }
     }
 
-    /**
-     * Runs a no-data-phase MTP command ({@code opcode} with {@code params}) via SendCommand and returns
-     * the device's MTP response code (0x2001 on success).
-     */
     private int executeWithoutData(MemorySegment device, int opcode, int... params) throws IOException {
         try (var arena = Arena.ofConfined()) {
-            var cmd = createCommand(MTP_EXT_CATEGORY, PID_EXECUTE_WITHOUT_DATA_PHASE);
+            var command = createCommand(PID_EXECUTE_WITHOUT_DATA_PHASE);
             try {
-                setU4(cmd, KEY_MTP_OP_CODE, opcode);
-                setOpParams(cmd, arena, params);
-                var results = sendCommand(device, cmd, arena);
+                setU4(command, KEY_MTP_OP_CODE, opcode);
+                setOpParams(command, arena, params);
+                var results = sendCommand(device, command, arena);
                 try {
                     checkDriverHr(results, "MTP op 0x" + Integer.toHexString(opcode));
-                    return (int) getU4(results, KEY_MTP_RESPONSE_CODE);
+                    return getOptionalU4(results, KEY_MTP_RESPONSE_CODE);
                 } finally {
                     release(results);
                 }
             } finally {
-                release(cmd);
+                release(command);
             }
         }
     }
 
-    /**
-     * Diagnostic seam for {@code MTPReservationLeverProbe} (same package, dev source set): issues one
-     * raw no-data-phase MTP command at the device, behind the driver's back.
-     *
-     * <p>Exists because the deleted-name reservation has no known cure on WPD and the untested
-     * hypothesis is that what must be reset is the <em>device's</em> MTP session rather than the host's
-     * handle to it — see {@code docs/deleted-name-reservation.md}. Nothing in the library calls this,
-     * and it is package-private precisely so nothing outside a probe can: sending session-level
-     * opcodes underneath a driver that believes it owns the session is not a supported operation, and
-     * a wedged WpdMtpDr takes every client of the device down with it.
-     */
     int sendRawMtpCommand(DeviceHandle handle, int opcode, int... params) throws IOException {
-        return executeWithoutData(dev(handle).device(), opcode, params);
+        return executeWithoutData(asDevice(handle).device(), opcode, params);
     }
 
-    /**
-     * Sends {@code size} bytes from {@code in} as one SendPartialObject transaction at offset 0:
-     * initiate (WITH_DATA_TO_WRITE), stream the data phase in chunks (WRITE_DATA), then always close it
-     * (END_DATA_TRANSFER), whose MTP response code must be OK.
-     */
     private void sendPartialObject(MemorySegment device, long objectHandle, long size, InputStream in)
             throws IOException {
-        String context;
-        try (var arena = Arena.ofConfined()) {
-            var cmd = createCommand(MTP_EXT_CATEGORY, PID_EXECUTE_WITH_DATA_TO_WRITE);
-            try {
-                setU4(cmd, KEY_MTP_OP_CODE, OP_SEND_PARTIAL_OBJECT);
-                // SendPartialObject params: object handle, offset low, offset high, length.
-                setOpParams(cmd, arena, (int) objectHandle, 0, 0, (int) size);
-                setU8(cmd, KEY_MTP_TRANSFER_TOTAL_SIZE, size);
-                var results = sendCommand(device, cmd, arena);
-                try {
-                    checkDriverHr(results, "initiate SendPartialObject");
-                    context = getString(results, KEY_MTP_TRANSFER_CONTEXT);
-                } finally {
-                    release(results);
-                }
-            } finally {
-                release(cmd);
-            }
-        }
-
-        int responseCode;
+        String context = beginDataToWrite(device, objectHandle, size);
+        int response;
         try {
             writeDataPhase(device, context, in, size);
         } finally {
-            responseCode = endDataTransfer(device, context);
+            response = endDataTransfer(device, context);
         }
-        checkMtpResponse(responseCode, "SendPartialObject");
+        checkMtpResponse(response, "SendPartialObject");
     }
 
-    /** Streams {@code total} bytes from {@code in} to the open transfer {@code context} in chunks. */
+    private String beginDataToWrite(MemorySegment device, long objectHandle, long size) throws IOException {
+        try (var arena = Arena.ofConfined()) {
+            var command = createCommand(PID_EXECUTE_WITH_DATA_TO_WRITE);
+            try {
+                setU4(command, KEY_MTP_OP_CODE, OP_SEND_PARTIAL_OBJECT);
+                setOpParams(command, arena, (int) objectHandle, 0, 0, (int) size);
+                setU8(command, KEY_MTP_TRANSFER_TOTAL_SIZE, size);
+                var results = sendCommand(device, command, arena);
+                try {
+                    checkDriverHr(results, "initiate SendPartialObject");
+                    String context = getString(results, KEY_MTP_TRANSFER_CONTEXT);
+                    if (context.isBlank()) throw new IOException("SendPartialObject returned no transfer context");
+                    return context;
+                } finally {
+                    release(results);
+                }
+            } finally {
+                release(command);
+            }
+        }
+    }
+
     private void writeDataPhase(MemorySegment device, String context, InputStream in, long total)
             throws IOException {
-        byte[] heap = new byte[(int) Math.min(Math.max(total, 1), READ_DATA_CHUNK)];
+        byte[] heap = new byte[(int) Math.min(Math.max(total, 1), MTP_TRANSFER_CHUNK)];
         long remaining = total;
         while (remaining > 0) {
             int want = (int) Math.min(remaining, heap.length);
             int got = readFully(in, heap, want);
-            if (got < want) throw new IOException("local file ended before the declared edit length");
+            if (got < want) throw new IOException("local file ended before declared transfer length");
+
             try (var arena = Arena.ofConfined()) {
-                var cmd = createCommand(MTP_EXT_CATEGORY, PID_WRITE_DATA);
+                var command = createCommand(PID_WRITE_DATA);
                 try {
-                    setString(cmd, KEY_MTP_TRANSFER_CONTEXT, wstr(arena, context));
-                    var buf = arena.allocate(got);
-                    MemorySegment.copy(heap, 0, buf, JAVA_BYTE, 0, got);
-                    call(cmd, VAL_SET_BUFFER,
-                        FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, ADDRESS, JAVA_INT),
-                        KEY_MTP_TRANSFER_DATA, buf, got);
-                    setU4(cmd, KEY_MTP_NUM_BYTES_TO_WRITE, got);
-                    var results = sendCommand(device, cmd, arena);
+                    setString(command, KEY_MTP_TRANSFER_CONTEXT, wstr(arena, context));
+                    var buffer = arena.allocate(got);
+                    MemorySegment.copy(heap, 0, buffer, JAVA_BYTE, 0, got);
+                    setBuffer(command, KEY_MTP_TRANSFER_DATA, buffer, got);
+                    setU4(command, KEY_MTP_NUM_BYTES_TO_WRITE, got);
+                    var results = sendCommand(device, command, arena);
                     try {
                         checkDriverHr(results, "WRITE_DATA");
                     } finally {
                         release(results);
                     }
                 } finally {
-                    release(cmd);
+                    release(command);
                 }
             }
             remaining -= got;
         }
     }
 
-    /** Fills {@code buf[0..want)} from {@code in}, returning the count read (short only at EOF). */
-    private static int readFully(InputStream in, byte[] buf, int want) throws IOException {
-        int off = 0;
-        while (off < want) {
-            int r = in.read(buf, off, want - off);
-            if (r < 0) break;
-            off += r;
+    private static int readFully(InputStream in, byte[] buffer, int want) throws IOException {
+        int offset = 0;
+        while (offset < want) {
+            int read = in.read(buffer, offset, want - offset);
+            if (read < 0) break;
+            offset += read;
         }
-        return off;
+        return offset;
     }
 
-    /** Attaches an IPortableDevicePropVariantCollection of the given VT_UI4 values as the op params. */
-    private void setOpParams(MemorySegment cmd, Arena arena, int... values) throws IOException {
-        var params = createInstance(CLSID_PROPVARIANT_COLLECTION, IID_PROPVARIANT_COLLECTION,
+    private void setOpParams(MemorySegment values, Arena arena, int... params) throws IOException {
+        var collection = createInstance(CLSID_PROPVARIANT_COLLECTION, IID_PROPVARIANT_COLLECTION,
             "create MTP operation params");
         try {
-            for (int v : values) addU4(params, arena, v);
-            call(cmd, VAL_SET_PVCOLL,
-                FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, ADDRESS), KEY_MTP_OP_PARAMS, params);
+            for (int param : params) addU4(collection, arena, param);
+            call(values, VAL_SET_PVCOLL,
+                FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, ADDRESS), KEY_MTP_OP_PARAMS, collection);
         } finally {
-            release(params);
+            release(collection);
         }
     }
 
-    /** Throws unless {@code responseCode} is the MTP "OK" (0x2001). */
-    private void checkMtpResponse(int responseCode, String op) throws IOException {
-        if (responseCode != MTP_RESPONSE_OK) {
-            throw new IOException(op + " failed (MTP response 0x" + Integer.toHexString(responseCode) + ")");
-        }
+    private void addU4(MemorySegment collection, Arena arena, int value) {
+        var variant = arena.allocate(PROPVARIANT_SIZE);
+        variant.set(JAVA_SHORT, 0, VT_UI4);
+        variant.set(JAVA_INT, 8, value);
+        call(collection, PVCOLL_ADD, FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS), variant);
     }
 
-    // MTP-ext command pids within MTP_EXT_CATEGORY (WpdMtpExtensions.h). The read/write execute and
-    // data commands form one contiguous block 12..17 (without-data, to-read, to-write, read-data,
-    // write-data, end); GET_SUPPORTED_VENDOR_OPCODES (11) reports the device's vendor-extended opcodes.
-    private static final int PID_GET_SUPPORTED_VENDOR_OPCODES = 11, PID_EXECUTE_WITHOUT_DATA_PHASE = 12,
-        PID_EXECUTE_WITH_DATA_TO_READ = 13, PID_EXECUTE_WITH_DATA_TO_WRITE = 14,
-        PID_READ_DATA = 15, PID_WRITE_DATA = 16, PID_END_DATA_TRANSFER = 17;
-
-    /** Builds an {@code IPortableDeviceValues} addressed to one MTP-ext command (category + pid). */
-    private MemorySegment createCommand(MemorySegment category, int commandPid) throws IOException {
-        var values = createInstance(CLSID_VALUES, IID_VALUES, "create command parameters");
-        setGuid(values, KEY_COMMON_COMMAND_CATEGORY, category);
+    private MemorySegment createCommand(int commandPid) throws IOException {
+        var values = createInstance(CLSID_VALUES, IID_VALUES, "create MTP command values");
+        setGuid(values, KEY_COMMON_COMMAND_CATEGORY, MTP_EXT_CATEGORY);
         setU4(values, KEY_COMMON_COMMAND_ID, commandPid);
         return values;
     }
 
-    /** IPortableDevice::SendCommand; returns the results IPortableDeviceValues (caller releases). */
-    private MemorySegment sendCommand(MemorySegment device, MemorySegment params, Arena arena) throws IOException {
+    private MemorySegment sendCommand(MemorySegment device, MemorySegment command, Arena arena)
+            throws IOException {
         var out = arena.allocate(ADDRESS);
         checkHr(call(device, DEV_SEND_COMMAND,
-                FunctionDescriptor.of(JAVA_INT, ADDRESS, JAVA_INT, ADDRESS, ADDRESS), 0, params, out),
+                FunctionDescriptor.of(JAVA_INT, ADDRESS, JAVA_INT, ADDRESS, ADDRESS),
+                0, command, out),
             "IPortableDevice::SendCommand");
         return out.get(ADDRESS, 0);
     }
 
-    /** Throws when the driver failed to relay the command (WPD_PROPERTY_COMMON_HRESULT). */
-    private void checkDriverHr(MemorySegment results, String op) throws IOException {
+    private void checkDriverHr(MemorySegment results, String operation) throws IOException {
         try (var arena = Arena.ofConfined()) {
             var out = arena.allocate(JAVA_INT);
             int hr = call(results, VAL_GET_ERROR,
                 FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, ADDRESS), KEY_COMMON_HRESULT, out);
-            if (!failed(hr)) checkHr(out.get(JAVA_INT, 0), op + " (driver HRESULT)");
+            if (!failed(hr)) checkHr(out.get(JAVA_INT, 0), operation + " (driver HRESULT)");
         }
     }
 
-    private void setU4(MemorySegment values, MemorySegment key, int value) {
-        call(values, VAL_SET_U4, FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, JAVA_INT), key, value);
-    }
-
-    /** Appends a VT_UI4 value to an IPortableDevicePropVariantCollection. */
-    private void addU4(MemorySegment coll, Arena arena, int value) {
-        var pv = arena.allocate(PROPVARIANT_SIZE); // zero-filled
-        pv.set(JAVA_SHORT, 0, VT_UI4);
-        pv.set(JAVA_INT, 8, value);
-        call(coll, PVCOLL_ADD, FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS), pv);
-    }
-
-    /**
-     * Copies the byte buffer returned in {@code results} under WPD_PROPERTY_MTP_EXT_TRANSFER_DATA into
-     * {@code out} at {@code dstOffset}, frees the device-allocated buffer, and returns the count copied.
-     */
-    private int copyBufferValue(MemorySegment results, byte[] out, int dstOffset) {
-        try (var arena = Arena.ofConfined()) {
-            var ptrOut = arena.allocate(ADDRESS);
-            var cbOut = arena.allocate(JAVA_INT);
-            int hr = call(results, VAL_GET_BUFFER,
-                FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, ADDRESS, ADDRESS),
-                KEY_MTP_TRANSFER_DATA, ptrOut, cbOut);
-            if (failed(hr)) return 0;
-            int cb = cbOut.get(JAVA_INT, 0);
-            var ptr = ptrOut.get(ADDRESS, 0);
-            if (cb <= 0 || MemorySegment.NULL.equals(ptr)) return 0;
-            int n = Math.min(cb, out.length - dstOffset);
-            MemorySegment.copy(ptr.reinterpret(n), JAVA_BYTE, 0, out, dstOffset, n);
-            coTaskMemFree(ptr);
-            return n;
+    private void checkMtpResponse(int responseCode, String operation) throws IOException {
+        if (responseCode != MTP_RESPONSE_OK) {
+            throw new IOException(operation + " failed (MTP response 0x"
+                + Integer.toHexString(responseCode) + ")");
         }
-    }
-
-    /**
-     * Derives the numeric MTP object handle from a WPD object-id string. The Microsoft WpdMtp driver
-     * renders object ids as {@code "o"} followed by the hex object handle; the leading letter is
-     * dropped and the rest parsed as hex.
-     */
-    private static long parseObjectHandle(String itemId) throws IOException {
-        String hex = (!itemId.isEmpty() && (itemId.charAt(0) == 'o' || itemId.charAt(0) == 'O'))
-            ? itemId.substring(1) : itemId;
-        try {
-            return Long.parseUnsignedLong(hex, 16) & 0xFFFFFFFFL;
-        } catch (NumberFormatException e) {
-            throw new IOException("cannot derive an MTP object handle from WPD id: " + itemId);
-        }
-    }
-
-    /**
-     * Returns the WPD audio object-format GUID for a filename's extension, or {@code null} when it
-     * is not a recognised audio extension. Extensions without a standard WPD object format (e.g.
-     * .m4a, .mp2) return null and are stored as generic files, unlike the libmtp backend.
-     */
-    private static MemorySegment audioFormatForFilename(String filename) {
-        int dot = filename.lastIndexOf('.');
-        if (dot < 0 || dot == filename.length() - 1) return null;
-        return switch (filename.substring(dot + 1).toLowerCase(Locale.ROOT)) {
-            case "mp3"  -> FORMAT_MP3;
-            case "wav"  -> FORMAT_WAV;
-            case "wma"  -> FORMAT_WMA;
-            case "ogg"  -> FORMAT_OGG;
-            case "aac"  -> FORMAT_AAC;
-            case "flac" -> FORMAT_FLAC;
-            default     -> null;
-        };
     }
 
     @Override
     public String sendFile(DeviceHandle handle, String localPath, String filename,
                            String parentId, String storageId, long filesize) throws IOException {
-        var d = dev(handle);
-        String parent = parentId.equals(ROOT_PARENT) ? storageId : parentId;
+        var d = asDevice(handle);
         try (var arena = Arena.ofConfined()) {
-            MemorySegment stream;
-            int bufSize;
-            var values = createInstance(CLSID_VALUES, IID_VALUES, "create object properties");
-            try {
-                setString(values, KEY_PARENT_ID, wstr(arena, parent));
-                setString(values, KEY_NAME, wstr(arena, filename));
-                setString(values, KEY_ORIGINAL_FILE_NAME, wstr(arena, filename));
-                setU8(values, KEY_OBJECT_SIZE, filesize);
-                // Storing a track as audio with its codec's object format lets the device index it
-                // and expose tags via getTrackMetadata (parity with the libmtp backend's sendFile).
-                // Anything else is stored as a generic, format-unspecified byte stream.
-                var audioFormat = audioFormatForFilename(filename);
-                if (audioFormat != null) {
-                    setGuid(values, KEY_CONTENT_TYPE, CONTENT_TYPE_AUDIO);
-                    setGuid(values, KEY_OBJECT_FORMAT, audioFormat);
-                } else {
-                    setGuid(values, KEY_CONTENT_TYPE, CONTENT_TYPE_GENERIC_FILE);
-                    setGuid(values, KEY_OBJECT_FORMAT, FORMAT_UNSPECIFIED);
-                }
-
-                var streamOut = arena.allocate(ADDRESS);
-                var optBuf = arena.allocate(JAVA_INT);
-                checkHr(call(d.content(), CONTENT_CREATE_DATA,
-                        FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, ADDRESS, ADDRESS, ADDRESS),
-                        values, streamOut, optBuf, MemorySegment.NULL),
-                    "CreateObjectWithPropertiesAndData");
-                stream = streamOut.get(ADDRESS, 0);
-                bufSize = transferBufferSize(optBuf.get(JAVA_INT, 0));
-            } finally {
-                release(values);
-            }
-
-            // From here the device is mid-SendObject: the stream must be released on every path,
-            // and a stream abandoned mid-transfer wedges the MTP session for every later request
-            // (the same hazard documented for ranged reads in docs/windows-parity.md). The libmtp
-            // backend has no equivalent exposure — LIBMTP_Send_File_From_File owns the whole
-            // transaction and unwinds it itself.
+            var created = openObjectWriteStream(d.content(), parentForWpd(parentId, storageId),
+                filename, filesize, arena);
             boolean committed = false;
             try {
                 try (var in = Files.newInputStream(Path.of(localPath))) {
-                    copyFileToStream(in, stream, bufSize);
+                    copyFileToStream(in, created.stream(), created.bufferSize());
                 }
-                checkHr(call(stream, STREAM_COMMIT, FunctionDescriptor.of(JAVA_INT, ADDRESS, JAVA_INT), 0),
+                checkHr(call(created.stream(), STREAM_COMMIT,
+                        FunctionDescriptor.of(JAVA_INT, ADDRESS, JAVA_INT), 0),
                     "IStream::Commit");
                 committed = true;
-                return readNewObjectId(stream);
+                return readNewObjectId(created.stream());
             } finally {
-                // CreateObjectWithPropertiesAndData already sent SendObjectInfo, so a failed transfer
-                // can leave a partial object holding this filename. Read its id before releasing the
-                // stream, then delete it, so a caller's retry re-creates the name from scratch instead
-                // of colliding with the wreckage of the previous attempt.
-                //
-                // Every step here is best-effort and must not stop the release: this runs while the
-                // send is already failing, so asking a broken stream for its object id can itself
-                // fail, and letting that escape would both mask the real error and leak the stream —
-                // leaving the device mid-SendObject, the exact state this block exists to prevent.
                 String partialId = "";
                 if (!committed) {
                     try {
-                        partialId = readNewObjectId(stream);
-                    } catch (RuntimeException unusableStream) {
-                        partialId = "";
+                        partialId = readNewObjectId(created.stream());
+                    } catch (RuntimeException ignored) {
                     }
                 }
-                release(stream);
-                if (!partialId.isEmpty()) {
+                release(created.stream());
+                if (!partialId.isBlank()) {
                     try {
                         deleteObject(handle, partialId);
                     } catch (IOException | RuntimeException ignored) {
-                        // The send already failed; that error is the one worth reporting.
                     }
                 }
             }
         }
     }
 
-    /**
-     * The chunk size to use against a WPD object stream. WPD reports the driver's optimal transfer
-     * buffer size and expects writes of at most that much; only when it reports nothing do we pick a
-     * size ourselves.
-     */
-    private static int transferBufferSize(int driverOptimal) {
-        return driverOptimal > 0 ? driverOptimal : 1 << 16;
+    private record CreatedStream(MemorySegment stream, int bufferSize) {}
+
+    private CreatedStream openObjectWriteStream(MemorySegment content, String parent, String filename,
+                                                long filesize, Arena arena) throws IOException {
+        var values = createInstance(CLSID_VALUES, IID_VALUES, "create file properties");
+        try {
+            setString(values, KEY_PARENT_ID, wstr(arena, parent));
+            setString(values, KEY_NAME, wstr(arena, filename));
+            setString(values, KEY_ORIGINAL_FILE_NAME, wstr(arena, filename));
+            setU8(values, KEY_OBJECT_SIZE, filesize);
+            var audioFormat = audioFormatForFilename(filename);
+            if (audioFormat == null) {
+                setGuid(values, KEY_CONTENT_TYPE, CONTENT_TYPE_GENERIC_FILE);
+                setGuid(values, KEY_OBJECT_FORMAT, FORMAT_UNSPECIFIED);
+            } else {
+                setGuid(values, KEY_CONTENT_TYPE, CONTENT_TYPE_AUDIO);
+                setGuid(values, KEY_OBJECT_FORMAT, audioFormat);
+            }
+            var streamOut = arena.allocate(ADDRESS);
+            var optimal = arena.allocate(JAVA_INT);
+            checkHr(call(content, CONTENT_CREATE_DATA,
+                    FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, ADDRESS, ADDRESS, ADDRESS),
+                    values, streamOut, optimal, MemorySegment.NULL),
+                "CreateObjectWithPropertiesAndData");
+            return new CreatedStream(streamOut.get(ADDRESS, 0),
+                transferBufferSize(optimal.get(JAVA_INT, 0)));
+        } finally {
+            release(values);
+        }
+    }
+
+    private static MemorySegment audioFormatForFilename(String filename) {
+        int dot = filename.lastIndexOf('.');
+        if (dot < 0 || dot == filename.length() - 1) return null;
+        return switch (filename.substring(dot + 1).toLowerCase(Locale.ROOT)) {
+            case "mp3" -> FORMAT_MP3;
+            case "wav" -> FORMAT_WAV;
+            case "wma" -> FORMAT_WMA;
+            case "ogg" -> FORMAT_OGG;
+            case "aac" -> FORMAT_AAC;
+            case "flac" -> FORMAT_FLAC;
+            case "m4a" -> FORMAT_M4A;
+            case "mp2" -> FORMAT_MP2;
+            default -> null;
+        };
     }
 
     @Override
-    public void moveObject(DeviceHandle handle, String itemId, String storageId, String parentId) throws IOException {
-        var d = dev(handle);
-        String dest = parentId.equals(ROOT_PARENT) ? storageId : parentId;
-        var coll = objectIdCollection(itemId);
+    public void moveObject(DeviceHandle handle, String itemId, String storageId, String parentId)
+            throws IOException {
+        var d = asDevice(handle);
+        var ids = objectIdCollection(itemId);
         try (var arena = Arena.ofConfined()) {
-            // Many devices do not implement Move; a failing HRESULT surfaces as IOException, which
-            // MTPDeviceBridge.move() turns into MTPOperationUnsupportedException for emulation.
             checkHr(call(d.content(), CONTENT_MOVE,
                     FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, ADDRESS, ADDRESS),
-                    coll, wstr(arena, dest), MemorySegment.NULL),
+                    ids, wstr(arena, parentForWpd(parentId, storageId)), MemorySegment.NULL),
                 "IPortableDeviceContent::Move");
         } finally {
-            release(coll);
+            release(ids);
         }
     }
 
     @Override
     public void setFileName(DeviceHandle handle, String itemId, String newName) throws IOException {
-        var d = dev(handle);
+        var d = asDevice(handle);
         try (var arena = Arena.ofConfined()) {
             var values = createInstance(CLSID_VALUES, IID_VALUES, "create rename properties");
             try {
@@ -1381,9 +1193,7 @@ class WpdBackend implements MtpBackend {
                 int hr = call(d.properties(), PROPS_SET_VALUES,
                     FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, ADDRESS, ADDRESS),
                     wstr(arena, itemId), values, resultsOut);
-                if (!failed(hr)) {
-                    release(resultsOut.get(ADDRESS, 0));
-                }
+                if (!failed(hr)) release(resultsOut.get(ADDRESS, 0));
                 checkHr(hr, "IPortableDeviceProperties::SetValues");
             } finally {
                 release(values);
@@ -1391,9 +1201,6 @@ class WpdBackend implements MtpBackend {
         }
     }
 
-    // ---- helpers ----
-
-    /** Enumerates the immediate child object ids of {@code parentObjectId}. */
     private List<String> enumChildren(MemorySegment content, String parentObjectId) throws IOException {
         var ids = new ArrayList<String>();
         try (var arena = Arena.ofConfined()) {
@@ -1402,51 +1209,46 @@ class WpdBackend implements MtpBackend {
                     FunctionDescriptor.of(JAVA_INT, ADDRESS, JAVA_INT, ADDRESS, ADDRESS, ADDRESS),
                     0, wstr(arena, parentObjectId), MemorySegment.NULL, enumOut),
                 "IPortableDeviceContent::EnumObjects");
-            var enumObj = enumOut.get(ADDRESS, 0);
+            var enumerator = enumOut.get(ADDRESS, 0);
             try {
                 final int batch = 32;
                 var fetched = arena.allocate(JAVA_INT);
-                var arr = arena.allocate(ADDRESS.byteSize() * batch);
+                var idArray = arena.allocate(ADDRESS.byteSize() * batch);
                 while (true) {
                     fetched.set(JAVA_INT, 0, 0);
-                    int hr = call(enumObj, ENUM_NEXT,
-                        FunctionDescriptor.of(JAVA_INT, ADDRESS, JAVA_INT, ADDRESS, ADDRESS),
-                        batch, arr, fetched);
-                    // A failed Next must not be mistaken for the end of the list: reporting the
-                    // ids gathered so far would silently hand back a truncated listing, making
-                    // objects — or, when enumerating the device root, a whole storage — look as
-                    // though they had been deleted.
-                    checkHr(hr, "IEnumPortableDeviceObjectIDs::Next");
+                    checkHr(call(enumerator, ENUM_NEXT,
+                            FunctionDescriptor.of(JAVA_INT, ADDRESS, JAVA_INT, ADDRESS, ADDRESS),
+                            batch, idArray, fetched),
+                        "IEnumPortableDeviceObjectIDs::Next");
                     int n = fetched.get(JAVA_INT, 0);
                     for (int i = 0; i < n; i++) {
-                        var ptr = arr.getAtIndex(ADDRESS, i);
+                        var ptr = idArray.getAtIndex(ADDRESS, i);
                         ids.add(readWstr(ptr));
                         coTaskMemFree(ptr);
                     }
-                    if (n < batch) break; // S_FALSE / fewer than requested ⇒ end of enumeration
+                    if (n < batch) break;
                 }
             } finally {
-                release(enumObj);
+                release(enumerator);
             }
         }
         return ids;
     }
 
-    /** Fetches the given properties for one object. Returns NULL on failure; caller must release. */
     private MemorySegment getValues(MemorySegment properties, String objectId, MemorySegment... keys) {
-        var keyColl = createInstanceQuiet(CLSID_KEY_COLLECTION, IID_KEY_COLLECTION);
-        if (MemorySegment.NULL.equals(keyColl)) return MemorySegment.NULL;
+        var keyCollection = createInstanceQuiet(CLSID_KEY_COLLECTION, IID_KEY_COLLECTION);
+        if (MemorySegment.NULL.equals(keyCollection)) return MemorySegment.NULL;
         try (var arena = Arena.ofConfined()) {
             for (var key : keys) {
-                call(keyColl, KEYCOLL_ADD, FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS), key);
+                call(keyCollection, KEYCOLL_ADD, FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS), key);
             }
             var out = arena.allocate(ADDRESS);
             int hr = call(properties, PROPS_GET_VALUES,
                 FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, ADDRESS, ADDRESS),
-                wstr(arena, objectId), keyColl, out);
+                wstr(arena, objectId), keyCollection, out);
             return failed(hr) ? MemorySegment.NULL : out.get(ADDRESS, 0);
         } finally {
-            release(keyColl);
+            release(keyCollection);
         }
     }
 
@@ -1465,9 +1267,11 @@ class WpdBackend implements MtpBackend {
                 FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, ADDRESS), key, out);
             if (failed(hr)) return "";
             var ptr = out.get(ADDRESS, 0);
-            var s = readWstr(ptr);
-            coTaskMemFree(ptr);
-            return s;
+            try {
+                return readWstr(ptr);
+            } finally {
+                coTaskMemFree(ptr);
+            }
         }
     }
 
@@ -1481,71 +1285,79 @@ class WpdBackend implements MtpBackend {
     }
 
     private long getU4(MemorySegment values, MemorySegment key) {
+        int v = getOptionalU4(values, key);
+        return v < 0 ? -1 : Integer.toUnsignedLong(v);
+    }
+
+    private int getOptionalU4(MemorySegment values, MemorySegment key) {
         try (var arena = Arena.ofConfined()) {
             var out = arena.allocate(JAVA_INT);
             int hr = call(values, VAL_GET_U4,
                 FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, ADDRESS), key, out);
-            return failed(hr) ? -1 : Integer.toUnsignedLong(out.get(JAVA_INT, 0));
+            return failed(hr) ? -1 : out.get(JAVA_INT, 0);
         }
     }
 
-    // Days between the OLE Automation date epoch (1899-12-30) and the Unix epoch (1970-01-01).
-    private static final double OA_EPOCH_DAYS = 25569.0;
-    private static final double SECONDS_PER_DAY = 86400.0;
+    private long readUnsigned(MemorySegment values, MemorySegment key) {
+        long u8 = getU8(values, key);
+        return u8 >= 0 ? u8 : getU4(values, key);
+    }
 
-    /**
-     * Reads {@code key} as a VT_DATE (the documented type of WPD_OBJECT_DATE_MODIFIED) and converts
-     * it to Unix epoch seconds, matching the {@code time_t} semantics the rest of the code expects.
-     * Returns 0 when the property is absent or not a date.
-     */
     private long getDateEpochSeconds(MemorySegment values, MemorySegment key) {
         try (var arena = Arena.ofConfined()) {
-            var pv = arena.allocate(PROPVARIANT_SIZE); // zero-filled
+            var variant = arena.allocate(PROPVARIANT_SIZE);
             int hr = call(values, VAL_GET_VALUE,
-                FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, ADDRESS), key, pv);
+                FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, ADDRESS), key, variant);
             if (failed(hr)) return 0;
             try {
-                if (pv.get(JAVA_SHORT, 0) != VT_DATE) return 0;
-                double oaDate = pv.get(JAVA_DOUBLE, 8);
+                if (variant.get(JAVA_SHORT, 0) != VT_DATE) return 0;
+                double oaDate = variant.get(JAVA_DOUBLE, 8);
                 return Math.round((oaDate - OA_EPOCH_DAYS) * SECONDS_PER_DAY);
             } finally {
-                propVariantClear(pv);
+                propVariantClear(variant);
             }
         }
     }
 
-    private boolean getGuid(MemorySegment values, MemorySegment key, MemorySegment outBuf) {
-        int hr = call(values, VAL_GET_GUID,
-            FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, ADDRESS), key, outBuf);
-        return !failed(hr);
+    private boolean getGuid(MemorySegment values, MemorySegment key, MemorySegment out) {
+        return !failed(call(values, VAL_GET_GUID,
+            FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, ADDRESS), key, out));
     }
 
-    private void setString(MemorySegment values, MemorySegment key, MemorySegment valueW) {
-        call(values, VAL_SET_STRING, FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, ADDRESS), key, valueW);
+    private void setString(MemorySegment values, MemorySegment key, MemorySegment value) {
+        call(values, VAL_SET_STRING, FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, ADDRESS), key, value);
+    }
+
+    private void setU4(MemorySegment values, MemorySegment key, int value) {
+        call(values, VAL_SET_U4, FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, JAVA_INT), key, value);
     }
 
     private void setU8(MemorySegment values, MemorySegment key, long value) {
         call(values, VAL_SET_U8, FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, JAVA_LONG), key, value);
     }
 
-    private void setGuid(MemorySegment values, MemorySegment key, MemorySegment guid) {
-        call(values, VAL_SET_GUID, FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, ADDRESS), key, guid);
+    private void setGuid(MemorySegment values, MemorySegment key, MemorySegment value) {
+        call(values, VAL_SET_GUID, FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, ADDRESS), key, value);
     }
 
-    /** Builds an IPortableDevicePropVariantCollection holding a single VT_LPWSTR object id. */
+    private void setBuffer(MemorySegment values, MemorySegment key, MemorySegment buffer, int size) {
+        call(values, VAL_SET_BUFFER,
+            FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, ADDRESS, JAVA_INT), key, buffer, size);
+    }
+
     private MemorySegment objectIdCollection(String objectId) throws IOException {
-        var coll = createInstance(CLSID_PROPVARIANT_COLLECTION, IID_PROPVARIANT_COLLECTION,
+        var collection = createInstance(CLSID_PROPVARIANT_COLLECTION, IID_PROPVARIANT_COLLECTION,
             "create object-id collection");
         try (var arena = Arena.ofConfined()) {
-            var pv = arena.allocate(PROPVARIANT_SIZE); // zero-filled
-            pv.set(JAVA_SHORT, 0, VT_LPWSTR);
-            pv.set(ADDRESS, 8, wstr(arena, objectId));
-            // Add deep-copies the PROPVARIANT (including the string), so the arena copy is safe to free.
-            checkHr(call(coll, PVCOLL_ADD, FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS), pv),
+            var variant = arena.allocate(PROPVARIANT_SIZE);
+            variant.set(JAVA_SHORT, 0, VT_LPWSTR);
+            variant.set(ADDRESS, 8, wstr(arena, objectId));
+            checkHr(call(collection, PVCOLL_ADD,
+                    FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS), variant),
                 "IPortableDevicePropVariantCollection::Add");
-            return coll;
+            return collection;
         } catch (Throwable t) {
-            release(coll);
+            release(collection);
             if (t instanceof IOException io) throw io;
             throw new IOException("Failed to build object-id collection", t);
         }
@@ -1560,53 +1372,101 @@ class WpdBackend implements MtpBackend {
                 FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS), out);
             if (failed(hr)) return "";
             var ptr = out.get(ADDRESS, 0);
-            var id = readWstr(ptr);
-            coTaskMemFree(ptr);
-            return id;
+            try {
+                return readWstr(ptr);
+            } finally {
+                coTaskMemFree(ptr);
+            }
         } finally {
             release(dataStream);
         }
     }
 
-    private void copyStreamToFile(MemorySegment stream, OutputStream out, int bufSize) throws IOException {
+    private void copyStreamToFile(MemorySegment stream, OutputStream out, int bufferSize)
+            throws IOException {
         try (var arena = Arena.ofConfined()) {
-            var buf = arena.allocate(bufSize);
+            var buffer = arena.allocate(bufferSize);
             var readOut = arena.allocate(JAVA_INT);
-            var desc = FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, JAVA_INT, ADDRESS);
+            var descriptor = FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, JAVA_INT, ADDRESS);
             while (true) {
-                int hr = call(stream, STREAM_READ, desc, buf, bufSize, readOut);
-                checkHr(hr, "IStream::Read");
-                int got = readOut.get(JAVA_INT, 0);
-                if (got <= 0) break;
-                out.write(buf.asSlice(0, got).toArray(JAVA_BYTE));
+                readOut.set(JAVA_INT, 0, 0);
+                checkHr(call(stream, STREAM_READ, descriptor, buffer, bufferSize, readOut),
+                    "IStream::Read");
+                int read = readOut.get(JAVA_INT, 0);
+                if (read <= 0) break;
+                out.write(buffer.asSlice(0, read).toArray(JAVA_BYTE));
             }
         }
     }
 
-    private void copyFileToStream(InputStream in, MemorySegment stream, int bufSize) throws IOException {
+    private void copyFileToStream(InputStream in, MemorySegment stream, int bufferSize)
+            throws IOException {
         try (var arena = Arena.ofConfined()) {
-            var buf = arena.allocate(bufSize);
-            var written = arena.allocate(JAVA_INT);
-            var desc = FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, JAVA_INT, ADDRESS);
-            byte[] heap = new byte[bufSize];
-            int r;
-            while ((r = in.read(heap)) > 0) {
-                MemorySegment.copy(heap, 0, buf, JAVA_BYTE, 0, r);
-                // IStream::Write may consume less than it was offered; the object was created with a
-                // declared WPD_OBJECT_SIZE, so dropping the remainder would commit a short object.
+            var nativeBuffer = arena.allocate(bufferSize);
+            var writtenOut = arena.allocate(JAVA_INT);
+            var descriptor = FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, JAVA_INT, ADDRESS);
+            byte[] heap = new byte[bufferSize];
+            int read;
+            while ((read = in.read(heap)) > 0) {
+                MemorySegment.copy(heap, 0, nativeBuffer, JAVA_BYTE, 0, read);
                 int sent = 0;
-                while (sent < r) {
-                    written.set(JAVA_INT, 0, 0);
-                    checkHr(call(stream, STREAM_WRITE, desc, buf.asSlice(sent), r - sent, written),
+                while (sent < read) {
+                    writtenOut.set(JAVA_INT, 0, 0);
+                    checkHr(call(stream, STREAM_WRITE, descriptor,
+                            nativeBuffer.asSlice(sent), read - sent, writtenOut),
                         "IStream::Write");
-                    int n = written.get(JAVA_INT, 0);
-                    if (n <= 0) {
+                    int written = writtenOut.get(JAVA_INT, 0);
+                    if (written <= 0) {
                         throw new IOException("IStream::Write accepted no bytes with "
-                            + (r - sent) + " still to send");
+                            + (read - sent) + " bytes remaining");
                     }
-                    sent += n;
+                    sent += written;
                 }
             }
+        }
+    }
+
+    private int copyBufferValue(MemorySegment results, byte[] out, int offset) {
+        try (var arena = Arena.ofConfined()) {
+            var ptrOut = arena.allocate(ADDRESS);
+            var sizeOut = arena.allocate(JAVA_INT);
+            int hr = call(results, VAL_GET_BUFFER,
+                FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, ADDRESS, ADDRESS),
+                KEY_MTP_TRANSFER_DATA, ptrOut, sizeOut);
+            if (failed(hr)) return 0;
+            int size = sizeOut.get(JAVA_INT, 0);
+            var ptr = ptrOut.get(ADDRESS, 0);
+            if (size <= 0 || MemorySegment.NULL.equals(ptr)) return 0;
+            int n = Math.min(size, out.length - offset);
+            MemorySegment.copy(ptr.reinterpret(n), JAVA_BYTE, 0, out, offset, n);
+            coTaskMemFree(ptr);
+            return n;
+        }
+    }
+
+    private static int transferBufferSize(int driverOptimal) {
+        return driverOptimal > 0 ? driverOptimal : STREAM_FALLBACK_BUFFER;
+    }
+
+    private static String parentForWpd(String parentId, String storageId) {
+        return parentId.equals(ROOT_PARENT) ? storageId : parentId;
+    }
+
+    private static String firstNonBlank(String... values) {
+        for (var value : values) {
+            if (value != null && !value.isBlank()) return value;
+        }
+        return "";
+    }
+
+    private static long parseObjectHandle(String objectId) throws IOException {
+        String hex = (!objectId.isEmpty() && (objectId.charAt(0) == 'o' || objectId.charAt(0) == 'O'))
+            ? objectId.substring(1)
+            : objectId;
+        try {
+            return Long.parseUnsignedLong(hex, 16) & 0xFFFFFFFFL;
+        } catch (NumberFormatException e) {
+            throw new IOException("cannot derive an MTP object handle from WPD id: " + objectId, e);
         }
     }
 }

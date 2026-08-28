@@ -26,7 +26,7 @@ match **`NativeLibMTP`** (libmtp, Linux/macOS). **Keep this file updated wheneve
 | Whole-object read (`getFile`) | ✅ | ✅ (IStream::Read) | none |
 | Eager `newInputStream` / `Files.copy` | ✅ | ✅ | none |
 | `mtp` view (device-index metadata) | ✅ | ✅ | none |
-| `sendFile` audio object-format inference | ✅ | ✅ (`audioFormatForFilename`) | none |
+| `sendFile` audio object-format inference | ✅ | ✅ (`audioFormatForFilename`) | none — fixed 2026-08-27 after WPD GUIDs were found word-swapped |
 | **Ranged read (`readPartial`)** | ✅ | ✅ (MTP GetPartialObject via `SendCommand`) | none |
 | `supportsPartialReads()` | ✅ `true` | ✅ `true` | none |
 | Lazy read channel (`newByteChannel`) | ✅ lazy | ✅ lazy | none |
@@ -68,6 +68,16 @@ file", "Device lifetime" and "Resource ownership". Two consecutive full runs pas
 per-test device open/close churn intact, which is the load that used to wedge the driver within a
 single run. **PR #25 has since removed that churn** — so this result stands as evidence the leaks were
 fixed, but a green suite no longer re-proves it; see [Pending Windows work](#pending-windows-work-pr-25).
+
+### Audio object formats on WPD
+
+`WpdBackend.sendFile` must set `WPD_OBJECT_FORMAT` to the real WPD format GUID, not to a GUID formed
+by pasting the MTP object-format code after `0000`. The latter was wrong: for the common MTP-derived
+formats, WPD's GUID uses the 16-bit MTP format code in the high word of `GUID.Data1`
+(`30090000-...` for MP3, `b9060000-...` for FLAC, etc.), and M4A has a separate WPD GUID. The bad
+mapping meant Windows uploaded audio objects with nonstandard format GUIDs while libmtp uploaded the
+same extensions under recognized audio filetypes. That was a real implementation parity gap, despite
+the previous status table claiming this path was complete.
 
 ### In-place object editing on WPD
 
