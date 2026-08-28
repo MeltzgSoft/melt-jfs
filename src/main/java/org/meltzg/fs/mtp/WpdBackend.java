@@ -749,11 +749,23 @@ class WpdBackend implements MtpBackend {
 
         byte[] out = new byte[start.transferSize()];
         int read = 0;
-        int response;
+        int response = -1;
+        IOException readFailure = null;
         try {
             read = readDataPhase(d.device(), start.context(), out);
+        } catch (IOException e) {
+            readFailure = e;
+            throw e;
         } finally {
-            response = endDataTransfer(d.device(), start.context());
+            try {
+                response = endDataTransfer(d.device(), start.context());
+            } catch (IOException endFailure) {
+                if (readFailure != null) {
+                    readFailure.addSuppressed(endFailure);
+                } else {
+                    throw endFailure;
+                }
+            }
         }
         if (response == MTP_RESPONSE_OP_NOT_SUPPORTED) return null;
         if (response >= 0) checkMtpResponse(response, "GetPartialObject");
@@ -830,7 +842,7 @@ class WpdBackend implements MtpBackend {
         return read;
     }
 
-    private int endDataTransfer(MemorySegment device, String context) {
+    private int endDataTransfer(MemorySegment device, String context) throws IOException {
         try (var arena = Arena.ofConfined()) {
             var command = createCommand(PID_END_DATA_TRANSFER);
             try {
@@ -845,8 +857,6 @@ class WpdBackend implements MtpBackend {
             } finally {
                 release(command);
             }
-        } catch (IOException | RuntimeException e) {
-            return -1;
         }
     }
 
