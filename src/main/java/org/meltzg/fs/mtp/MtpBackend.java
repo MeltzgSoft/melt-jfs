@@ -120,6 +120,16 @@ public interface MtpBackend {
     }
 
     /**
+     * Whether new uploads should first be sent under a unique temporary object name and renamed to
+     * the requested filename only after the data transfer commits. This is useful for backends where
+     * a failed create-with-data can leave the requested name reserved during cleanup, making retries
+     * of the same final name fail for a different reason than the original send.
+     */
+    default boolean uploadWithTemporaryName() {
+        return false;
+    }
+
+    /**
      * Uploads {@code localPath} to the device as a new file named {@code filename} under
      * {@code parentId} on {@code storageId}. Returns the new item's id.
      */

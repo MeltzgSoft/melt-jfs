@@ -199,6 +199,31 @@ public class MTPDeviceBridgeSessionRecycleTest {
         }
     }
 
+    @Test
+    public void temporaryUploadNamesKeepFailedSendRetriesOffTheFinalName() throws IOException {
+        var bridge = MTPDeviceBridge.getInstance();
+        backend.temporaryUploadNames = true;
+        backend.sendFailuresRemaining = 1;
+
+        var local = Files.createTempFile("melt-jfs-temp-upload", ".bin");
+        try {
+            Files.write(local, new byte[]{1, 2, 3});
+
+            bridge.writeFile(id, "/Store/fresh.bin", local);
+
+            assertEquals("the failed first send and successful retry must both reach the backend",
+                2, backend.sendCalls.get());
+            assertTrue("the final name must never be used for the upload data phase",
+                backend.uploadNames.stream().noneMatch("fresh.bin"::equals));
+            var names = java.util.Arrays.stream(bridge.listChildren(id, "/Store"))
+                .map(MTPItemInfo::filename).toList();
+            assertTrue("the committed temporary object must be renamed to the requested name",
+                names.contains("fresh.bin"));
+        } finally {
+            Files.deleteIfExists(local);
+        }
+    }
+
     /**
      * In-memory backend modelling a device that reserves deleted names for the life of the MTP
      * session:
@@ -219,11 +244,15 @@ public class MTPDeviceBridgeSessionRecycleTest {
         final MTPDeviceIdentifier id = new MTPDeviceIdentifier(1, 2, "SERIAL");
         final AtomicInteger sessionsOpened = new AtomicInteger();
         final AtomicInteger createCalls = new AtomicInteger();
+        final AtomicInteger sendCalls = new AtomicInteger();
+        final List<String> uploadNames = new ArrayList<>();
         final Set<String> reserved = new HashSet<>();
         volatile boolean reopenClearsReservations = true;
         volatile boolean reopenClearsNameReservations = true;
         volatile boolean recycleAfterPartialRead = false;
+        volatile boolean temporaryUploadNames = false;
         volatile boolean failSends = false;
+        volatile int sendFailuresRemaining = 0;
 
         @Override
         public boolean reopenClearsNameReservations() {
@@ -238,6 +267,11 @@ public class MTPDeviceBridgeSessionRecycleTest {
         @Override
         public boolean recycleBeforeMutationAfterPartialRead() {
             return recycleAfterPartialRead;
+        }
+
+        @Override
+        public boolean uploadWithTemporaryName() {
+            return temporaryUploadNames;
         }
 
         @Override
@@ -303,7 +337,11 @@ public class MTPDeviceBridgeSessionRecycleTest {
         @Override
         public String sendFile(DeviceHandle device, String localPath, String filename,
                                String parentId, String storageId, long filesize) throws IOException {
-            if (failSends) {
+            sendCalls.incrementAndGet();
+            uploadNames.add(filename);
+            if (failSends || sendFailuresRemaining > 0) {
+                if (sendFailuresRemaining > 0) sendFailuresRemaining--;
+                reserved.add(filename);
                 throw new IOException("LIBMTP_Send_File_From_File failed with code -1 for: " + filename);
             }
             reserved.remove(filename); // the name is occupied again
@@ -327,7 +365,18 @@ public class MTPDeviceBridgeSessionRecycleTest {
         @Override public long getFreeSpace(DeviceHandle device, String storageId) { return 0; }
         @Override public void getFile(DeviceHandle device, String itemId, String destPath) {}
         @Override public void moveObject(DeviceHandle device, String itemId, String storageId, String parentId) {}
-        @Override public void setFileName(DeviceHandle device, String itemId, String newName) {}
+        @Override
+        public void setFileName(DeviceHandle device, String itemId, String newName) {
+            tree.values().forEach(children -> {
+                for (int i = 0; i < children.size(); i++) {
+                    var item = children.get(i);
+                    if (item.itemId().equals(itemId)) {
+                        children.set(i, new MTPItemInfo(item.parentId(), item.itemId(), item.storageId(),
+                            item.isFile(), item.filesize(), item.modificationDate(), newName));
+                    }
+                }
+            });
+        }
         @Override public void releaseDevice(DeviceHandle device) {}
     }
 }

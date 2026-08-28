@@ -923,8 +923,10 @@ public enum MTPDeviceBridge implements Closeable {
                                   String name, String parentId, String storageId, long size) throws IOException {
         int attempt = 0;
         while (true) {
+            String uploadName = backend.uploadWithTemporaryName() ? temporaryUploadName(name, attempt) : name;
+            String itemId;
             try {
-                return backend.sendFile(conn.handle(), localFile.toString(), name, parentId, storageId, size);
+                itemId = backend.sendFile(conn.handle(), localFile.toString(), uploadName, parentId, storageId, size);
             } catch (IOException e) {
                 if (attempt >= SEND_RETRY_DELAYS_MILLIS.length) throw e;
                 try {
@@ -934,8 +936,28 @@ public enum MTPDeviceBridge implements Closeable {
                     e.addSuppressed(interrupted);
                     throw e;
                 }
+                continue;
             }
+            if (!uploadName.equals(name)) {
+                try {
+                    backend.setFileName(conn.handle(), itemId, name);
+                } catch (IOException | RuntimeException renameFailed) {
+                    try {
+                        backend.deleteObject(conn.handle(), itemId);
+                    } catch (IOException | RuntimeException cleanupFailed) {
+                        renameFailed.addSuppressed(cleanupFailed);
+                    }
+                    throw renameFailed;
+                }
+            }
+            return itemId;
         }
+    }
+
+    private static String temporaryUploadName(String finalName, int attempt) {
+        int dot = finalName.lastIndexOf('.');
+        String extension = dot >= 0 ? finalName.substring(dot) : "";
+        return "__melt_jfs_upload_" + Long.toHexString(System.nanoTime()) + "_" + attempt + extension;
     }
 
     /**
