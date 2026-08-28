@@ -58,7 +58,9 @@ there by `MtpBackend.reopenClearsNameReservations()` (see [WPD](#wpd)).
 
 - [x] Run over WPD — **negative result**, measured. The recycle fired correctly and the device
       refused the retry identically; Windows now skips the recovery rather than paying a futile
-      process-wide reconnect. Suite back to baseline: 220 tests, 217 passed, 3 skipped, 0 failed.
+      process-wide reconnect. On 2026-08-28, `device-tests-windows-1299.log` still shows this as the
+      third, WPD-only skip; that same run also exposed a separate WPD upload failure documented in
+      [`windows-parity.md`](windows-parity.md#status).
 - [x] Run the integration suite on Linux/libmtp, where a reopen *was* measured to clear the
       reservation. **Confirmed.** `createDirectorySucceedsAfterDeletingSameName` flipped from skip
       to pass on FiiO / Micro SD (220 tests, 218 passed, 2 skipped, 0 failed): the run took 1.27s

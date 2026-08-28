@@ -47,27 +47,31 @@ devices.
 
 > **That WPD figure predates PR #25 and no longer describes the current suite.** The suite is now 220
 > tests (three new `createDirectory*` cases × four storages), and PR #25 also changed how the suite
-> drives the device session — see [Pending Windows work](#pending-windows-work-pr-25). Both platforms
-> have now been re-run on 2026-07-31, and they differ by exactly one test:
+> drives the device session — see [Pending Windows work](#pending-windows-work-pr-25). Newer
+> 2026-08-28 runs show two distinct WPD-only differences:
 >
 > | | Tests | Passed | Skipped | Failed |
 > |---|---|---|---|---|
-> | Linux / libmtp | 220 | 218 | 2 | 0 |
-> | Windows / WPD | 220 | 217 | 3 | 0 |
+> | Linux / libmtp (`device-tests-linux-1298.log`) | 220 | 218 | 2 | 0 |
+> | Windows / WPD (`device-tests-windows-1299.log`) | 220 | 216 | 3 | 1 |
 >
 > Two skips are common to both: `moveNonEmptyDirectoryThrowsWhenNotNativelySupported` on the FiiO's
 > two storages, which natively supports directory move. The third, Windows-only, is
 > `createDirectorySucceedsAfterDeletingSameName` on FiiO / Micro SD — the deleted-name reservation,
-> which the session recycle clears on libmtp but not over WPD. That single test is the whole of the
-> current parity gap; see [`deleted-name-reservation.md`](deleted-name-reservation.md#status).
+> which the session recycle clears on libmtp but not over WPD. The Windows failure is separate:
+> `isHiddenAlwaysFalse` on FiiO / Internal shared storage fails while writing its one-byte setup file,
+> after a roughly 133 second gap following `uploadedId3v23Mp3TagsAreReadBackViaAudioView`. That points
+> at a WPD upload/session-state issue, not at hidden-file semantics. Future Windows runs should use
+> full Gradle exception logging so the HRESULT and WPD call site are visible.
 
-No caveats remain on the FiiO. The intermittent failures previously recorded here — the growing
-replace on its SD card, storages transiently disappearing, sessions wedging mid-run — were all
-symptoms of WPD-side defects in this backend, not of the device; they are described under "Growing a
-file", "Device lifetime" and "Resource ownership". Two consecutive full runs passed with the suite's
-per-test device open/close churn intact, which is the load that used to wedge the driver within a
-single run. **PR #25 has since removed that churn** — so this result stands as evidence the leaks were
-fixed, but a green suite no longer re-proves it; see [Pending Windows work](#pending-windows-work-pr-25).
+The earlier intermittent failures recorded here — the growing replace on the FiiO SD card, storages
+transiently disappearing, sessions wedging mid-run — were symptoms of WPD-side defects in this backend,
+not of the device; they are described under "Growing a file", "Device lifetime" and "Resource
+ownership". Two consecutive full runs once passed with the suite's per-test device open/close churn
+intact, which is the load that used to wedge the driver within a single run. **PR #25 has since removed
+that churn**, so those runs stand as evidence the leaks were fixed, but a green suite no longer
+re-proves it; see [Pending Windows work](#pending-windows-work-pr-25). The 2026-08-28 WPD upload
+failure on FiiO / Internal shared storage is now tracked separately above.
 
 ### Audio object formats on WPD
 
