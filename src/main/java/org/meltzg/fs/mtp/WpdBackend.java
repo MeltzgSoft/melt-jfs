@@ -1492,18 +1492,18 @@ class WpdBackend implements MtpBackend {
         byte[] out = new byte[maxBytes];
         int read = 0;
         try (var arena = Arena.ofConfined()) {
-            var buffer = arena.allocate(Math.min(bufferSize, maxBytes));
+            var buffer = arena.allocate(bufferSize);
             var readOut = arena.allocate(JAVA_INT);
             var descriptor = FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, JAVA_INT, ADDRESS);
             while (read < maxBytes) {
-                int want = Math.min(maxBytes - read, (int) buffer.byteSize());
                 readOut.set(JAVA_INT, 0, 0);
-                checkHr(call(stream, STREAM_READ, descriptor, buffer, want, readOut),
+                checkHr(call(stream, STREAM_READ, descriptor, buffer, (int) buffer.byteSize(), readOut),
                     "IStream::Read");
                 int got = readOut.get(JAVA_INT, 0);
                 if (got <= 0) break;
-                MemorySegment.copy(buffer, JAVA_BYTE, 0, out, read, got);
-                read += got;
+                int keep = Math.min(got, maxBytes - read);
+                MemorySegment.copy(buffer, JAVA_BYTE, 0, out, read, keep);
+                read += keep;
             }
         }
         return read == out.length ? out : Arrays.copyOf(out, read);
