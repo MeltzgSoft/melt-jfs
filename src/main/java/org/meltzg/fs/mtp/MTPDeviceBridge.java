@@ -86,6 +86,11 @@ public enum MTPDeviceBridge implements Closeable {
     // Keyed per device; cleared when connections are torn down.
     private final Map<ItemKey, Long> sizeOverlays = new ConcurrentHashMap<>();
 
+    // Devices for which the backend's ranged-read path says the next mutating request should start
+    // from a fresh client handle. WPD needs this after raw GetPartialObject on at least one device:
+    // the partial read succeeds, but the next IStream upload fails with E_WPD_DEVICE_IS_HUNG.
+    private final Set<MTPDeviceIdentifier> partialReadMutationRecycle = ConcurrentHashMap.newKeySet();
+
     // Paths whose name this bridge freed with a DeleteObject in the current session and which
     // nothing has reoccupied. Some devices keep a deleted name reserved for the rest of the MTP
     // session, refusing to create an object under it again (measured on an Android-based player's
@@ -262,6 +267,7 @@ public enum MTPDeviceBridge implements Closeable {
      * no reconnect.
      */
     public void createDirectory(MTPDeviceIdentifier deviceId, String path) throws IOException {
+        recycleBeforeMutationIfNeeded(deviceId);
         try {
             createDirectoryOnce(deviceId, path);
         } catch (FileSystemException definitive) {
@@ -326,6 +332,7 @@ public enum MTPDeviceBridge implements Closeable {
     }
 
     public void delete(MTPDeviceIdentifier deviceId, String path) throws IOException {
+        recycleBeforeMutationIfNeeded(deviceId);
         connectionLock.readLock().lock();
         try {
             var parts = pathParts(path);
@@ -361,6 +368,7 @@ public enum MTPDeviceBridge implements Closeable {
      * root or storage level). Returns the new item's id.
      */
     public String writeFile(MTPDeviceIdentifier deviceId, String path, java.nio.file.Path localFile) throws IOException {
+        recycleBeforeMutationIfNeeded(deviceId);
         connectionLock.readLock().lock();
         try {
             var parts = pathParts(path);
@@ -439,6 +447,7 @@ public enum MTPDeviceBridge implements Closeable {
      * {@link FileAlreadyExistsException} is thrown.
      */
     public void move(MTPDeviceIdentifier deviceId, String sourcePath, String targetPath, boolean replace) throws IOException {
+        recycleBeforeMutationIfNeeded(deviceId);
         connectionLock.readLock().lock();
         try {
             var srcParts = pathParts(sourcePath);
@@ -572,7 +581,13 @@ public enum MTPDeviceBridge implements Closeable {
                 var item = resolveItemUnsafe(conn, parts);
                 if (item == null) throw new NoSuchFileException(path);
                 if (!item.isFile()) throw new IOException(path + " is not a file");
-                return backend().readPartial(conn.handle(), item.itemId(), offset, maxBytes);
+                try {
+                    return backend().readPartial(conn.handle(), item.itemId(), offset, maxBytes);
+                } finally {
+                    if (backend().recycleBeforeMutationAfterPartialRead()) {
+                        partialReadMutationRecycle.add(deviceId);
+                    }
+                }
             }
         } finally {
             connectionLock.readLock().unlock();
@@ -673,6 +688,12 @@ public enum MTPDeviceBridge implements Closeable {
         }
     }
 
+    private void recycleBeforeMutationIfNeeded(MTPDeviceIdentifier deviceId) throws IOException {
+        if (!backend().recycleBeforeMutationAfterPartialRead()) return;
+        if (!partialReadMutationRecycle.remove(deviceId)) return;
+        recycleConnections();
+    }
+
     /** Records that {@code path}'s name was freed by a DeleteObject and nothing has taken it back. */
     private void recordFreedName(MTPDeviceIdentifier deviceId, String path) {
         freedNames.add(new FreedName(deviceId, canonicalPath(path)));
@@ -711,6 +732,7 @@ public enum MTPDeviceBridge implements Closeable {
         tombstones.clear();
         renameOverlays.clear();
         sizeOverlays.clear();
+        partialReadMutationRecycle.clear();
         freedNames.clear(); // a new session releases every reserved name, so none may authorise a retry
         lastSignature = Set.of();
         devicesDetected = false;
