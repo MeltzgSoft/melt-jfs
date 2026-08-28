@@ -940,7 +940,7 @@ public enum MTPDeviceBridge implements Closeable {
             }
             if (!uploadName.equals(name)) {
                 try {
-                    backend.setFileName(conn.handle(), itemId, name);
+                    setFileNameWithRetry(backend, conn, itemId, name);
                 } catch (IOException | RuntimeException renameFailed) {
                     try {
                         backend.deleteObject(conn.handle(), itemId);
@@ -951,6 +951,26 @@ public enum MTPDeviceBridge implements Closeable {
                 }
             }
             return itemId;
+        }
+    }
+
+    private void setFileNameWithRetry(MtpBackend backend, MTPDeviceConnection conn, String itemId, String name)
+            throws IOException {
+        int attempt = 0;
+        while (true) {
+            try {
+                backend.setFileName(conn.handle(), itemId, name);
+                return;
+            } catch (IOException e) {
+                if (attempt >= SEND_RETRY_DELAYS_MILLIS.length) throw e;
+                try {
+                    Thread.sleep(SEND_RETRY_DELAYS_MILLIS[attempt++]);
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    e.addSuppressed(interrupted);
+                    throw e;
+                }
+            }
         }
     }
 

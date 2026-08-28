@@ -204,6 +204,7 @@ public class MTPDeviceBridgeSessionRecycleTest {
         var bridge = MTPDeviceBridge.getInstance();
         backend.temporaryUploadNames = true;
         backend.sendFailuresRemaining = 1;
+        backend.renameFailuresRemaining = 1;
 
         var local = Files.createTempFile("melt-jfs-temp-upload", ".bin");
         try {
@@ -213,6 +214,8 @@ public class MTPDeviceBridgeSessionRecycleTest {
 
             assertEquals("the failed first send and successful retry must both reach the backend",
                 2, backend.sendCalls.get());
+            assertEquals("a transient immediate post-upload rename failure must be retried",
+                2, backend.renameCalls.get());
             assertTrue("the final name must never be used for the upload data phase",
                 backend.uploadNames.stream().noneMatch("fresh.bin"::equals));
             var names = java.util.Arrays.stream(bridge.listChildren(id, "/Store"))
@@ -245,6 +248,7 @@ public class MTPDeviceBridgeSessionRecycleTest {
         final AtomicInteger sessionsOpened = new AtomicInteger();
         final AtomicInteger createCalls = new AtomicInteger();
         final AtomicInteger sendCalls = new AtomicInteger();
+        final AtomicInteger renameCalls = new AtomicInteger();
         final List<String> uploadNames = new ArrayList<>();
         final Set<String> reserved = new HashSet<>();
         volatile boolean reopenClearsReservations = true;
@@ -253,6 +257,7 @@ public class MTPDeviceBridgeSessionRecycleTest {
         volatile boolean temporaryUploadNames = false;
         volatile boolean failSends = false;
         volatile int sendFailuresRemaining = 0;
+        volatile int renameFailuresRemaining = 0;
 
         @Override
         public boolean reopenClearsNameReservations() {
@@ -366,7 +371,12 @@ public class MTPDeviceBridgeSessionRecycleTest {
         @Override public void getFile(DeviceHandle device, String itemId, String destPath) {}
         @Override public void moveObject(DeviceHandle device, String itemId, String storageId, String parentId) {}
         @Override
-        public void setFileName(DeviceHandle device, String itemId, String newName) {
+        public void setFileName(DeviceHandle device, String itemId, String newName) throws IOException {
+            renameCalls.incrementAndGet();
+            if (renameFailuresRemaining > 0) {
+                renameFailuresRemaining--;
+                throw new IOException("SetObjectName failed for: " + newName);
+            }
             tree.values().forEach(children -> {
                 for (int i = 0; i < children.size(); i++) {
                     var item = children.get(i);
