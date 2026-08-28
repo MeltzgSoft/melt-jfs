@@ -27,7 +27,7 @@ match **`NativeLibMTP`** (libmtp, Linux/macOS). **Keep this file updated wheneve
 | Eager `newInputStream` / `Files.copy` | ✅ | ✅ | none |
 | `mtp` view (device-index metadata) | ✅ | ✅ | none |
 | `sendFile` audio object-format inference | ✅ | ✅ | none — correct WPD audio GUIDs are used; forcing generic uploads with `-Dmelt-jfs.wpd.uploadAudioAsGeneric=true` did not prevent the FiiO/WPD hang |
-| `sendFile` retry after failed create-with-data | ✅ | ✅ | WPD uploads through a unique temporary object name and renames after commit, so a failed retry does not poison the requested final filename |
+| `sendFile` retry after failed create-with-data | ✅ | ⚠️ opt-in experiment | WPD can upload through a unique temporary object name with `-Dmelt-jfs.wpd.temporaryUploadNames=true`, but this is disabled by default because FiiO rejected the immediate post-commit rename |
 | **Ranged read (`readPartial`)** | ✅ | ✅ (MTP GetPartialObject via `SendCommand`) | WPD currently reopens the client handle before the next upload after a partial read, because FiiO/WPD otherwise hangs that upload |
 | `supportsPartialReads()` | ✅ `true` | ✅ `true` | none |
 | Lazy read channel (`newByteChannel`) | ✅ lazy | ✅ lazy | none |
@@ -101,14 +101,12 @@ hook moved the failure: `isHiddenAlwaysFalse` passed and the FiiO no longer ente
 `E_WPD_DEVICE_IS_HUNG`, but two later fresh writes on the same storage failed with generic
 `IStream::Write failed (HRESULT 0x80004005)`.
 
-WPD therefore also defaults to `MtpBackend.uploadWithTemporaryName()`: each create-with-data transfer
-uses a unique hidden implementation name that preserves the requested extension, and the object is
-renamed to the caller's filename only after the stream commits. This keeps a failed WPD send retry
-from repeatedly using, and possibly reserving, the final name. Run 48 showed the rename itself can be
-rejected transiently immediately after commit (`IPortableDeviceProperties::SetValues` returning
-`0x8007065d`), so the post-commit rename uses the same short retry schedule before treating the temp
-object as unrecoverable. The temporary-name path can be disabled with
-`-Dmelt-jfs.wpd.temporaryUploadNames=false`.
+An attempted follow-up made WPD upload each create-with-data transfer under a unique implementation
+name, then rename the committed object to the caller's filename. That reduced later same-storage
+write failures, but it made the first post-partial upload fail at rename:
+`IPortableDeviceProperties::SetValues` returned `0x8007065d` in run 48 and `0x80004005` in run 50,
+even with the short retry schedule. The temporary-name path remains available for diagnostics with
+`-Dmelt-jfs.wpd.temporaryUploadNames=true`, but it is disabled by default.
 
 ### In-place object editing on WPD
 
