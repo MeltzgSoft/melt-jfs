@@ -176,7 +176,7 @@ public class MTPDeviceBridgeSessionRecycleTest {
     }
 
     @Test
-    public void mutationAfterPartialReadRecyclesOnceWhenBackendRequestsIt() throws IOException {
+    public void uploadAfterPartialReadRecyclesOnceWhenBackendRequestsIt() throws IOException {
         var bridge = MTPDeviceBridge.getInstance();
         backend.recycleAfterPartialRead = true;
 
@@ -188,11 +188,11 @@ public class MTPDeviceBridgeSessionRecycleTest {
             Files.write(local, new byte[]{1, 2, 3});
             bridge.writeFile(id, "/Store/after-partial.bin", local);
 
-            assertEquals("first mutation after readPartial must reopen the backend handle",
+            assertEquals("first upload after readPartial must reopen the backend handle",
                 sessionsAfterRead + 1, backend.sessionsOpened.get());
 
             bridge.writeFile(id, "/Store/second-write.bin", local);
-            assertEquals("the partial-read recycle gate must be consumed by the first mutation",
+            assertEquals("the partial-read recycle gate must be consumed by the first upload",
                 sessionsAfterRead + 1, backend.sessionsOpened.get());
         } finally {
             Files.deleteIfExists(local);
@@ -270,7 +270,7 @@ public class MTPDeviceBridgeSessionRecycleTest {
         }
 
         @Override
-        public boolean recycleBeforeMutationAfterPartialRead() {
+        public boolean recycleBeforeUploadAfterPartialRead() {
             return recycleAfterPartialRead;
         }
 

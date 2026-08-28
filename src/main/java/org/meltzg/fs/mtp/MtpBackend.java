@@ -111,11 +111,11 @@ public interface MtpBackend {
 
     /**
      * Whether a successful or attempted ranged read leaves the backend's client handle in a state
-     * where the next mutation should first reopen the device. This is a backend/driver workaround,
+     * where the next upload should first reopen the device. This is a backend/driver workaround,
      * not an MTP requirement: libmtp owns the wire session and does not need it, while WPD's MTP
      * pass-through can poison the next upload on some devices after GetPartialObject completes.
      */
-    default boolean recycleBeforeMutationAfterPartialRead() {
+    default boolean recycleBeforeUploadAfterPartialRead() {
         return false;
     }
 

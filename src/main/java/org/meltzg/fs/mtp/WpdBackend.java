@@ -721,7 +721,7 @@ class WpdBackend implements MtpBackend {
     }
 
     @Override
-    public boolean recycleBeforeMutationAfterPartialRead() {
+    public boolean recycleBeforeUploadAfterPartialRead() {
         return RECYCLE_AFTER_PARTIAL_READ;
     }
 
