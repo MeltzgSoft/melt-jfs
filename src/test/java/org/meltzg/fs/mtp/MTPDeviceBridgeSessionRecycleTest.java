@@ -176,7 +176,7 @@ public class MTPDeviceBridgeSessionRecycleTest {
     }
 
     @Test
-    public void mutationAfterPartialReadRecyclesOnceWhenBackendRequestsIt() throws IOException {
+    public void mutationsAfterPartialReadRecycleAcrossTheMeasuredWpdWindow() throws IOException {
         var bridge = MTPDeviceBridge.getInstance();
         backend.recycleAfterPartialRead = true;
 
@@ -192,8 +192,17 @@ public class MTPDeviceBridgeSessionRecycleTest {
                 sessionsAfterRead + 1, backend.sessionsOpened.get());
 
             bridge.writeFile(id, "/Store/second-write.bin", local);
-            assertEquals("the partial-read recycle gate must be consumed by the first mutation",
-                sessionsAfterRead + 1, backend.sessionsOpened.get());
+            assertEquals("second mutation after readPartial stays in the recycle window",
+                sessionsAfterRead + 2, backend.sessionsOpened.get());
+
+            bridge.writeFile(id, "/Store/third-write.bin", local);
+            bridge.writeFile(id, "/Store/fourth-write.bin", local);
+            assertEquals("four post-partial mutations are covered by fresh handles",
+                sessionsAfterRead + 4, backend.sessionsOpened.get());
+
+            bridge.writeFile(id, "/Store/fifth-write.bin", local);
+            assertEquals("the bounded recycle window is consumed after four mutations",
+                sessionsAfterRead + 4, backend.sessionsOpened.get());
         } finally {
             Files.deleteIfExists(local);
         }
@@ -212,8 +221,8 @@ public class MTPDeviceBridgeSessionRecycleTest {
         assertEquals("delete after readPartial must reopen the backend handle first",
             sessionsAfterRead + 1, backend.sessionsOpened.get());
         bridge.createDirectory(id, "/Store/after-delete");
-        assertEquals("the delete must consume the partial-read recycle gate",
-            sessionsAfterRead + 1, backend.sessionsOpened.get());
+        assertEquals("the post-delete mutation remains in the partial-read recycle window",
+            sessionsAfterRead + 2, backend.sessionsOpened.get());
     }
 
     @Test

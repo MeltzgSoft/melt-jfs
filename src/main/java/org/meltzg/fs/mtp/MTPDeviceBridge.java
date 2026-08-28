@@ -88,9 +88,12 @@ public enum MTPDeviceBridge implements Closeable {
 
     // Devices for which the backend's ranged-read path says the next mutation should start from a
     // fresh client handle. WPD needs this after raw GetPartialObject on at least one device: the
-    // partial read succeeds, but a following delete can leave the device in a state where the next
-    // IStream upload fails with E_WPD_DEVICE_IS_HUNG.
-    private final Set<MTPDeviceIdentifier> partialReadMutationRecycle = ConcurrentHashMap.newKeySet();
+    // partial read succeeds, but later deletes/uploads can leave the device in a state where a
+    // following IStream upload fails with E_WPD_DEVICE_IS_HUNG. Run 64 showed the vulnerable window
+    // can span cleanup delete -> write -> cleanup delete -> write, so keep a small mutation budget
+    // instead of a one-shot flag.
+    private static final int POST_PARTIAL_READ_RECYCLE_MUTATIONS = 4;
+    private final Map<MTPDeviceIdentifier, Integer> partialReadMutationRecycles = new ConcurrentHashMap<>();
 
     // Paths whose name this bridge freed with a DeleteObject in the current session and which
     // nothing has reoccupied. Some devices keep a deleted name reserved for the rest of the MTP
@@ -586,7 +589,7 @@ public enum MTPDeviceBridge implements Closeable {
                     return backend().readPartial(conn.handle(), item.itemId(), offset, maxBytes);
                 } finally {
                     if (backend().recycleBeforeMutationAfterPartialRead()) {
-                        partialReadMutationRecycle.add(deviceId);
+                        partialReadMutationRecycles.put(deviceId, POST_PARTIAL_READ_RECYCLE_MUTATIONS);
                     }
                 }
             }
@@ -691,8 +694,12 @@ public enum MTPDeviceBridge implements Closeable {
 
     private void recycleBeforeMutationIfNeeded(MTPDeviceIdentifier deviceId) throws IOException {
         if (!backend().recycleBeforeMutationAfterPartialRead()) return;
-        if (!partialReadMutationRecycle.remove(deviceId)) return;
+        Integer budget = partialReadMutationRecycles.remove(deviceId);
+        if (budget == null) return;
         recycleConnections();
+        if (budget > 1) {
+            partialReadMutationRecycles.put(deviceId, budget - 1);
+        }
     }
 
     /** Records that {@code path}'s name was freed by a DeleteObject and nothing has taken it back. */
@@ -733,7 +740,7 @@ public enum MTPDeviceBridge implements Closeable {
         tombstones.clear();
         renameOverlays.clear();
         sizeOverlays.clear();
-        partialReadMutationRecycle.clear();
+        partialReadMutationRecycles.clear();
         freedNames.clear(); // a new session releases every reserved name, so none may authorise a retry
         lastSignature = Set.of();
         devicesDetected = false;
