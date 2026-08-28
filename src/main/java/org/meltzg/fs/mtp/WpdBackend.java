@@ -897,6 +897,7 @@ class WpdBackend implements MtpBackend {
 
         checkMtpResponse(executeWithoutData(device, OP_BEGIN_EDIT_OBJECT, (int) objectHandle),
             "BeginEditObject");
+        IOException pending = null;
         try {
             checkMtpResponse(executeWithoutData(device, OP_TRUNCATE_OBJECT, (int) objectHandle, 0, 0),
                 "TruncateObject");
@@ -905,10 +906,23 @@ class WpdBackend implements MtpBackend {
                     sendPartialObject(device, objectHandle, size, in);
                 }
             }
+        } catch (IOException e) {
+            pending = e;
+            throw e;
         } finally {
-            try {
-                executeWithoutData(device, OP_END_EDIT_OBJECT, (int) objectHandle);
-            } catch (IOException ignored) {
+            endEditObject(device, objectHandle, pending);
+        }
+    }
+
+    private void endEditObject(MemorySegment device, long objectHandle, IOException pending) throws IOException {
+        try {
+            checkMtpResponse(executeWithoutData(device, OP_END_EDIT_OBJECT, (int) objectHandle),
+                "EndEditObject");
+        } catch (IOException endFailure) {
+            if (pending != null) {
+                pending.addSuppressed(endFailure);
+            } else {
+                throw endFailure;
             }
         }
     }
