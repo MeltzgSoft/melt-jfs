@@ -60,43 +60,6 @@ jobs:
       - name: Run integration tests
         run: .\gradlew.bat integrationTest -PrequireDevice
 
-      # TEMPORARY (PR #25): measures what the driver does when a name is already
-      # taken, to settle whether a FileAlreadyExistsException backstop can key off
-      # the HRESULT. libmtp has now answered on all four storages (refused
-      # everywhere, no duplicate); this is the WPD half. Remove once
-      # docs/windows-parity.md records the answer.
-      - name: Probe name collisions
-        if: always()
-        timeout-minutes: 10
-        run: .\gradlew.bat collisionProbe
-
-      # TEMPORARY (PR #25): the real test of the WPD parity gap, not a smoke test.
-      # Targeted at FiiO / Micro SD alone, the only storage known to reserve a
-      # deleted name: no other storage can score a lever, so pointing the raw
-      # opcodes at them would add wedge risk for no data. No "force" either --
-      # with a genuine reservation available, an unscored result is not wanted.
-      #
-      # Lever order is deliberate: recycle (the known-negative control, proving
-      # the reservation is live), then session (CloseSession+OpenSession, the
-      # direct test of "reset the session the DEVICE sees"), then reset
-      # (ResetDevice, the bigger hammer, last because it is likeliest to end the
-      # run). Each lever re-establishes its own reservation, so a wedge degrades
-      # to a skipped lever rather than a bogus result.
-      #
-      # These go underneath a driver that thinks it owns the session and CAN
-      # wedge WpdMtpDr, whose recorded recovery is a physical replug. Run
-      # deliberately, with access to the machine. timeout-minutes bounds it
-      # because a wedged Open blocks forever with no timeout of its own.
-      - name: Run the reservation lever probe
-        if: always()
-        timeout-minutes: 15
-        # Inner quotes are required, not decoration: Gradle splits --args on
-        # whitespace, so an unquoted "FiiO M11 Plus|..." arrives as six separate
-        # arguments and only the first is read. That silently degraded run 1286
-        # to a device filter of "FiiO" with no storage and no levers -- the
-        # default control ran and session/reset never fired.
-        run: .\gradlew.bat reservationLeverProbe "--args='FiiO M11 Plus|M11 Plus Micro SD;recycle,session,reset'"
-
       - name: Release device lock
         if: always()
         run: python devicelock.py release
@@ -129,19 +92,6 @@ jobs:
       # must not apt-get inside the VM it shares with every other job.
       - name: Run integration tests
         run: ./gradlew integrationTest -PrequireDevice
-
-      # TEMPORARY (PR #25): the libmtp half of the same measurement — the doc's
-      # claim is that the two backends differ here, so the comparison needs both.
-      - name: Probe name collisions
-        if: always()
-        run: ./gradlew collisionProbe
-
-      # TEMPORARY (PR #25): the libmtp half of the same smoke test. Equally UNSCORED
-      # here -- no attached storage reserves names -- but it exercises the harness on
-      # the backend where a reopen is the mitigation that already works.
-      - name: Smoke-test the reservation lever probe
-        if: always()
-        run: ./gradlew reservationLeverProbe "--args=;recycle,force"
 
       - name: Release device lock
         if: always()
