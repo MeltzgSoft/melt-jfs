@@ -54,19 +54,10 @@ jobs:
       - name: Verify the attached device
         run: python devicelock.py verify
 
-      # TEMPORARILY DISABLED (PR #25). With the FiiO M11 Plus attached the suite
-      # hangs on this runner rather than failing -- last seen passing
-      # uploadedId3v23Mp3TagsAreReadBackViaAudioView on FiiO / Internal shared
-      # storage and never reaching the next test. A hang burns the whole job
-      # timeout and leaves the probes below unreachable, and the probes are what
-      # this branch still needs. Restore this step (drop the if:) once the hang
-      # is understood -- do NOT merge with it disabled.
-      #
       # -PrequireDevice: the integration tests self-skip without a device,
       # and after a successful acquire + verify an all-skipped run is a
       # failure, not a pass.
       - name: Run integration tests
-        if: ${{ false }}
         run: .\gradlew.bat integrationTest -PrequireDevice
 
       # TEMPORARY (PR #25): measures what the driver does when a name is already
