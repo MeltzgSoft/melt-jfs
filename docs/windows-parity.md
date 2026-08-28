@@ -26,7 +26,7 @@ match **`NativeLibMTP`** (libmtp, Linux/macOS). **Keep this file updated wheneve
 | Whole-object read (`getFile`) | ✅ | ✅ (IStream::Read) | none |
 | Eager `newInputStream` / `Files.copy` | ✅ | ✅ | none |
 | `mtp` view (device-index metadata) | ✅ | ✅ | none |
-| `sendFile` audio object-format inference | ✅ | ✅ (`audioFormatForFilename`) | none — fixed 2026-08-27 after WPD GUIDs were found word-swapped |
+| `sendFile` audio object-format inference | ✅ | ⚠️ disabled by default | experiment — correct WPD audio GUIDs were implemented, but FiiO/WPD started returning `E_WPD_DEVICE_IS_HUNG` after the first MP3 upload; WPD now uploads audio as generic files unless `-Dmelt-jfs.wpd.uploadAudioAsGeneric=false` is set |
 | **Ranged read (`readPartial`)** | ✅ | ✅ (MTP GetPartialObject via `SendCommand`) | none |
 | `supportsPartialReads()` | ✅ `true` | ✅ `true` | none |
 | Lazy read channel (`newByteChannel`) | ✅ lazy | ✅ lazy | none |
@@ -84,6 +84,13 @@ formats, WPD's GUID uses the 16-bit MTP format code in the high word of `GUID.Da
 mapping meant Windows uploaded audio objects with nonstandard format GUIDs while libmtp uploaded the
 same extensions under recognized audio filetypes. That was a real implementation parity gap, despite
 the previous status table claiming this path was complete.
+
+The 2026-08-28 Windows runs then exposed a worse behavior: after the first FiiO/WPD MP3 upload using
+the correct audio content type and format GUID, the next upload hung in `IStream::Write` until WPD
+returned `E_WPD_DEVICE_IS_HUNG`. As an experiment, WPD now defaults uploads to generic file properties
+again while keeping the correct audio GUID path behind `-Dmelt-jfs.wpd.uploadAudioAsGeneric=false`.
+If Windows CI becomes stable with generic WPD uploads, the WPD audio classification path is the likely
+trigger and should stay disabled or be made device/driver-gated.
 
 ### In-place object editing on WPD
 
