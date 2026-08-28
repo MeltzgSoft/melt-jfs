@@ -176,7 +176,7 @@ class WpdBackend implements MtpBackend {
     private static final boolean RECYCLE_AFTER_PARTIAL_READ = Boolean.parseBoolean(
         System.getProperty("melt-jfs.wpd.recycleAfterPartialRead", "true"));
     private static final boolean USE_TEMPORARY_UPLOAD_NAMES = Boolean.parseBoolean(
-        System.getProperty("melt-jfs.wpd.temporaryUploadNames", "true"));
+        System.getProperty("melt-jfs.wpd.temporaryUploadNames", "false"));
 
     private static final Pattern VID = Pattern.compile("vid_([0-9a-fA-F]{4})");
     private static final Pattern PID = Pattern.compile("pid_([0-9a-fA-F]{4})");
