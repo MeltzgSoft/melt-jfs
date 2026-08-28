@@ -171,6 +171,9 @@ class WpdBackend implements MtpBackend {
     private static final int PID_WRITE_DATA = 16;
     private static final int PID_END_DATA_TRANSFER = 17;
 
+    private static final boolean UPLOAD_AUDIO_AS_GENERIC = Boolean.parseBoolean(
+        System.getProperty("melt-jfs.wpd.uploadAudioAsGeneric", "true"));
+
     private static final Pattern VID = Pattern.compile("vid_([0-9a-fA-F]{4})");
     private static final Pattern PID = Pattern.compile("pid_([0-9a-fA-F]{4})");
 
@@ -1139,7 +1142,7 @@ class WpdBackend implements MtpBackend {
             setString(values, KEY_NAME, wstr(arena, filename));
             setString(values, KEY_ORIGINAL_FILE_NAME, wstr(arena, filename));
             setU8(values, KEY_OBJECT_SIZE, filesize);
-            var audioFormat = audioFormatForFilename(filename);
+            var audioFormat = UPLOAD_AUDIO_AS_GENERIC ? null : audioFormatForFilename(filename);
             if (audioFormat == null) {
                 setGuid(values, KEY_CONTENT_TYPE, CONTENT_TYPE_GENERIC_FILE);
                 setGuid(values, KEY_OBJECT_FORMAT, FORMAT_UNSPECIFIED);
