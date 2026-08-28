@@ -117,12 +117,17 @@ public class MTPFileSystemIntegrationTest {
      * test can poison a name another test reuses within the shared session.
      */
     private static volatile boolean forceReopen = true;
+    private static final Set<MTPDeviceIdentifier> WPD_HUNG_DEVICES =
+        java.util.concurrent.ConcurrentHashMap.newKeySet();
 
     /** Drops the shared session after a failure so the next test reopens from scratch. */
     @Rule
     public final org.junit.rules.TestWatcher sessionResetOnFailure = new org.junit.rules.TestWatcher() {
         @Override
         protected void failed(Throwable e, org.junit.runner.Description description) {
+            if (deviceId != null && WpdException.causedByDeviceHung(e)) {
+                WPD_HUNG_DEVICES.add(deviceId);
+            }
             forceReopen = true;
         }
     };
@@ -144,6 +149,9 @@ public class MTPFileSystemIntegrationTest {
     public void setUp() throws IOException {
         assumeTrue("native MTP backend not available", isBackendAvailable());
         assumeTrue("no MTP device connected", deviceId != null);
+        assumeTrue("WPD reported E_WPD_DEVICE_IS_HUNG for " + deviceName
+                + "; skipping remaining tests for this device",
+            !WPD_HUNG_DEVICES.contains(deviceId));
         assumeTrue("device exposes no storages: " + deviceName, storageName != null);
 
         // Reuse the open session unless a virgin one was requested; getInstance() still performs the

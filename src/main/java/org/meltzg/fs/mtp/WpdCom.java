@@ -70,7 +70,7 @@ final class WpdCom {
 
     static void checkHr(int hr, String op) throws IOException {
         if (failed(hr)) {
-            throw new IOException(op + " failed (HRESULT 0x" + Integer.toHexString(hr) + ")");
+            throw new WpdException(op, hr);
         }
     }
 
