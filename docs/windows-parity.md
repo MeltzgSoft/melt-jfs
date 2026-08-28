@@ -104,7 +104,10 @@ hook moved the failure: `isHiddenAlwaysFalse` passed and the FiiO no longer ente
 WPD therefore also defaults to `MtpBackend.uploadWithTemporaryName()`: each create-with-data transfer
 uses a unique hidden implementation name that preserves the requested extension, and the object is
 renamed to the caller's filename only after the stream commits. This keeps a failed WPD send retry
-from repeatedly using, and possibly reserving, the final name. It can be disabled with
+from repeatedly using, and possibly reserving, the final name. Run 48 showed the rename itself can be
+rejected transiently immediately after commit (`IPortableDeviceProperties::SetValues` returning
+`0x8007065d`), so the post-commit rename uses the same short retry schedule before treating the temp
+object as unrecoverable. The temporary-name path can be disabled with
 `-Dmelt-jfs.wpd.temporaryUploadNames=false`.
 
 ### In-place object editing on WPD
