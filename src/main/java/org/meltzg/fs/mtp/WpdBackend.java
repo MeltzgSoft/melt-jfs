@@ -144,11 +144,9 @@ class WpdBackend implements MtpBackend {
     private static final int PVCOLL_GET_AT = 4;
     private static final int PVCOLL_ADD = 5;
     private static final int STREAM_READ = 3;
-    private static final int STREAM_SEEK = 5;
     private static final int STREAM_WRITE = 4;
     private static final int STREAM_COMMIT = 8;
     private static final int DATASTREAM_GET_OBJECT_ID = 14;
-    private static final int STREAM_SEEK_SET = 0;
 
     private static final int PORTABLE_DEVICE_DELETE_NO_RECURSION = 0;
     private static final int STORAGE_ENUM_ATTEMPTS = 3;
@@ -760,8 +758,8 @@ class WpdBackend implements MtpBackend {
                     "IPortableDeviceResources::GetStream");
                 var stream = streamOut.get(ADDRESS, 0);
                 try {
-                    seekStream(stream, offset);
-                    return readStreamRange(stream, maxBytes, transferBufferSize(optimal.get(JAVA_INT, 0)));
+                    return readStreamRange(stream, offset, maxBytes,
+                        transferBufferSize(optimal.get(JAVA_INT, 0)));
                 } finally {
                     release(stream);
                 }
@@ -1477,30 +1475,28 @@ class WpdBackend implements MtpBackend {
         }
     }
 
-    private void seekStream(MemorySegment stream, long offset) throws IOException {
-        try (var arena = Arena.ofConfined()) {
-            var newPosition = arena.allocate(JAVA_LONG);
-            checkHr(call(stream, STREAM_SEEK,
-                    FunctionDescriptor.of(JAVA_INT, ADDRESS, JAVA_LONG, JAVA_INT, ADDRESS),
-                    offset, STREAM_SEEK_SET, newPosition),
-                "IStream::Seek");
-        }
-    }
-
-    private byte[] readStreamRange(MemorySegment stream, int maxBytes, int bufferSize)
+    private byte[] readStreamRange(MemorySegment stream, long offset, int maxBytes, int bufferSize)
             throws IOException {
         byte[] out = new byte[maxBytes];
         int read = 0;
+        long remainingSkip = offset;
         try (var arena = Arena.ofConfined()) {
             var buffer = arena.allocate(bufferSize);
             var readOut = arena.allocate(JAVA_INT);
             var descriptor = FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, JAVA_INT, ADDRESS);
-            while (read < maxBytes) {
+            while (remainingSkip > 0 || read < maxBytes) {
+                int want = remainingSkip > 0
+                    ? (int) Math.min(remainingSkip, buffer.byteSize())
+                    : Math.min(maxBytes - read, (int) buffer.byteSize());
                 readOut.set(JAVA_INT, 0, 0);
-                checkHr(call(stream, STREAM_READ, descriptor, buffer, (int) buffer.byteSize(), readOut),
+                checkHr(call(stream, STREAM_READ, descriptor, buffer, want, readOut),
                     "IStream::Read");
                 int got = readOut.get(JAVA_INT, 0);
                 if (got <= 0) break;
+                if (remainingSkip > 0) {
+                    remainingSkip -= got;
+                    continue;
+                }
                 int keep = Math.min(got, maxBytes - read);
                 MemorySegment.copy(buffer, JAVA_BYTE, 0, out, read, keep);
                 read += keep;
