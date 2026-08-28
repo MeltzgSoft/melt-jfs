@@ -26,8 +26,8 @@ match **`NativeLibMTP`** (libmtp, Linux/macOS). **Keep this file updated wheneve
 | Whole-object read (`getFile`) | ✅ | ✅ (IStream::Read) | none |
 | Eager `newInputStream` / `Files.copy` | ✅ | ✅ | none |
 | `mtp` view (device-index metadata) | ✅ | ✅ | none |
-| `sendFile` audio object-format inference | ✅ | ⚠️ disabled by default | experiment — correct WPD audio GUIDs were implemented, but FiiO/WPD started returning `E_WPD_DEVICE_IS_HUNG` after the first MP3 upload; WPD now uploads audio as generic files unless `-Dmelt-jfs.wpd.uploadAudioAsGeneric=false` is set |
-| **Ranged read (`readPartial`)** | ✅ | ✅ (MTP GetPartialObject via `SendCommand`) | none |
+| `sendFile` audio object-format inference | ✅ | ✅ | none — correct WPD audio GUIDs are used; forcing generic uploads with `-Dmelt-jfs.wpd.uploadAudioAsGeneric=true` did not prevent the FiiO/WPD hang |
+| **Ranged read (`readPartial`)** | ✅ | ✅ (MTP GetPartialObject via `SendCommand`) | WPD currently reopens the client handle before the next mutation after a partial read, because FiiO/WPD otherwise hangs the next upload |
 | `supportsPartialReads()` | ✅ `true` | ✅ `true` | none |
 | Lazy read channel (`newByteChannel`) | ✅ lazy | ✅ lazy | none |
 | `audio` view (embedded tags) | ✅ | ✅ (lit up by `readPartial`) | none |
@@ -85,12 +85,17 @@ mapping meant Windows uploaded audio objects with nonstandard format GUIDs while
 same extensions under recognized audio filetypes. That was a real implementation parity gap, despite
 the previous status table claiming this path was complete.
 
-The 2026-08-28 Windows runs then exposed a worse behavior: after the first FiiO/WPD MP3 upload using
-the correct audio content type and format GUID, the next upload hung in `IStream::Write` until WPD
-returned `E_WPD_DEVICE_IS_HUNG`. As an experiment, WPD now defaults uploads to generic file properties
-again while keeping the correct audio GUID path behind `-Dmelt-jfs.wpd.uploadAudioAsGeneric=false`.
-If Windows CI becomes stable with generic WPD uploads, the WPD audio classification path is the likely
-trigger and should stay disabled or be made device/driver-gated.
+The 2026-08-28 Windows runs then exposed a worse behavior: after the first FiiO/WPD MP3 upload and
+embedded-tag read, the next upload hung in `IStream::Write` until WPD returned
+`E_WPD_DEVICE_IS_HUNG`. Forcing WPD uploads back to generic file properties with
+`-Dmelt-jfs.wpd.uploadAudioAsGeneric=true` did **not** prevent the hang when the FiiO was present in
+run 44 attempt 2, so the audio content type / object-format path is not the trigger.
+
+The current experiment instead treats WPD `readPartial` as dirtying that client handle for writes:
+`MTPDeviceBridge` records devices that have used a ranged read, and before the next create/write/delete
+/move it reopens the WPD client handle once. This is deliberately gated by
+`MtpBackend.recycleBeforeMutationAfterPartialRead()` so libmtp keeps its normal path, and by
+`-Dmelt-jfs.wpd.recycleAfterPartialRead=true` on WPD so CI can falsify it directly.
 
 ### In-place object editing on WPD
 

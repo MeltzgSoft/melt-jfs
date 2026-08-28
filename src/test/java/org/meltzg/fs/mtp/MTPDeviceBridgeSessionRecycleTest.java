@@ -175,6 +175,30 @@ public class MTPDeviceBridgeSessionRecycleTest {
         }
     }
 
+    @Test
+    public void mutationAfterPartialReadRecyclesOnceWhenBackendRequestsIt() throws IOException {
+        var bridge = MTPDeviceBridge.getInstance();
+        backend.recycleAfterPartialRead = true;
+
+        assertArrayEquals(new byte[]{9}, bridge.readPartial(id, "/Store/f1", 0, 1));
+        int sessionsAfterRead = backend.sessionsOpened.get();
+
+        var local = Files.createTempFile("melt-jfs-partial-recycle", ".bin");
+        try {
+            Files.write(local, new byte[]{1, 2, 3});
+            bridge.writeFile(id, "/Store/after-partial.bin", local);
+
+            assertEquals("first mutation after readPartial must reopen the backend handle",
+                sessionsAfterRead + 1, backend.sessionsOpened.get());
+
+            bridge.writeFile(id, "/Store/second-write.bin", local);
+            assertEquals("the partial-read recycle gate must be consumed by the first mutation",
+                sessionsAfterRead + 1, backend.sessionsOpened.get());
+        } finally {
+            Files.deleteIfExists(local);
+        }
+    }
+
     /**
      * In-memory backend modelling a device that reserves deleted names for the life of the MTP
      * session:
@@ -198,11 +222,28 @@ public class MTPDeviceBridgeSessionRecycleTest {
         final Set<String> reserved = new HashSet<>();
         volatile boolean reopenClearsReservations = true;
         volatile boolean reopenClearsNameReservations = true;
+        volatile boolean recycleAfterPartialRead = false;
         volatile boolean failSends = false;
 
         @Override
         public boolean reopenClearsNameReservations() {
             return reopenClearsNameReservations;
+        }
+
+        @Override
+        public boolean supportsPartialReads() {
+            return true;
+        }
+
+        @Override
+        public boolean recycleBeforeMutationAfterPartialRead() {
+            return recycleAfterPartialRead;
+        }
+
+        @Override
+        public byte[] readPartial(DeviceHandle device, String itemId, long offset, int maxBytes) {
+            if (!"2".equals(itemId) || offset > 0 || maxBytes == 0) return new byte[0];
+            return new byte[]{9};
         }
 
         private final Map<String, List<MTPItemInfo>> tree = new java.util.HashMap<>(Map.of(
