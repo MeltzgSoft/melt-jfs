@@ -144,9 +144,11 @@ class WpdBackend implements MtpBackend {
     private static final int PVCOLL_GET_AT = 4;
     private static final int PVCOLL_ADD = 5;
     private static final int STREAM_READ = 3;
+    private static final int STREAM_SEEK = 5;
     private static final int STREAM_WRITE = 4;
     private static final int STREAM_COMMIT = 8;
     private static final int DATASTREAM_GET_OBJECT_ID = 14;
+    private static final int STREAM_SEEK_SET = 0;
 
     private static final int PORTABLE_DEVICE_DELETE_NO_RECURSION = 0;
     private static final int STORAGE_ENUM_ATTEMPTS = 3;
@@ -174,9 +176,11 @@ class WpdBackend implements MtpBackend {
     private static final boolean UPLOAD_AUDIO_AS_GENERIC = Boolean.parseBoolean(
         System.getProperty("melt-jfs.wpd.uploadAudioAsGeneric", "false"));
     private static final boolean RECYCLE_AFTER_PARTIAL_READ = Boolean.parseBoolean(
-        System.getProperty("melt-jfs.wpd.recycleAfterPartialRead", "true"));
+        System.getProperty("melt-jfs.wpd.recycleAfterPartialRead", "false"));
     private static final boolean USE_TEMPORARY_UPLOAD_NAMES = Boolean.parseBoolean(
         System.getProperty("melt-jfs.wpd.temporaryUploadNames", "false"));
+    private static final boolean USE_MTP_PARTIAL_READS = Boolean.parseBoolean(
+        System.getProperty("melt-jfs.wpd.mtpPartialReads", "false"));
 
     private static final Pattern VID = Pattern.compile("vid_([0-9a-fA-F]{4})");
     private static final Pattern PID = Pattern.compile("pid_([0-9a-fA-F]{4})");
@@ -736,6 +740,39 @@ class WpdBackend implements MtpBackend {
         if (maxBytes < 0) throw new IllegalArgumentException("maxBytes must be non-negative: " + maxBytes);
         if (maxBytes == 0) return new byte[0];
 
+        if (USE_MTP_PARTIAL_READS) {
+            return readPartialViaMtpPassThrough(handle, itemId, offset, maxBytes);
+        }
+
+        var d = asDevice(handle);
+        try (var arena = Arena.ofConfined()) {
+            var resourcesOut = arena.allocate(ADDRESS);
+            checkHr(call(d.content(), CONTENT_TRANSFER,
+                    FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS), resourcesOut),
+                "IPortableDeviceContent::Transfer");
+            var resources = resourcesOut.get(ADDRESS, 0);
+            try {
+                var optimal = arena.allocate(JAVA_INT);
+                var streamOut = arena.allocate(ADDRESS);
+                checkHr(call(resources, RES_GET_STREAM,
+                        FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, ADDRESS, JAVA_INT, ADDRESS, ADDRESS),
+                        wstr(arena, itemId), KEY_RESOURCE_DEFAULT, STGM_READ, optimal, streamOut),
+                    "IPortableDeviceResources::GetStream");
+                var stream = streamOut.get(ADDRESS, 0);
+                try {
+                    seekStream(stream, offset);
+                    return readStreamRange(stream, maxBytes, transferBufferSize(optimal.get(JAVA_INT, 0)));
+                } finally {
+                    release(stream);
+                }
+            } finally {
+                release(resources);
+            }
+        }
+    }
+
+    private byte[] readPartialViaMtpPassThrough(DeviceHandle handle, String itemId, long offset, int maxBytes)
+            throws IOException {
         var d = asDevice(handle);
         long objectHandle = parseObjectHandle(itemId);
         int cached = partialReadOpcode;
@@ -1438,6 +1475,38 @@ class WpdBackend implements MtpBackend {
                 out.write(buffer.asSlice(0, read).toArray(JAVA_BYTE));
             }
         }
+    }
+
+    private void seekStream(MemorySegment stream, long offset) throws IOException {
+        try (var arena = Arena.ofConfined()) {
+            var newPosition = arena.allocate(JAVA_LONG);
+            checkHr(call(stream, STREAM_SEEK,
+                    FunctionDescriptor.of(JAVA_INT, ADDRESS, JAVA_LONG, JAVA_INT, ADDRESS),
+                    offset, STREAM_SEEK_SET, newPosition),
+                "IStream::Seek");
+        }
+    }
+
+    private byte[] readStreamRange(MemorySegment stream, int maxBytes, int bufferSize)
+            throws IOException {
+        byte[] out = new byte[maxBytes];
+        int read = 0;
+        try (var arena = Arena.ofConfined()) {
+            var buffer = arena.allocate(Math.min(bufferSize, maxBytes));
+            var readOut = arena.allocate(JAVA_INT);
+            var descriptor = FunctionDescriptor.of(JAVA_INT, ADDRESS, ADDRESS, JAVA_INT, ADDRESS);
+            while (read < maxBytes) {
+                int want = Math.min(maxBytes - read, (int) buffer.byteSize());
+                readOut.set(JAVA_INT, 0, 0);
+                checkHr(call(stream, STREAM_READ, descriptor, buffer, want, readOut),
+                    "IStream::Read");
+                int got = readOut.get(JAVA_INT, 0);
+                if (got <= 0) break;
+                MemorySegment.copy(buffer, JAVA_BYTE, 0, out, read, got);
+                read += got;
+            }
+        }
+        return read == out.length ? out : Arrays.copyOf(out, read);
     }
 
     private void copyFileToStream(InputStream in, MemorySegment stream, int bufferSize)
