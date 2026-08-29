@@ -7,9 +7,7 @@ on:
 
 jobs:
   # Tier 1 (usb-ci FR-4.5): fake-backed unit tests plus integration-test
-  # compilation, no device. The macOS tier-1 leg lives in the separate
-  # .forgejo/workflows/macos.yml because it selects the native Apple-silicon
-  # runner while matching this workflow's push and pull-request triggers.
+  # compilation, no device, across Linux, Windows and macOS.
   test-linux:
     runs-on: linux
     steps:
@@ -55,3 +53,25 @@ jobs:
           distribution: 'temurin'
       - name: Run unit tests and compile integration tests
         run: .\gradlew.bat test integrationTestClasses
+
+  # Native Apple-silicon host runner, capacity 1. libmtp is a machine
+  # prerequisite provisioned once on the persistent runner.
+  test-macos:
+    runs-on: macos
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: https://github.com/actions/setup-java@v4
+        with:
+          java-version: '25'
+          distribution: temurin
+
+      - name: Check the provisioned libmtp
+        run: |
+          prefix="$(brew --prefix libmtp)"
+          test -d "$prefix/lib"
+          echo "libmtp provisioned at $prefix"
+
+      - name: Run unit tests and compile integration tests
+        run: ./gradlew test integrationTestClasses

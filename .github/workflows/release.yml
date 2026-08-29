@@ -90,9 +90,9 @@ jobs:
             "workflow_dispatch with override_hardware_gate=true and a reason." >&2
           exit 1
 
-  # The native Forgejo runner has normally passed equivalent tier-1 coverage
-  # on this commit already. This hosted repeat keeps the release gate in the
-  # same environment that performs publication.
+  # The native Forgejo test-macos job has normally passed equivalent tier-1
+  # coverage on this commit already. This hosted repeat keeps the release gate
+  # in the same environment that performs publication.
   test-macos:
     uses: ./.github/workflows/test-macos.yml
 

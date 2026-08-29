@@ -1,8 +1,8 @@
 name: macOS tests
 
 # The GitHub-hosted macOS release-gate leg. Everyday pull-request and post-
-# merge coverage now runs on the native Forgejo runner from
-# .forgejo/workflows/macos.yml; this callable workflow remains here so release
+# merge coverage now runs on the native Forgejo runner from the test-macos job
+# in .forgejo/workflows/ci.yml; this callable workflow remains here so release
 # tags keep their proven hosted environment and publication credentials.
 on:
   workflow_call:
