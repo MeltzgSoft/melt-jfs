@@ -28,7 +28,7 @@ match **`NativeLibMTP`** (libmtp, Linux/macOS). **Keep this file updated wheneve
 | `mtp` view (device-index metadata) | ✅ | ✅ | none |
 | `sendFile` audio object-format inference | ✅ | ✅ | none — correct WPD audio GUIDs are used; forcing generic uploads with `-Dmelt-jfs.wpd.uploadAudioAsGeneric=true` did not prevent the FiiO/WPD hang |
 | `sendFile` retry after failed create-with-data | ✅ | ⚠️ opt-in experiment | WPD can upload through a unique temporary object name with `-Dmelt-jfs.wpd.temporaryUploadNames=true`, but this is disabled by default because FiiO rejected the immediate post-commit rename |
-| **Ranged read (`readPartial`)** | ✅ | ✅ (WPD content stream seek/read) | Raw MTP `GetPartialObject` via WPD `SendCommand` is retained only for diagnostics with `-Dmelt-jfs.wpd.mtpPartialReads=true`; on FiiO/WPD it can poison later uploads |
+| **Ranged read (`readPartial`)** | ✅ | ✅ (MTP `GetPartialObject` via WPD `SendCommand`) | WPD content-stream reads are retained only for diagnostics with `-Dmelt-jfs.wpd.mtpPartialReads=false`; the normal path still reopens the client handle before a small window of later mutations |
 | `supportsPartialReads()` | ✅ `true` | ✅ `true` | none |
 | Lazy read channel (`newByteChannel`) | ✅ lazy | ✅ lazy | none |
 | `audio` view (embedded tags) | ✅ | ✅ (lit up by `readPartial`) | none |
@@ -92,14 +92,20 @@ embedded-tag read, the next upload hung in `IStream::Write` until WPD returned
 `-Dmelt-jfs.wpd.uploadAudioAsGeneric=true` did **not** prevent the hang when the FiiO was present in
 run 44 attempt 2, so the audio content type / object-format path is not the trigger.
 
-The next runs, with the FiiO online, showed that raw WPD `SendCommand` `GetPartialObject` dirties
+The next runs, with the FiiO online, showed that raw WPD `SendCommand` `GetPartialObject` can dirty
 that client/device state across subsequent mutations. A bridge-level fresh-handle hook was only
 partially effective: run 46 proved it could move the failure, run 54 proved upload-only recycle was
 too narrow, and run 64/66 showed even a post-partial mutation window could still leave a later
-`IStream::Write` failing with `E_WPD_DEVICE_IS_HUNG`. The normal WPD `readPartial` path therefore no
-longer uses raw `GetPartialObject`; it opens the object's WPD content stream, seeks to the requested
-offset, and reads only the requested byte span. The raw MTP path remains available for diagnostics
-with `-Dmelt-jfs.wpd.mtpPartialReads=true`.
+`IStream::Write` failing with `E_WPD_DEVICE_IS_HUNG`. Even so, PR #25's last known green Windows run
+(run 62 attempt 2, commit `750c2b4300`) used raw `GetPartialObject` with the post-partial mutation
+recycle enabled by default.
+
+An attempted replacement using WPD content streams regressed harder: run 68, the first stream-read
+commit, failed the very first AK100_II filesystem row because `audio:*` could not read back the
+uploaded ID3v2.3 fixture, then every later AK storage listing stalled/fell over while classifying
+functional object `s10001`. Run 70 and later sequential-stream attempts repeated the same pattern.
+The normal WPD path is therefore back to raw `GetPartialObject`; the stream path remains available
+only for diagnostics by setting `-Dmelt-jfs.wpd.mtpPartialReads=false`.
 
 An attempted follow-up made WPD upload each create-with-data transfer under a unique implementation
 name, then rename the committed object to the caller's filename. That reduced later same-storage

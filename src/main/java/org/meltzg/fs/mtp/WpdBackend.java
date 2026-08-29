@@ -174,11 +174,11 @@ class WpdBackend implements MtpBackend {
     private static final boolean UPLOAD_AUDIO_AS_GENERIC = Boolean.parseBoolean(
         System.getProperty("melt-jfs.wpd.uploadAudioAsGeneric", "false"));
     private static final boolean RECYCLE_AFTER_PARTIAL_READ = Boolean.parseBoolean(
-        System.getProperty("melt-jfs.wpd.recycleAfterPartialRead", "false"));
+        System.getProperty("melt-jfs.wpd.recycleAfterPartialRead", "true"));
     private static final boolean USE_TEMPORARY_UPLOAD_NAMES = Boolean.parseBoolean(
         System.getProperty("melt-jfs.wpd.temporaryUploadNames", "false"));
     private static final boolean USE_MTP_PARTIAL_READS = Boolean.parseBoolean(
-        System.getProperty("melt-jfs.wpd.mtpPartialReads", "false"));
+        System.getProperty("melt-jfs.wpd.mtpPartialReads", "true"));
 
     private static final Pattern VID = Pattern.compile("vid_([0-9a-fA-F]{4})");
     private static final Pattern PID = Pattern.compile("pid_([0-9a-fA-F]{4})");
