@@ -7,11 +7,9 @@ on:
 
 jobs:
   # Tier 1 (usb-ci FR-4.5): fake-backed unit tests plus integration-test
-  # compilation, no device. The macOS tier-1 leg is NOT here -- the forge has
-  # no macOS runner (Part 2 hardware does not exist), so it lives in
-  # .github/workflows/release.yml and proves the build at release time
-  # (FR-10.4): after FR-2.7 pruned GitHub-side CI to the release set, the
-  # release workflow is the only place left that can run macOS at all.
+  # compilation, no device. The macOS tier-1 leg lives in the separate
+  # .forgejo/workflows/macos.yml because it preserves the former post-merge-
+  # only trigger and selects the native Apple-silicon runner.
   test-linux:
     runs-on: linux
     steps:

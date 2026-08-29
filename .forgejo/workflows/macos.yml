@@ -1,0 +1,35 @@
+name: macOS
+
+# Tier-1 macOS coverage on the native Apple-silicon Forgejo runner: fake-
+# backed unit tests, the native libmtp load check, and integration-test
+# compilation. The runner is host mode and capacity 1; libmtp is a machine
+# prerequisite provisioned once on the runner.
+#
+# Release tags still call .github/workflows/test-macos.yml on GitHub. This
+# replaces only the old GitHub push-to-master wrapper, preserving post-merge
+# coverage without duplicating it after every mirror sync.
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+jobs:
+  test-macos:
+    runs-on: macos
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: https://github.com/actions/setup-java@v4
+        with:
+          java-version: '25'
+          distribution: temurin
+
+      - name: Check the provisioned libmtp
+        run: |
+          prefix="$(brew --prefix libmtp)"
+          test -d "$prefix/lib"
+          echo "libmtp provisioned at $prefix"
+
+      - name: Run unit tests and compile integration tests
+        run: ./gradlew test integrationTestClasses

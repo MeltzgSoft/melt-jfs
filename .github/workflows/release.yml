@@ -10,8 +10,9 @@ name: Release
 #     master SHA as the commit status `forge/device-tests` (FR-10.9). No status, or a failed one,
 #     blocks the release -- fail closed (FR-10.10), keyed to the exact commit being released
 #     (FR-10.11), never to recency.
-#   - test-macos: the tier-1 macOS leg (fake-backed tests + integration-test compilation). The forge
-#     has no macOS runner, so release time is where macOS proves the build (FR-10.4 rationale 1).
+#   - test-macos: the hosted release-gate repeat of the tier-1 macOS leg
+#     (fake-backed tests + integration-test compilation). Everyday coverage
+#     runs on the native Forgejo runner.
 on:
   push:
     tags:
@@ -89,10 +90,9 @@ jobs:
             "workflow_dispatch with override_hardware_gate=true and a reason." >&2
           exit 1
 
-  # The same workflow macos.yml runs on every push to master, so the release
-  # gate and the per-commit run cannot diverge. By tag time this has normally
-  # already passed on this very commit -- the gate is then confirmation rather
-  # than the first time macOS is exercised, which is the point.
+  # The native Forgejo runner has normally passed equivalent tier-1 coverage
+  # on this commit already. This hosted repeat keeps the release gate in the
+  # same environment that performs publication.
   test-macos:
     uses: ./.github/workflows/test-macos.yml
 

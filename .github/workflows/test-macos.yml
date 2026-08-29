@@ -1,9 +1,9 @@
 name: macOS tests
 
-# The macOS leg, factored out so the release gate and the per-commit run share
-# ONE definition. The lab has no macOS runner and macOS has no self-hosted
-# substitute (usb-ci FR-10.17), so GitHub is the only place this can run --
-# which is exactly why it must not drift between its two callers.
+# The GitHub-hosted macOS release-gate leg. Everyday post-merge coverage now
+# runs on the native Forgejo runner from .forgejo/workflows/macos.yml; this
+# callable workflow remains here so release tags keep their proven hosted
+# environment and publication credentials.
 on:
   workflow_call:
 
