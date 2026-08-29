@@ -11,8 +11,8 @@ name: Release
 #     blocks the release -- fail closed (FR-10.10), keyed to the exact commit being released
 #     (FR-10.11), never to recency.
 #   - test-macos: the hosted release-gate repeat of the tier-1 macOS leg
-#     (fake-backed tests + integration-test compilation). Everyday coverage
-#     runs on the native Forgejo runner.
+#     (fake-backed tests + integration-test compilation). Pull-request and
+#     post-merge coverage runs on the native Forgejo runner.
 on:
   push:
     tags:

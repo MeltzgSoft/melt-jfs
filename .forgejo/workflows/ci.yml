@@ -8,8 +8,8 @@ on:
 jobs:
   # Tier 1 (usb-ci FR-4.5): fake-backed unit tests plus integration-test
   # compilation, no device. The macOS tier-1 leg lives in the separate
-  # .forgejo/workflows/macos.yml because it preserves the former post-merge-
-  # only trigger and selects the native Apple-silicon runner.
+  # .forgejo/workflows/macos.yml because it selects the native Apple-silicon
+  # runner while matching this workflow's push and pull-request triggers.
   test-linux:
     runs-on: linux
     steps:

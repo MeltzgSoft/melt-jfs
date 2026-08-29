@@ -5,12 +5,13 @@ name: macOS
 # compilation. The runner is host mode and capacity 1; libmtp is a machine
 # prerequisite provisioned once on the runner.
 #
-# Release tags still call .github/workflows/test-macos.yml on GitHub. This
-# replaces only the old GitHub push-to-master wrapper, preserving post-merge
-# coverage without duplicating it after every mirror sync.
+# Release tags still call .github/workflows/test-macos.yml on GitHub. Everyday
+# macOS coverage now runs beside the other Forgejo tier-1 jobs on pull requests
+# and pushes to master without duplicating it after every mirror sync.
 on:
   push:
     branches: [master]
+  pull_request:
   workflow_dispatch:
 
 jobs:
